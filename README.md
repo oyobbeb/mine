@@ -37,7 +37,14 @@ flowchart TD
 
 ## 시작
 
-macOS 또는 Linux에서 Python 3.8+, tmux 3.2+, Claude Code, Codex CLI가 필요합니다. 파일 변경 보기에는 GitButler CLI(`but`)를 사용합니다. 저장소에서 `export PATH="$PWD:$PATH"`를 실행한 뒤 작업할 저장소 안으로 이동하세요.
+macOS 또는 Linux에서 Python 3.8+, tmux 3.2+, Claude Code, Codex CLI가 필요합니다. 파일 변경 보기에는 GitButler CLI(`but`)를 사용합니다. 저장소 루트에서 한 번 실행해 사용자 명령 경로에 연결하세요.
+
+```sh
+mkdir -p ~/.local/bin
+ln -s "$PWD/mine" ~/.local/bin/mine
+```
+
+새 셸에서 `command -v mine`으로 확인하세요. zsh의 PATH에 `~/.local/bin`이 없다면 `~/.zshrc`에 `export PATH="$HOME/.local/bin:$PATH"`를 추가한 뒤 셸을 다시 여세요. 이제 작업할 저장소 안에서 아래 명령을 사용할 수 있습니다.
 
 ```sh
 mine login claude-a
