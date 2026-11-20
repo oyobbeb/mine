@@ -16,7 +16,7 @@ if os.environ.get("FAIL"):
     sys.exit(1)
 prompt = sys.stdin.read()
 with open(os.environ["TRACE"], "a") as f:
-    print(json.dumps([sys.argv, prompt, os.getenv("CLAUDE_CONFIG_DIR")]), file=f)
+    print(json.dumps([sys.argv, prompt, os.getenv("CLAUDE_CONFIG_DIR"), os.getcwd()]), file=f)
 if Path(sys.argv[0]).name == "claude":
     print(json.dumps({"session_id":"claude-session","result":"claude-answer"}))
 else:
@@ -39,8 +39,8 @@ class Workflow(unittest.TestCase):
             cli.write_text(FIXTURE)
             cli.chmod(0o755)
 
-    def mine(self, *args, input=None, check=True):
-        return subprocess.run([str(MINE), *args], cwd=self.project, env=self.env,
+    def mine(self, *args, input=None, check=True, cwd=None):
+        return subprocess.run([str(MINE), *args], cwd=cwd or self.project, env=self.env,
                               input=input, capture_output=True, text=True, check=check)
 
     def test_roundtrip_in_common_ui_and_native(self):
@@ -61,6 +61,33 @@ class Workflow(unittest.TestCase):
         self.assertIn("--resume", calls[2][0])
         self.assertTrue(calls[0][2].endswith("/profiles/claude-a"))
         self.assertNotIn("native finding", self.mine("history","other").stdout)
+
+    def test_project_roots_and_console_switch(self):
+        first = self.project / "one" / "repo"
+        other = self.project / "two" / "repo"
+        sub = first / "src"
+        sub.mkdir(parents=True)
+        (first / ".git").mkdir()
+        other.mkdir(parents=True)
+        (other / ".git").write_text("gitdir: ../worktrees/repo")
+        self.mine("note", "fix", "first repo note", cwd=sub)
+        self.assertIn("first repo note", self.mine("history", "fix", cwd=first).stdout)
+        self.mine("ui", "fix", cwd=sub, input=f"/project {other}\n/room fix\n/use codex\ninspect\n/quit\n")
+        call = json.loads(self.trace.read_text())
+        self.assertEqual(call[3], str(other.resolve()))
+        self.assertNotIn("first repo note", call[1])
+        self.assertNotIn("codex-answer", self.mine("history","fix",cwd=sub).stdout)
+        self.assertIn("codex-answer", self.mine("--project",str(other),"history","fix").stdout)
+        self.assertEqual(set(self.mine("projects").stdout.splitlines()),
+                         {str(first.resolve()), str(other.resolve())})
+
+    def test_explicit_folder_and_nested_repository(self):
+        self.mine("--project",str(self.project),"note","fix","folder task")
+        child = self.project / "sub"
+        child.mkdir()
+        self.assertIn("folder task",self.mine("history","fix",cwd=child).stdout)
+        (child / ".git").mkdir()
+        self.assertNotIn("folder task",self.mine("history","fix",cwd=child).stdout)
 
     def test_capacity_and_failure(self):
         self.mine("ask","fix","claude-a","implement")

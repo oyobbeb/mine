@@ -31,15 +31,38 @@ def atomic_json(path, data):
 
 
 class Workspace:
-    def __init__(self):
-        self.project = Path.cwd().resolve()
-        self.key = hashlib.sha256(os.fsencode(self.project)).hexdigest()[:16]
-        self.state = Path(os.environ.get("MINE_STATE_DIR", Path.home() / ".mine")).resolve()
+    def __init__(self, folder=None, state=None):
+        self.state = state or Path(os.environ.get("MINE_STATE_DIR", Path.home() / ".mine")).resolve()
+        self.registry = self.state / "projects"
+        start = Path.cwd() if folder is None else Path(folder).expanduser()
+        self.project = start.resolve(strict=True)
+        if not self.project.is_dir():
+            raise ValueError(f"폴더를 선택하세요: {self.project}")
+        if folder is None:
+            ancestors = (self.project, *self.project.parents)
+            for directory in ancestors:
+                if (directory / ".git").exists() or self.registration(directory).is_file():
+                    self.project = directory
+                    break
+        self.key = self.registration(self.project).stem
         self.rooms = self.state / "rooms" / self.key
+
+    def registration(self, path):
+        key = hashlib.sha256(os.fsencode(path)).hexdigest()[:16]
+        return self.registry / (key + ".json")
+
+    def register(self):
+        registration = self.registration(self.project)
+        if not registration.exists():
+            atomic_json(registration, str(self.project))
+
+    def projects(self):
+        return sorted(json.loads(p.read_text()) for p in self.registry.glob("*.json"))
 
     def room(self, name):
         if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}", name):
             raise ValueError("작업 이름은 영문, 숫자, _, - 조합으로 1~64자를 사용하세요.")
+        self.register()
         room = self.rooms / name
         room.mkdir(parents=True, exist_ok=True, mode=0o700)
         return room
@@ -240,7 +263,7 @@ def ask(ws, room, agent, message, model=None):
             record(room, agent=agent, role="user", text=message)
             try:
                 result = subprocess.run(cmd, input=prompt, text=True, stdout=subprocess.PIPE,
-                                        env=ws.env(agent), check=True)
+                                        cwd=ws.project, env=ws.env(agent), check=True)
                 if agent == "codex":
                     answer = last.read_text()
                     for line in result.stdout.splitlines():

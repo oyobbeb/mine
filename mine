@@ -82,8 +82,8 @@ def rooms(ws):
     return sorted(p.name for p in ws.rooms.iterdir() if p.is_dir()) if ws.rooms.exists() else []
 
 
-def changes():
-    result = subprocess.run(["but","diff"], text=True, stdout=subprocess.PIPE,
+def changes(ws):
+    result = subprocess.run(["but","diff"], cwd=ws.project, text=True, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT)
     return safe(result.stdout.strip()) or "변경 없음"
 
@@ -97,7 +97,7 @@ def console(ws, room):
         if sys.stdin.isatty() and sys.stdout.isatty():
             print("\033[2J\033[H", end="")
         entries = history(room)
-        print(f"\n[mine]  {ws.project.name} / {room.name}  ·  {agent or '계정 미선택'}  {model or ''}")
+        print(f"\n[mine]  {safe(str(ws.project))} / {room.name}  ·  {agent or '계정 미선택'}  {model or ''}")
         print("작업 목록   " + "  ".join(rooms(ws)))
         print("최근 대화")
         for entry in entries[-4:]:
@@ -107,7 +107,7 @@ def console(ws, room):
         if panel:
             print(panel)
             panel = ""
-        print("/use 계정 [모델]   /native   /files   /history   /room 작업   /recommend 작업   /usage   /quit")
+        print("/projects   /project 경로   /use 계정 [모델]   /native   /files   /history   /room 작업   /recommend 작업   /usage   /quit")
         try:
             line = input("mine › ").strip()
         except (EOFError, KeyboardInterrupt):
@@ -116,7 +116,16 @@ def console(ws, room):
         try:
             if op == "/quit":
                 return
-            if op == "/room":
+            if op == "/projects":
+                panel = "\n".join(safe(p) for p in ws.projects())
+            elif op == "/project":
+                if not rest.strip():
+                    raise ValueError("/project 작업폴더경로")
+                selection = Path(rest.strip()).expanduser()
+                selected = Workspace(ws.project / selection, state=ws.state)
+                room = selected.room("default")
+                ws, agent, model = selected, None, None
+            elif op == "/room":
                 room = ws.room(rest.strip())
                 agent, model = None, None
             elif op == "/use":
@@ -127,7 +136,7 @@ def console(ws, room):
             elif op == "/history":
                 panel = "\n".join(safe(display(entry)) for entry in entries) or "기록 없음"
             elif op == "/files":
-                panel = changes()
+                panel = changes(ws)
             elif op == "/usage":
                 try:
                     refresh_codex(ws)
@@ -175,7 +184,9 @@ def main():
             print("mine · " + agent + "  " + "  ".join(f"{w['name']} {w['used']}%" for w in windows))
         return
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--project", metavar="DIR", help="작업 루트로 사용할 폴더")
     commands = parser.add_subparsers(dest="command")
+    commands.add_parser("projects")
     commands.add_parser("rooms")
     commands.add_parser("usage")
     commands.add_parser("login").add_argument("agent",choices=AGENTS)
@@ -193,7 +204,13 @@ def main():
         if name in ("ask","note","recommend"):
             sub.add_argument("message")
     args = parser.parse_args()
+    if args.project:
+        ws = Workspace(args.project)
     cmd = args.command
+    if cmd == "projects":
+        for path in ws.projects():
+            print(safe(path))
+        return
     if cmd == "rooms":
         print("\n".join(rooms(ws)))
         return

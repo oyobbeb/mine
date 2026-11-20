@@ -4,7 +4,7 @@ Claude Code 계정 두 개와 Codex를 한 터미널 작업방에서 사용합�
 
 ## 시작
 
-macOS 또는 Linux에서 Python 3.8+, tmux 3.2+, Claude Code, Codex CLI가 필요합니다. 파일 변경 보기에는 GitButler CLI(`but`)를 사용합니다. 저장소에서 `export PATH="$PWD:$PATH"`를 실행한 뒤 작업할 프로젝트의 루트로 이동하세요.
+macOS 또는 Linux에서 Python 3.8+, tmux 3.2+, Claude Code, Codex CLI가 필요합니다. 파일 변경 보기에는 GitButler CLI(`but`)를 사용합니다. 저장소에서 `export PATH="$PWD:$PATH"`를 실행한 뒤 작업할 저장소 안으로 이동하세요.
 
 ```sh
 mine login claude-a
@@ -14,6 +14,19 @@ mine ui payments
 ```
 
 두 Claude 계정은 별도의 설정 디렉터리를 쓰며, Codex는 기존 사용자 로그인을 사용합니다. 처음 설정할 때 각 CLI에서 활성 로그인 방법을 확인하세요. 실제 요청은 선택한 계정의 사용량을 소비합니다.
+
+## 프로젝트와 작업방
+
+`mine`은 현재 위치에서 위로 올라가며 가장 가까운 Git 작업 트리 루트 또는 등록된 프로젝트 폴더를 찾습니다. 처음 연 작업방이 해당 프로젝트를 등록합니다. Git 저장소가 없는 경우에는 현재 폴더가 기준입니다. 별도 worktree와 중첩 저장소는 각각 독립된 프로젝트입니다. 같은 이름의 폴더도 전체 로컬 경로로 구분합니다.
+
+```sh
+mine projects
+mine --project ~/dev/shop-front ui payments
+```
+
+콘솔에서는 `/projects`로 목록을 보고 `/project ~/dev/mine`과 `/room 작업이름`으로 전환합니다. 프로젝트를 바꾸면 대상 폴더의 기본 작업방을 열고 계정을 다시 선택합니다. 에이전트 실행과 파일 변경 보기도 선택한 폴더를 기준으로 합니다. 계정 로그인과 사용량은 호스트 안에서 공유됩니다.
+
+이전 버전에서 하위 폴더를 작업 루트로 사용했으면 `mine --project 기존폴더 history 작업이름`으로 그 폴더의 기존 기록을 열 수 있습니다. 프로젝트 식별에는 실제 경로를 사용하므로 폴더를 이동하면 별개 프로젝트로 열립니다.
 
 ## 한 작업에서 Claude → Codex → Claude
 
