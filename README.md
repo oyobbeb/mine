@@ -2,6 +2,39 @@
 
 Claude Code 계정 두 개와 Codex를 한 터미널 작업방에서 사용합니다. 작업을 선택하면 대화·인수인계 메모를 함께 보고, 사용할 계정과 모델을 정할 수 있습니다. 순정 CLI는 tmux에서 실행합니다.
 
+## 설계와 구현 상태
+
+`mine`은 한 호스트에서 작업별로 에이전트를 추천하고, 사용자가 선택한 계정에 작업을 맡긴다. 작업방에는 공유 대화를, 계정별 CLI에는 해당 모델의 세션을 보관한다. 따라서 Claude가 작성한 변경을 Codex가 리뷰하고 다시 Claude로 넘길 수 있다.
+
+현재 구현은 Python CLI와 tmux다. Ghostty나 SSH 터미널에서 실행할 수 있다. Rust 스케줄러와 Ratatui 화면은 제안 단계다. 모바일용 호스트 서비스, 기기 페어링, 이벤트 동기화, 사용 한도에 따른 자동 전환도 아직 구현 전이다.
+
+```mermaid
+flowchart TD
+    UI["mine ui 또는 헤드리스 명령"] --> WS["프로젝트 → 작업방"]
+    WS --> Ask["ask: 계정 선택 · 최근 인계 기록"]
+    Ask --> CLI["claude -p 또는 codex exec"]
+    CLI --> Journal["작업방 handoff.jsonl"]
+    WS --> Native["open: tmux 순정 세션"]
+    Native --> Hooks["질문 제출 · 응답 완료 훅"]
+    Hooks --> Journal
+    Journal --> Ask
+```
+
+| 코드를 읽는 순서 | 책임 |
+|---|---|
+| [mine](mine)의 `main`, `console`, `terminal` | CLI와 작업 화면, 프로젝트 전환, tmux 세션 생성·재접속, 훅 입력 처리 |
+| [scheduler.py](scheduler.py)의 `Workspace`, `ask`, `context` | 프로젝트 식별과 계정 환경, 실행 디렉터리, 대화 기록과 세션 재개 |
+| 같은 파일의 `recommendation`, `refresh_codex`, `native_event` | 계정 추천, 사용량 관측, 순정 세션과 작업방 간 대화 전달 |
+| [tests/test_workflow.py](tests/test_workflow.py) | 모의 CLI로 왕복 인계, 실패 기록, 한도 소진, 프로젝트 격리를 검증 |
+
+**상태의 범위.** 기본 저장 위치는 `~/.mine`이다. `projects/<key>.json`은 실제 프로젝트 경로를, `rooms/<key>/<room>/handoff.jsonl`은 작업 기록을 보관한다. 키는 실제 경로를 SHA-256으로 해시한 앞 16자리다. `profiles/<agent>`의 Claude 설정과 `usage/<agent>.json`의 사용량 관측값은 같은 호스트의 여러 프로젝트가 공유한다. Codex는 사용자의 기존 Codex 로그인을 사용한다.
+
+**한 턴의 처리.** `ask`는 작업방의 `turn.lock`을 잡고 사용자 요청을 기록한 뒤 프로젝트 루트에서 CLI를 실행한다. 같은 계정의 마지막 성공 응답에 세션 ID가 있으면 그 세션을 재개하고 그 뒤에 쌓인 공유 기록을 전달한다. 첫 요청에는 방의 최근 기록을 전달한다. 전달 텍스트는 최근 16,000자로 제한하고 전체 기록 경로도 제공한다. 성공 응답에 세션 ID를 저장하며, 실패하면 오류를 기록한다. 실패 전에 실행한 파일 편집이나 외부 명령은 이미 반영됐을 수 있다.
+
+**동시 실행의 경계.** 잠금은 같은 방의 `ask` 호출끼리 적용된다. 순정 tmux 세션과 서로 다른 작업방은 독립적으로 움직이므로, 동일 파일을 병렬 편집할 때는 별도 worktree를 사용하거나 편집이 끝난 후 인계한다. 사용량에는 관측 시각이 붙고 추천은 계정을 직접 전환하지 않는다.
+
+**다음 에이전트의 출발점.** Rust 이식에 착수한다면 기존 상태 디렉터리를 복사한 테스트 환경에서 메모 읽기, Claude → Codex → Claude 왕복, 하위 폴더에서의 프로젝트 선택을 먼저 검증한다. 모바일 확장에서는 호스트가 작업 실행을 유지하고 클라이언트가 같은 작업방에 재접속하는 것을 목표로 한다. 현재 SSH 접속과 장래의 모바일 서비스는 배포 방식이 다르다.
+
 ## 시작
 
 macOS 또는 Linux에서 Python 3.8+, tmux 3.2+, Claude Code, Codex CLI가 필요합니다. 파일 변경 보기에는 GitButler CLI(`but`)를 사용합니다. 저장소에서 `export PATH="$PWD:$PATH"`를 실행한 뒤 작업할 저장소 안으로 이동하세요.
