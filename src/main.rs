@@ -3,6 +3,8 @@
 
 mod paths;
 mod project;
+mod proto;
+mod session;
 
 use std::path::PathBuf;
 
