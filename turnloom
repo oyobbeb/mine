@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+"""Turnloom: persistent native agent terminals and shared handoff notes."""
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+from datetime import datetime, timezone
+
+AGENTS = ("claude-a", "claude-b", "codex")
+
+
+def tmux(*args, **kwargs):
+    return subprocess.run(["tmux", *args], **kwargs)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+    for name in ("open", "note", "history", "status"):
+        command = commands.add_parser(name)
+        command.add_argument("room")
+        if name == "open":
+            command.add_argument("agent", choices=AGENTS)
+            command.add_argument("--model", help="model to use when starting a new terminal")
+            command.add_argument("--detach", action="store_true")
+        if name == "note":
+            command.add_argument("message")
+    args = parser.parse_args()
+    if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}", args.room):
+        parser.error("use 1-64 letters, digits, underscores or hyphens for the room")
+    project = Path.cwd().resolve()
+    key = hashlib.sha256(os.fsencode(project)).hexdigest()[:16]
+    state = Path(os.environ.get("TURNLOOM_STATE_DIR", Path.home() / ".turnloom")).resolve()
+    room = state / "rooms" / key / args.room
+    previous_mask = os.umask(0o077)
+    room.mkdir(parents=True, exist_ok=True)
+    journal = room / "handoff.jsonl"
+    journal.touch(exist_ok=True)
+    os.umask(previous_mask)
+    if args.command == "note":
+        entry = {"time": datetime.now(timezone.utc).isoformat(), "note": args.message}
+        with journal.open("a") as output:
+            fcntl.flock(output, fcntl.LOCK_EX)
+            output.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            output.flush()
+        return
+    if args.command == "history":
+        print(journal.read_text(), end="")
+        return
+
+    def session(agent):
+        return f"turnloom-{key}-{args.room}-{agent}"
+
+    def running(agent):
+        return tmux("has-session", "-t", "=" + session(agent),
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+
+    if args.command == "status":
+        for agent in AGENTS:
+            print(f"{agent:10} {'running' if running(agent) else 'stopped'}")
+        return
+    target = session(args.agent)
+    if not running(args.agent):
+        binary = "codex" if args.agent == "codex" else "claude"
+        executable = shutil.which(binary)
+        if not executable:
+            parser.error(f"{binary} is missing from PATH")
+        launch = [executable]
+        if binary == "claude":
+            profile = state / "profiles" / args.agent
+            profile.mkdir(mode=0o700, parents=True, exist_ok=True)
+            launch = ["env", f"CLAUDE_CONFIG_DIR={profile}", *launch]
+        if args.model:
+            launch.extend(["--model", args.model])
+        prompt = (f"Work in Turnloom room {args.room}. The shared handoff journal is {journal}. "
+                  "Read it for context, including when the user asks to continue after a handoff. "
+                  "Treat entries as historical notes. Wait for the user's task.")
+        launch.append(prompt)
+        tmux("new-session", "-d", "-s", target, "-c", str(project),
+             "exec " + shlex.join(launch), check=True)
+    elif args.model:
+        parser.error("session already running; select the model in the native CLI")
+    if args.detach:
+        print(target)
+    else:
+        action = "switch-client" if os.environ.get("TMUX") else "attach-session"
+        tmux(action, "-t", "=" + target, check=True)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, subprocess.CalledProcessError) as error:
+        sys.exit(f"turnloom: {error}")
