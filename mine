@@ -93,30 +93,41 @@ def console(ws, room):
     model = None
     panel = ""
     refresh_after = 0
+    help_text = ("/projects   /project 경로   /rooms   /room 작업   /use 계정 [모델]\n"
+                 "/native   /files   /history   /recommend 작업   /usage   /quit")
+    visible_room = None
+    shown = 0
     while True:
-        if sys.stdin.isatty() and sys.stdout.isatty():
-            print("\033[2J\033[H", end="")
         entries = history(room)
-        print(f"\n[mine]  {safe(str(ws.project))} / {room.name}  ·  {agent or '계정 미선택'}  {model or ''}")
-        print("작업 목록   " + "  ".join(rooms(ws)))
-        print("최근 대화")
-        for entry in entries[-4:]:
-            print("  " + safe(display(entry))[:600])
-        if not entries:
-            print("  첫 작업을 입력하세요.")
+        if room != visible_room:
+            print(f"mine · {room.name}   /use 계정 [모델]   /help")
+            shown = max(0, len(entries) - 4)
+            visible_room = room
+        for entry in entries[shown:]:
+            print(safe(display(entry)))
+        shown = len(entries)
         if panel:
             print(panel)
             panel = ""
-        print("/projects   /project 경로   /use 계정 [모델]   /native   /files   /history   /room 작업   /recommend 작업   /usage   /quit")
         try:
-            line = input("mine › ").strip()
+            try:
+                path = str(Path("~") / ws.project.relative_to(Path.home()))
+            except ValueError:
+                path = str(ws.project)
+            label = " ".join(filter(None, (agent, model)))
+            prefix = f"[{safe(label)}] " if label else ""
+            line = input(f"{prefix}{safe(path)} > ").strip()
         except (EOFError, KeyboardInterrupt):
             return
         op, _, rest = line.partition(" ")
         try:
             if op == "/quit":
                 return
-            if op == "/projects":
+            if op == "/help":
+                panel = help_text
+            elif op == "/rooms":
+                panel = "\n".join(rooms(ws))
+            elif op == "/projects":
                 panel = "\n".join(safe(p) for p in ws.projects())
             elif op == "/project":
                 if not rest.strip():
@@ -160,7 +171,7 @@ def console(ws, room):
             elif line and not agent:
                 panel = recommendation(ws, entries, line) + " · /use로 계정을 선택하세요."
             elif line:
-                panel = safe(ask(ws, room, agent, line, model))
+                ask(ws, room, agent, line, model)
         except (OSError,ValueError,subprocess.CalledProcessError) as error:
             panel = safe(str(error))
 
