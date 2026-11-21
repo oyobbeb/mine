@@ -3,6 +3,7 @@
 // 이후 태스크가 쓰기 전까지 공개 함수 일부가 사용되지 않는다.
 #![allow(dead_code)]
 
+pub mod client;
 pub mod conn;
 pub mod daemon;
 pub mod hold;
