@@ -1,12 +1,15 @@
 //! 세션 화면 상태. PTY 출력을 먹여 칸을 유지하고, 같은 크기의 새 `Screen`이
 //! 똑같은 화면을 되살릴 수 있는 바이트열(스냅숏)을 만든다.
 //!
-//! 터미널 질의(DA, 커서 위치 등)에는 답하지 않는다. `VoidListener`가 버리고,
-//! 답은 데몬이 따로 처리한다.
+//! 안쪽 앱의 터미널 질의(DA1, 커서 위치 DSR, OSC 10/11 색, kitty 키보드 모드)에 대한 답은
+//! `Replies`가 모아 두고 `take_replies`로 꺼낸다. 데몬만 꺼내서 보관 프로세스에 입력으로 보낸다.
+//! 클라이언트의 `Screen`은 꺼내지 않는다(같은 질의에 두 번 답하지 않도록).
 
 use std::fmt::Write as _;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Instant;
 
-use alacritty_terminal::event::VoidListener;
+use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::{Dimensions, Grid, GridCell, Row, Scroll};
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::{Cell, Flags, Hyperlink};
@@ -46,10 +49,51 @@ impl Dimensions for Size {
     }
 }
 
+/// 색 질의(OSC 10/11/12)에 답하는 기본 전경색과 배경색. 앱이 OSC로 바꾼 색이 있으면 그 색이 먼저다.
+// ponytail: 클라이언트가 바깥 터미널의 실제 색을 알려 주면(이후 태스크) 그 값으로 바꾼다.
+const DEFAULT_FG: Rgb = Rgb {
+    r: 0xff,
+    g: 0xff,
+    b: 0xff,
+};
+const DEFAULT_BG: Rgb = Rgb {
+    r: 0x28,
+    g: 0x2c,
+    b: 0x34,
+};
+
+/// 꺼내지 않고 쌓아 둘 답의 최대 개수. 클라이언트 쪽 `Screen`은 꺼내지 않으므로 무한히 늘지 않게 막는다.
+const MAX_PENDING_REPLIES: usize = 256;
+
+/// 질의에 대한 답 하나. 색 답은 꺼낼 때 그 시점 색으로 채운다.
+enum Reply {
+    Text(String),
+    Color(usize, Arc<dyn Fn(Rgb) -> String + Send + Sync>),
+}
+
+/// `Term`이 보내는 사건 중 PTY로 돌려보낼 답만 모으는 수신자.
+#[derive(Clone, Default)]
+pub struct Replies(Arc<Mutex<Vec<Reply>>>);
+
+impl EventListener for Replies {
+    fn send_event(&self, event: Event) {
+        let reply = match event {
+            Event::PtyWrite(text) => Reply::Text(text),
+            Event::ColorRequest(index, format) => Reply::Color(index, format),
+            _ => return,
+        };
+        let mut pending = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if pending.len() < MAX_PENDING_REPLIES {
+            pending.push(reply);
+        }
+    }
+}
+
 /// 세션 하나의 화면. 데몬이 PTY 출력을 `feed`로 먹이고, 붙는 클라이언트에는 `snapshot`을 보낸다.
 pub struct Screen {
-    term: Term<VoidListener>,
+    term: Term<Replies>,
     parser: Processor,
+    replies: Replies,
     /// 대체 화면에 있는 동안 가려진 주 화면(스크롤백 포함). `Term`은 비활성 화면을 내주지 않으므로
     /// 진입한 순간에 복사해 두고, 스냅숏이 대체 화면 뒤의 주 화면을 되살릴 때 쓴다.
     primary: Option<Grid<Cell>>,
@@ -63,9 +107,11 @@ impl Screen {
             kitty_keyboard: true,
             ..Config::default()
         };
+        let replies = Replies::default();
         Screen {
-            term: Term::new(config, &Size::new(cols, rows), VoidListener),
+            term: Term::new(config, &Size::new(cols, rows), replies.clone()),
             parser: Processor::new(),
+            replies,
             primary: None,
         }
     }
@@ -75,13 +121,64 @@ impl Screen {
         // 진입 직후 주 화면이 아직 그대로일 때 붙잡고, 한 번에 나갔다 다시 들어와도 놓치지 않는다.
         for chunk in bytes.split_inclusive(|&b| b == b'h' || b == b'l') {
             self.parser.advance(&mut self.term, chunk);
-            let alt = self.term.mode().contains(TermMode::ALT_SCREEN);
-            match (alt, self.primary.is_some()) {
-                (true, false) => self.primary = Some(self.copy_primary()),
-                (false, true) => self.primary = None,
-                _ => {}
+            self.track_alt();
+        }
+    }
+
+    /// 지금 화면이 대체 화면인지에 맞춰 가려진 주 화면 복사본을 만들거나 버린다.
+    fn track_alt(&mut self) {
+        let alt = self.term.mode().contains(TermMode::ALT_SCREEN);
+        match (alt, self.primary.is_some()) {
+            (true, false) => self.primary = Some(self.copy_primary()),
+            (false, true) => self.primary = None,
+            _ => {}
+        }
+    }
+
+    /// 지금까지 먹인 출력의 터미널 질의에 대한 답(PTY에 쓸 바이트). 꺼낸 답은 비운다.
+    pub fn take_replies(&mut self) -> Vec<u8> {
+        let pending = std::mem::take(
+            &mut *self
+                .replies
+                .0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
+        let mut out = String::new();
+        for reply in pending {
+            match reply {
+                Reply::Text(text) => out.push_str(&text),
+                Reply::Color(index, format) => {
+                    if let Some(color) = self.color(index) {
+                        out.push_str(&format(color));
+                    }
+                }
             }
         }
+        out.into_bytes()
+    }
+
+    /// 색 질의에 답할 색. 앱이 정한 색이 먼저고, 없으면 기본 전경·배경색이다. 그 밖의 색 번호는 답하지 않는다.
+    fn color(&self, index: usize) -> Option<Rgb> {
+        let fallback = match index {
+            i if i == NamedColor::Background as usize => DEFAULT_BG,
+            i if i == NamedColor::Foreground as usize || i == NamedColor::Cursor as usize => {
+                DEFAULT_FG
+            }
+            _ => return self.term.colors()[index],
+        };
+        Some(self.term.colors()[index].unwrap_or(fallback))
+    }
+
+    /// 동기화 갱신(`CSI ? 2026 h`) 중이면 그 갱신이 끝나야 할 시각. 이때까지 끝나지 않으면 `end_sync`를 부른다.
+    pub fn sync_deadline(&self) -> Option<Instant> {
+        self.parser.sync_timeout().sync_timeout()
+    }
+
+    /// 끝나지 않은 동기화 갱신을 끝내고 모아 둔 출력을 화면에 반영한다. 세션이 멈춘 화면에 갇히지 않게 한다.
+    pub fn end_sync(&mut self) {
+        self.parser.stop_sync(&mut self.term);
+        self.track_alt();
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16) {
@@ -149,7 +246,7 @@ impl Screen {
         self.term.scroll_display(Scroll::Delta(delta));
     }
 
-    pub fn term(&self) -> &Term<VoidListener> {
+    pub fn term(&self) -> &Term<Replies> {
         &self.term
     }
 
@@ -797,6 +894,50 @@ mod tests {
         assert_eq!(s.snapshot(), before);
         s.scroll(-5);
         assert_eq!(s.term().grid().display_offset(), 0);
+    }
+
+    #[test]
+    fn answers_cursor_position_query() {
+        let mut s = Screen::new(40, 10);
+        s.feed(b"\x1b[3;5H\x1b[6n");
+        assert_eq!(s.take_replies(), b"\x1b[3;5R");
+        assert!(s.take_replies().is_empty());
+    }
+
+    #[test]
+    fn answers_device_colour_and_keyboard_queries() {
+        let mut s = Screen::new(40, 10);
+        s.feed(b"\x1b[c\x1b]11;?\x07\x1b]10;?\x1b\\\x1b[>1u\x1b[?u");
+        let want = "\x1b[?6c\x1b]11;rgb:2828/2c2c/3434\x07\x1b]10;rgb:ffff/ffff/ffff\x1b\\\x1b[?1u";
+        assert_eq!(String::from_utf8(s.take_replies()).unwrap(), want);
+        // 앱이 OSC로 바꾼 색으로 답한다.
+        s.feed(b"\x1b]11;rgb:01/02/03\x07\x1b]11;?\x07");
+        assert_eq!(s.take_replies(), b"\x1b]11;rgb:0101/0202/0303\x07");
+    }
+
+    #[test]
+    fn unread_replies_are_capped() {
+        let mut s = Screen::new(40, 10);
+        s.feed(&b"\x1b[c".repeat(MAX_PENDING_REPLIES + 10));
+        assert_eq!(
+            s.take_replies().len(),
+            MAX_PENDING_REPLIES * b"\x1b[?6c".len()
+        );
+    }
+
+    #[test]
+    fn unfinished_sync_update_can_be_ended() {
+        let mut s = Screen::new(40, 10);
+        s.feed(b"\x1b[?2026hframe");
+        assert!(s.sync_deadline().is_some());
+        assert_eq!(s.lines()[0], "");
+        s.end_sync();
+        assert!(s.sync_deadline().is_none());
+        assert_eq!(s.lines()[0], "frame");
+        // 끝난 동기화 갱신은 데드라인이 없다.
+        s.feed(b"\x1b[?2026h!\x1b[?2026l");
+        assert!(s.sync_deadline().is_none());
+        assert_eq!(s.lines()[0], "frame!");
     }
 
     #[test]

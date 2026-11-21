@@ -12,6 +12,9 @@ use sha2::{Digest, Sha256};
 /// 상태 폴더 위치를 바꾸는 환경 변수.
 const STATE_DIR_ENV: &str = "MINE_STATE_DIR";
 
+/// 유닉스 소켓 경로 한도(macOS `sun_path`, 끝 NUL 포함). 경로 바이트 수가 이보다 작아야 한다.
+pub const SOCK_PATH_MAX: usize = 104;
+
 #[derive(Debug, Clone)]
 pub struct State {
     pub root: PathBuf,
@@ -51,10 +54,14 @@ impl State {
         self.sessions_dir().join(id)
     }
 
+    /// 보관 소켓을 두는 폴더.
+    pub fn run_dir(&self) -> PathBuf {
+        self.root.join("run")
+    }
+
     /// 보관 소켓은 macOS 소켓 경로 한도(104바이트)를 넘지 않도록 id의 해시 앞 12자로 짓는다.
     pub fn hold_sock(&self, id: &str) -> PathBuf {
-        self.root
-            .join("run")
+        self.run_dir()
             .join(format!("{}.sock", sha256_hex_prefix(id.as_bytes(), 12)))
     }
 
@@ -69,6 +76,18 @@ impl State {
     pub fn log_dir(&self) -> PathBuf {
         self.root.join("logs")
     }
+}
+
+/// 소켓 경로가 한도 안인지 본다. 넘으면 바인드·연결 전에 알아보기 쉬운 오류를 낸다.
+pub fn check_sock_path(p: &Path) -> Result<()> {
+    let len = p.as_os_str().len();
+    if len >= SOCK_PATH_MAX {
+        bail!(
+            "소켓 경로가 너무 길다({len}바이트, {SOCK_PATH_MAX}바이트 미만이어야 한다): {}. {STATE_DIR_ENV}로 짧은 상태 폴더를 쓴다",
+            p.display()
+        );
+    }
+    Ok(())
 }
 
 /// 폴더를 (상위 포함) 만들고, 새로 만드는 폴더의 권한을 0o700으로 한다.
@@ -163,6 +182,14 @@ mod tests {
     fn sha256_prefix_matches_known_digest() {
         // sha256("abc") = ba7816bf 8f01cfea 414140de 5dae2223 ...
         assert_eq!(sha256_hex_prefix(b"abc", 12), "ba7816bf8f01");
+    }
+
+    #[test]
+    fn long_socket_path_is_a_clear_error() {
+        assert!(check_sock_path(Path::new(&format!("/{}", "a".repeat(102)))).is_ok());
+        let long = format!("/{}", "a".repeat(103));
+        let err = check_sock_path(Path::new(&long)).unwrap_err().to_string();
+        assert!(err.contains("104"), "{err}");
     }
 
     #[test]

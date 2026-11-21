@@ -3,6 +3,7 @@
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, anyhow};
 
@@ -39,7 +40,9 @@ fn registration_file(state: &State, root: &Path) -> PathBuf {
 }
 
 /// 프로젝트를 등록한다. `projects/<key>.json`에 실제 경로 문자열을 JSON으로 적는다.
+/// 같은 폴더의 임시 파일에 쓴 뒤 이름을 바꿔서, 읽는 쪽이 쓰다 만 파일을 보지 않게 한다.
 pub fn register(state: &State, root: &Path) -> Result<()> {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
     let root = root
         .canonicalize()
         .with_context(|| format!("경로를 확인할 수 없다: {}", root.display()))?;
@@ -48,12 +51,22 @@ pub fn register(state: &State, root: &Path) -> Result<()> {
         .ok_or_else(|| anyhow!("UTF-8이 아닌 경로는 등록할 수 없다: {}", root.display()))?;
     ensure_dir(&state.projects_dir())?;
     let file = registration_file(state, &root);
-    fs::write(&file, serde_json::to_string(text)?)
-        .with_context(|| format!("등록 파일을 쓸 수 없다: {}", file.display()))?;
-    Ok(())
+    // 확장자가 `.json`이 아니라서 `registered`가 읽지 않는다.
+    let tmp = state.projects_dir().join(format!(
+        ".{}.{}.{}.tmp",
+        project_key(&root),
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::write(&tmp, serde_json::to_string(text)?)
+        .and_then(|()| fs::rename(&tmp, &file))
+        .with_context(|| format!("등록 파일을 쓸 수 없다: {}", file.display()))
+        .inspect_err(|_| {
+            let _ = fs::remove_file(&tmp);
+        })
 }
 
-/// 등록된 프로젝트 경로를 정렬해서 돌려준다.
+/// 등록된 프로젝트 경로를 정렬해서 돌려준다. 읽을 수 없거나 형식이 틀린 등록 파일은 경고하고 건너뛴다.
 pub fn registered(state: &State) -> Result<Vec<PathBuf>> {
     let dir = state.projects_dir();
     let entries = match fs::read_dir(&dir) {
@@ -67,11 +80,13 @@ pub fn registered(state: &State) -> Result<Vec<PathBuf>> {
         if path.extension().is_none_or(|e| e != "json") {
             continue;
         }
-        let text = fs::read_to_string(&path)
-            .with_context(|| format!("읽을 수 없다: {}", path.display()))?;
-        let root: String = serde_json::from_str(&text)
-            .with_context(|| format!("등록 파일 형식이 잘못됐다: {}", path.display()))?;
-        roots.push(PathBuf::from(root));
+        let parsed = fs::read_to_string(&path)
+            .map_err(anyhow::Error::from)
+            .and_then(|text| Ok(serde_json::from_str::<String>(&text)?));
+        match parsed {
+            Ok(root) => roots.push(PathBuf::from(root)),
+            Err(e) => eprintln!("경고: 등록 파일을 건너뛴다: {} ({e})", path.display()),
+        }
     }
     roots.sort();
     Ok(roots)
@@ -195,6 +210,22 @@ mod tests {
             std::fs::read_to_string(file).unwrap(),
             serde_json::to_string(real(&t.join("a")).to_str().unwrap()).unwrap()
         );
+    }
+
+    #[test]
+    fn registered_skips_malformed_entries() {
+        let (td, st) = fixture();
+        let t = td.path();
+        std::fs::create_dir_all(t.join("a")).unwrap();
+        register(&st, &t.join("a")).unwrap();
+        std::fs::write(st.projects_dir().join("broken.json"), "not json").unwrap();
+        assert_eq!(registered(&st).unwrap(), vec![real(&t.join("a"))]);
+        // 등록은 임시 파일을 남기지 않는다.
+        let names: Vec<_> = std::fs::read_dir(st.projects_dir())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert!(names.iter().all(|n| n.ends_with(".json")), "{names:?}");
     }
 
     #[test]

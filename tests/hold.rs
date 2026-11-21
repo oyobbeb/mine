@@ -1,15 +1,4 @@
 //! `mine hold` 통합 테스트. 실제 바이너리를 띄워 소켓으로 붙는다.
-//!
-//! 바이너리 크레이트라 라이브러리로 가져올 수 없어서 프로토콜 모듈 소스를 그대로 포함한다.
-
-#![allow(dead_code)]
-
-#[path = "../src/paths.rs"]
-mod paths;
-#[path = "../src/proto.rs"]
-mod proto;
-#[path = "../src/session.rs"]
-mod session;
 
 use std::io::{BufReader, Read};
 use std::os::unix::net::UnixStream;
@@ -17,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use proto::{HoldIn, HoldOut, read_msg, write_msg};
+use mine::proto::{HoldIn, HoldOut, read_msg, write_msg};
 
 /// 소켓 읽기와 출력 찾기가 기다리는 최대 시간.
 const READ_WAIT: Duration = Duration::from_secs(3);
