@@ -1,116 +1,125 @@
 # mine
 
-Claude Code 계정 두 개와 Codex를 한 터미널 작업방에서 사용합니다. 작업을 선택하면 대화·인수인계 메모를 함께 보고, 사용할 계정과 모델을 정할 수 있습니다. 순정 CLI는 tmux에서 실행합니다.
+Ghostty 안에서 tmux를 대신하는 AI 코딩 에이전트용 터미널 멀티플렉서입니다. Claude Code 계정 두 개와 Codex, 일반 셸 세션을 프로젝트별로 묶어 보여 주고, 화면을 닫거나 SSH가 끊겨도 세션은 계속 돕니다. Rust 바이너리 하나(`mine`)로 동작합니다.
 
 ## 설계와 구현 상태
 
-`mine`은 한 호스트에서 작업별로 에이전트를 추천하고, 사용자가 선택한 계정에 작업을 맡긴다. 작업방에는 공유 대화를, 계정별 CLI에는 해당 모델의 세션을 보관한다. 따라서 Claude가 작성한 변경을 Codex가 리뷰하고 다시 Claude로 넘길 수 있다.
+설계는 [docs/superpowers/specs/2026-11-20-mine-multiplexer-design.md](docs/superpowers/specs/2026-11-20-mine-multiplexer-design.md)에, 구현 순서는 [docs/superpowers/plans/2026-11-20-mine-core.md](docs/superpowers/plans/2026-11-20-mine-core.md)에 있다. 화면 목업은 [docs/superpowers/specs/2026-11-20-mine-mockups](docs/superpowers/specs/2026-11-20-mine-mockups)에 있다.
 
-현재 구현은 Python CLI와 tmux다. Ghostty나 SSH 터미널에서 실행할 수 있다. Rust 스케줄러와 Ratatui 화면은 제안 단계다. 모바일용 호스트 서비스, 기기 페어링, 이벤트 동기화, 사용 한도에 따른 자동 전환도 아직 구현 전이다.
+구조는 세 층이다. 클라이언트(`mine`)는 화면을 그리고 키를 받는다. 데몬(`mine daemon`)은 세션 목록과 상태, 세션마다의 터미널 화면을 유지한다. 세션 PTY는 세션마다 따로 뜨는 보관 프로세스(`mine hold`)가 쥐므로, 클라이언트를 닫거나 데몬이 재시작돼도 claude·codex·shell 프로세스는 계속 돈다. 데몬은 `mine`이 처음 실행될 때 알아서 뜬다.
 
 ```mermaid
-flowchart TD
-    UI["mine ui 또는 헤드리스 명령"] --> WS["프로젝트 → 작업방"]
-    WS --> Ask["ask: 계정 선택 · 최근 인계 기록"]
-    Ask --> CLI["claude -p 또는 codex exec"]
-    CLI --> Journal["작업방 handoff.jsonl"]
-    WS --> Native["open: tmux 순정 세션"]
-    Native --> Hooks["질문 제출 · 응답 완료 훅"]
-    Hooks --> Journal
-    Journal --> Ask
+flowchart LR
+    Client["mine (클라이언트)"] -->|"유닉스 소켓"| Daemon["mine daemon"]
+    Daemon --> H1["mine hold"] --> S1["claude / codex / shell"]
+    Daemon --> H2["mine hold"] --> S2["claude / codex / shell"]
+    Hook["순정 CLI 훅"] -->|"mine _event"| Daemon
 ```
 
-| 코드를 읽는 순서 | 책임 |
+현재는 설계의 1단계(데몬과 세션)가 구현돼 있다. 나머지 단계는 아래 "지금 되는 것과 아직 안 되는 것"에 정리했다. 예전 Python 프로토타입(`mine ask`, 작업방, 계정 간 대화 인계)은 이 Rust 구현으로 교체했고, 그 기록(`~/.mine/rooms`)은 옮기지 않는다.
+
+## 설치
+
+Rust 1.89 이상이 필요합니다. 세션 종류에 맞는 CLI(`claude`, `codex`)는 따로 설치하고 로그인해 두세요. 저장소 루트에서 실행합니다.
+
+```sh
+cargo install --path .
+```
+
+`~/.cargo/bin`이 PATH에 있어야 합니다. 새 셸에서 `command -v mine`으로 확인하세요. 예전에 Python 프로토타입을 쓰려고 `~/.local/bin/mine` 링크를 만들었다면 지우세요. 그 링크는 이제 없는 스크립트를 가리켜 `mine`이 실행되지 않습니다.
+
+```sh
+rm ~/.local/bin/mine
+```
+
+기준 환경은 macOS(Apple Silicon)와 Ghostty다. tmux는 필요 없다.
+
+## 실행
+
+프로젝트 폴더 안에서 실행한다. 현재 위치에서 위로 올라가며 가장 가까운 Git 작업 트리 루트를 프로젝트로 쓰고, Git 저장소가 없으면 등록된 폴더나 현재 폴더를 쓴다. 별도 worktree와 중첩 저장소는 각각 독립된 프로젝트다.
+
+```sh
+mine                                  # 화면을 연다
+mine ls                               # 세션 목록
+mine new rust-core --kind claude --account claude-b --model opus
+mine new dev                          # 종류를 생략하면 shell
+mine kill rust-core                   # 세션을 닫는다
+mine projects                         # 등록된 프로젝트
+mine --project ~/dev/mine new dev     # 프로젝트 폴더를 직접 지정한다
+```
+
+- `mine`: 아이콘 줄, 상태별 목록, 선택한 세션의 터미널로 이루어진 화면이다. 데몬이 없으면 띄운다.
+- `mine ls`: 한 줄에 `기호 프로젝트폴더 이름 계정 상태 대기문구`를 탭으로 나눠 쓴다. 빈 칸은 `-`다. 세션이 없으면 아무것도 출력하지 않는다.
+- `mine new <이름> [--kind claude|codex|shell] [--account claude-a|claude-b|codex] [--model 모델]`: 이름은 프로젝트 안에서 고유해야 한다. 영문·숫자로 시작하고 영문·숫자·`_~-`만 쓰며 64자 이하다. 종류를 생략하면 `shell`이다. `--account`를 생략한 claude 세션은 기본 설정 폴더(`~/.claude`)를 쓴다.
+- `mine kill <이름>`: 세션을 닫는다. 세션 폴더와 기록은 남는다.
+- `--project`는 하위 명령 앞에 쓴다. 생략하면 현재 위치에서 프로젝트를 찾는다.
+
+## 키
+
+접두 키는 `⌃a`다. `⌃a`를 누른 뒤 아래 키를 누른다.
+
+| 키 | 동작 |
 |---|---|
-| [mine](mine)의 `main`, `console`, `terminal` | CLI와 작업 화면, 프로젝트 전환, tmux 세션 생성·재접속, 훅 입력 처리 |
-| [scheduler.py](scheduler.py)의 `Workspace`, `ask`, `context` | 프로젝트 식별과 계정 환경, 실행 디렉터리, 대화 기록과 세션 재개 |
-| 같은 파일의 `recommendation`, `refresh_codex`, `native_event` | 계정 추천, 사용량 관측, 순정 세션과 작업방 간 대화 전달 |
-| [tests/test_workflow.py](tests/test_workflow.py) | 모의 CLI로 왕복 인계, 실패 기록, 한도 소진, 프로젝트 격리를 검증 |
+| `⌃a ⌃a` | 세션에 `⌃a`(0x01) 자체를 보낸다 |
+| `⌃a n` / `⌃a p` | 다음 / 이전 세션. 목록에 보이는 순서이며 끝에서 처음으로 돈다 |
+| `⌃a )` / `⌃a (` | 다음 / 이전 프로젝트 |
+| `⌃a 0` | 모든 프로젝트 |
+| `⌃a c` | 새 세션. 상태줄에 `<claude-a\|claude-b\|codex\|shell> <이름> [모델]`을 쓰고 Enter. Esc는 취소 |
+| `⌃a x` | 현재 세션 닫기. `y`를 누르면 닫고, 다른 키는 취소 |
+| `⌃a b` | 목록 접기 / 펴기. 접으면 아이콘 줄만 남는다 |
+| `⌃a [` | 복사 모드 |
+| `⌃a d` | 화면에서 떼기. 세션은 계속 돈다 |
 
-**상태의 범위.** 기본 저장 위치는 `~/.mine`이다. `projects/<key>.json`은 실제 프로젝트 경로를, `rooms/<key>/<room>/handoff.jsonl`은 작업 기록을 보관한다. 키는 실제 경로를 SHA-256으로 해시한 앞 16자리다. `profiles/<agent>`의 Claude 설정과 `usage/<agent>.json`의 사용량 관측값은 같은 호스트의 여러 프로젝트가 공유한다. Codex는 사용자의 기존 Codex 로그인을 사용한다.
+**복사 모드.** 스크롤백을 얼려 놓고 키보드로 움직이며 복사한다.
 
-**한 턴의 처리.** `ask`는 작업방의 `turn.lock`을 잡고 사용자 요청을 기록한 뒤 프로젝트 루트에서 CLI를 실행한다. 같은 계정의 마지막 성공 응답에 세션 ID가 있으면 그 세션을 재개하고 그 뒤에 쌓인 공유 기록을 전달한다. 첫 요청에는 방의 최근 기록을 전달한다. 전달 텍스트는 최근 16,000자로 제한하고 전체 기록 경로도 제공한다. 성공 응답에 세션 ID를 저장하며, 실패하면 오류를 기록한다. 실패 전에 실행한 파일 편집이나 외부 명령은 이미 반영됐을 수 있다.
+| 키 | 동작 |
+|---|---|
+| `h` `j` `k` `l` 또는 방향키 | 커서 이동 |
+| `g` / `G` | 맨 위 / 맨 아래 |
+| `/` | 검색어 입력(Enter로 찾기, Esc로 입력 취소). 대소문자를 가리지 않는다 |
+| `n` / `N` | 다음 / 이전 일치 |
+| `v` | 선택 시작 / 해제 |
+| `y` 또는 Enter | 선택 영역을 복사하고 복사 모드를 끝낸다 |
+| `q` 또는 Esc | 복사 모드를 끝낸다 |
 
-**동시 실행의 경계.** 잠금은 같은 방의 `ask` 호출끼리 적용된다. 순정 tmux 세션과 서로 다른 작업방은 독립적으로 움직이므로, 동일 파일을 병렬 편집할 때는 별도 worktree를 사용하거나 편집이 끝난 후 인계한다. 사용량에는 관측 시각이 붙고 추천은 계정을 직접 전환하지 않는다.
+**마우스.**
 
-**다음 에이전트의 출발점.** Rust 이식에 착수한다면 기존 상태 디렉터리를 복사한 테스트 환경에서 메모 읽기, Claude → Codex → Claude 왕복, 하위 폴더에서의 프로젝트 선택을 먼저 검증한다. 모바일 확장에서는 호스트가 작업 실행을 유지하고 클라이언트가 같은 작업방에 재접속하는 것을 목표로 한다. 현재 SSH 접속과 장래의 모바일 서비스는 배포 방식이 다르다.
+- 휠: 세션 터미널의 스크롤백을 움직인다. 세션 프로그램이 마우스를 직접 받으면 그 프로그램에 넘긴다.
+- 드래그: 선택하고, 손을 떼면 OSC 52로 클립보드에 복사한다. Ghostty가 ⌘C를 가로채므로 이 방식을 쓴다.
+- 클릭: 아이콘 줄의 프로젝트나 목록의 세션 줄을 고른다. 그룹 머리글을 누르면 그룹을 접거나 편다.
 
-## 시작
+## 상태 폴더
 
-macOS 또는 Linux에서 Python 3.8+, tmux 3.2+, Claude Code, Codex CLI가 필요합니다. 파일 변경 보기에는 GitButler CLI(`but`)를 사용합니다. 저장소 루트에서 한 번 실행해 사용자 명령 경로에 연결하세요.
-
-```sh
-mkdir -p ~/.local/bin
-ln -s "$PWD/mine" ~/.local/bin/mine
-```
-
-새 셸에서 `command -v mine`으로 확인하세요. zsh의 PATH에 `~/.local/bin`이 없다면 `~/.zshrc`에 `export PATH="$HOME/.local/bin:$PATH"`를 추가한 뒤 셸을 다시 여세요. 이제 작업할 저장소 안에서 아래 명령을 사용할 수 있습니다.
-
-```sh
-mine login claude-a
-mine login claude-b
-mine login codex
-mine ui payments
-```
-
-두 Claude 계정은 별도의 설정 디렉터리를 쓰며, Codex는 기존 사용자 로그인을 사용합니다. 처음 설정할 때 각 CLI에서 활성 로그인 방법을 확인하세요. 실제 요청은 선택한 계정의 사용량을 소비합니다.
-
-## 프로젝트와 작업방
-
-`mine`은 현재 위치에서 위로 올라가며 가장 가까운 Git 작업 트리 루트 또는 등록된 프로젝트 폴더를 찾습니다. 처음 연 작업방이 해당 프로젝트를 등록합니다. Git 저장소가 없는 경우에는 현재 폴더가 기준입니다. 별도 worktree와 중첩 저장소는 각각 독립된 프로젝트입니다. 같은 이름의 폴더도 전체 로컬 경로로 구분합니다.
-
-```sh
-mine projects
-mine --project ~/dev/shop-front ui payments
-```
-
-콘솔에서는 `/projects`로 목록을 보고 `/project ~/dev/mine`과 `/room 작업이름`으로 전환합니다. 프로젝트를 바꾸면 대상 폴더의 기본 작업방을 열고 계정을 다시 선택합니다. 에이전트 실행과 파일 변경 보기도 선택한 폴더를 기준으로 합니다. 계정 로그인과 사용량은 호스트 안에서 공유됩니다.
-
-이전 버전에서 하위 폴더를 작업 루트로 사용했으면 `mine --project 기존폴더 history 작업이름`으로 그 폴더의 기존 기록을 열 수 있습니다. 프로젝트 식별에는 실제 경로를 사용하므로 폴더를 이동하면 별개 프로젝트로 열립니다.
-
-## 한 작업에서 Claude → Codex → Claude
-
-작업 화면에 아래 내용을 한 줄씩 입력합니다. 일반 텍스트는 선택한 실행기로 보내고, 답변은 같은 대화 기록에 저장합니다.
+기본 위치는 `~/.mine`이고 `MINE_STATE_DIR`로 바꾼다. 유닉스 소켓 경로가 macOS 한도(104바이트)를 넘지 않도록 짧은 경로를 쓴다.
 
 ```text
-/use claude-a sonnet
-취소 처리를 수정하고 변경 이유를 설명해줘.
-/recommend 독립 코드 리뷰
-/use codex
-방금 변경한 취소 처리를 리뷰해줘.
-/use claude-a
-리뷰에서 지적한 부분을 확인해줘.
+~/.mine/
+  daemon.sock           클라이언트가 붙는 유닉스 소켓
+  daemon.pid            데몬이 하나만 뜨게 하는 잠금 파일
+  projects/<key>.json   등록된 프로젝트의 실제 경로. key는 경로 SHA-256의 앞 16자
+  sessions/<id>/        meta.json, events.jsonl(훅 이벤트), exit(자식 종료 코드)
+  run/                  보관 프로세스 소켓
+  logs/                 daemon.log, hold-<id>.log
+  profiles/claude-b/    claude-b의 CLAUDE_CONFIG_DIR
 ```
 
-- `/native`는 선택한 계정의 순정 터미널을 엽니다. tmux 안에서는 팝업에 열립니다. 기본 키 `Ctrl-b d`로 분리하면 작업 화면으로 돌아옵니다. 명령 실행이나 권한 승인이 필요한 경우 순정 화면에서 직접 처리할 수 있습니다.
-- `/files`는 현재 프로젝트의 미커밋 diff를 보여줍니다. `/history`는 작업 기록 전체, `/room 이름`은 다른 작업방, `/quit`은 화면 종료입니다.
-- `/usage`는 Codex App Server에서 한도를 조회하고 Claude 순정 터미널의 상태줄이 마지막으로 관측한 한도와 함께 표시합니다. Claude 상태줄은 첫 모델 응답 후에 값이 생길 수 있습니다. `/recommend`는 최근 15분 이내 관측된 한도, 직전 응답 계정 및 리뷰 요청 여부를 사용합니다. 추천만 표시하며 배정은 사용자가 합니다.
-- SSH에서는 같은 호스트·사용자의 같은 프로젝트 경로에서 실행하세요. 공통 화면의 요청도 SSH를 끊은 뒤 계속 실행하려면 `tmux new -A -s mine-console` 안에서 `mine ui payments`를 실행하세요.
+claude-a는 지금의 `~/.claude`를 그대로 쓴다. 설계 5.9의 `config.toml`, `usage/`, `master/`, 세션의 대화·인계 기록은 이후 단계에서 생긴다.
 
-## 헤드리스 명령
+## 지금 되는 것과 아직 안 되는 것
 
-```sh
-mine rooms
-mine usage
-mine recommend payments '취소 처리 리뷰'
-mine ask payments codex '이전 변경을 리뷰해줘'
-mine note payments '배포는 별도 승인 후 진행'
-mine history payments
-mine open payments claude-b --model sonnet --detach
-mine status payments
-```
+**되는 것(1단계).** 프로젝트 단위로 claude·codex·shell 세션을 만들고 전환하고 닫는다. 아이콘 줄과 상태별 목록(◆ 승인 대기, ◐ 작업 중, ✓ 끝남, ○ 대기)이 순정 CLI 훅으로 정한 상태를 보여 준다. 화면을 닫아도 세션이 계속 돌고, 다시 붙으면 현재 화면이 복구된다. 프로세스가 끝난 claude·codex 세션은 `종료됨`으로 남아, 고르면 같은 대화를 다시 띄운다. 스크롤백, 드래그 복사, 복사 모드를 쓸 수 있다.
 
-작업 기록은 `~/.mine/rooms`에 저장합니다. 기존 `handoff.jsonl` 메모도 읽습니다. `MINE_STATE_DIR`로 저장 위치와 Claude 프로필 루트를 변경할 수 있습니다.
+**아직 안 되는 것(2–8단계).**
 
-## 인계 범위
+- 2단계: 계정 한도 수집과 경고, `⌃a s` 넘기기와 인계, claude 두 계정의 설정 공유
+- 3단계: 재부팅 뒤 세션 복원
+- 4단계: git graph와 files 칸
+- 5단계: 원격 호스트
+- 6단계: 마스터 세션
+- 7단계: 브라우저 칸
+- 8단계: 설치 한 줄로 PATH에 넣는 배포(Homebrew). 그 전까지는 `cargo install --path .`를 쓴다.
 
-공통 화면은 계정별 CLI 세션 ID를 저장해 다음 요청에 재사용합니다. 계정 전환 시 최근 공유 기록(최대 16,000자)과 전체 기록 경로를 전달합니다. 작업방 이름이 같아도 프로젝트 경로가 다르면 기록이 분리됩니다.
-
-새로 연 순정 세션에서는 `UserPromptSubmit`과 `Stop` 훅이 사용자 질문과 최종 답변을 같은 기록에 추가합니다. **Codex 순정 세션에서 새 훅 검토가 표시되면 `/hooks`에서 해당 작업방의 mine 훅을 확인하세요.** 훅이 꺼져 있거나 구버전으로 열린 세션이면 순정 대화 수집이 작동하지 않습니다. 기존 세션은 작업을 마치고 CLI를 종료한 뒤 다시 열면 새 설정을 받습니다. Claude 순정 세션에서는 mine 사용량 표시줄이 적용됩니다.
-
-공통 화면과 순정 터미널은 대화와 작업 파일을 공유합니다. 실행 중인 도구의 승인이나 중간 출력은 해당 순정 세션에 남습니다. 순정 터미널에서 파일을 편집 중이라면 그 턴이 끝난 뒤 넘기세요. 실패한 요청은 기록에 표시되며 자동 재실행되지 않습니다.
-
-`python3 -B -m unittest discover -s tests -v`로 실제 모델 호출 없이 계정 간 왕복과 실패 처리를 검증할 수 있습니다.
+**알려진 한계(설계 5.12).** 안쪽 앱이 켠 키보드 모드(modifyOtherKeys, kitty 키보드, DECCKM)를 아직 바깥 터미널로 넘기지 않아서 Claude Code의 Shift+Enter 줄바꿈이 안 될 수 있다. IME 조합 위치, kitty 이미지 깜박임, 입력 지연 체감, Ghostty에서의 Codex 색은 아직 Ghostty에서 확인하지 못했다.
 
 ## 개발 브랜치와 인수인계 규칙
 
@@ -118,7 +127,7 @@ mine status payments
 
 1. 작업 시작 시 GitButler의 `but status -fv`로 현재 브랜치와 다른 작업자의 변경을 확인한다. 새 작업은 최신 `dev` 위에서 시작하고, 서로 의존하는 커밋은 의존 순서대로 쌓는다.
 2. 한 커밋은 독립적으로 설명하고 되돌릴 수 있는 동작 하나를 담는다. 그 동작에 필요한 테스트와 호환 처리를 함께 넣는다. 저장 형식을 바꾸면 기존 작업 기록을 읽는지와 이전 버전으로 복귀했을 때 데이터에 미치는 영향도 확인한다.
-3. 각 커밋의 파일 상태에서 `python3 -B -m unittest discover -s tests -v`를 실행한다. 동작을 바꿨다면 영향을 받는 CLI 진입점도 검증한다. 나중 커밋에 들어갈 미커밋 변경이 있다면 임시 worktree에서 해당 커밋만 검증한다. 중간 커밋이 깨지면 공개 전에 원인이 속한 커밋을 고치고 이후 커밋까지 재검증한다.
+3. 각 커밋의 파일 상태에서 `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test`를 실행한다. 동작을 바꿨다면 영향을 받는 CLI 진입점도 검증한다. 나중 커밋에 들어갈 미커밋 변경이 있다면 임시 worktree에서 해당 커밋만 검증한다. 중간 커밋이 깨지면 공개 전에 원인이 속한 커밋을 고치고 이후 커밋까지 재검증한다.
 4. 병행 작업은 공개 전 최신 `dev` 위로 rebase하고 테스트한 뒤 fast-forward로 반영한다. 릴리스할 때는 검증한 `dev`까지 `main`을 fast-forward한다. 분기 때문에 fast-forward가 불가능하면 먼저 차이를 검토한다. 이미 공유된 브랜치의 강제 푸시나 이력 재작성은 소유자와 합의한다.
 5. 공유 후 롤백은 동작을 취소하는 새 커밋으로 기록한다. 의존하는 변경을 함께 되돌릴 때는 최신 커밋부터 역순으로 처리하고 같은 테스트를 실행한다. 코드 롤백과 작업 기록·외부 시스템의 복구는 별도로 확인한다.
 
