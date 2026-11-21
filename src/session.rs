@@ -7,6 +7,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
+
+use crate::paths::State;
 
 /// 세션이 띄우는 프로그램 종류.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -123,6 +126,104 @@ impl Meta {
     }
 }
 
+/// 보관 프로세스가 세션 자식으로 띄울 명령.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Launch {
+    pub argv: Vec<String>,
+    pub env: Vec<(String, String)>,
+    pub cwd: PathBuf,
+}
+
+/// 로그인 셸 경로. `SHELL`이 비어 있거나 없으면 `/bin/zsh`다.
+pub fn login_shell() -> String {
+    std::env::var("SHELL")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "/bin/zsh".to_string())
+}
+
+/// 셸이 한 단어로 읽도록 POSIX 작은따옴표로 감싼다. 안전한 글자만 있으면 그대로 둔다.
+fn shell_quote(s: &str) -> String {
+    let plain = !s.is_empty()
+        && s.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(c, '_' | '-' | '.' | '/' | ':' | '=' | '@' | '%' | '+' | ',')
+        });
+    if plain {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    }
+}
+
+/// 훅이 부르는 명령 줄 `<exe> _event <세션 폴더>`.
+fn hook_command(exe: &Path, session_dir: &Path) -> String {
+    format!(
+        "{} _event {}",
+        shell_quote(&exe.to_string_lossy()),
+        shell_quote(&session_dir.to_string_lossy())
+    )
+}
+
+/// 세션 종류별 실행 명령을 만든다. claude와 codex에는 상태 훅을 주입한다.
+pub fn launch(meta: &Meta, state: &State, exe: &Path) -> Launch {
+    let mut env = vec![("MINE_SESSION".to_string(), meta.id.clone())];
+    let command = hook_command(exe, &state.session_dir(&meta.id));
+    let mut argv = Vec::new();
+    match meta.kind {
+        Kind::Shell => argv.extend([login_shell(), "-l".to_string()]),
+        Kind::Claude => {
+            let c = json!({"type": "command", "command": command});
+            let h = json!({"hooks": [c]});
+            let settings = json!({"hooks": {
+                "UserPromptSubmit": [h],
+                "Stop": [h],
+                "Notification": [{"matcher": "permission_prompt", "hooks": [c]}],
+            }});
+            argv.extend([
+                "claude".to_string(),
+                "--settings".to_string(),
+                settings.to_string(),
+            ]);
+            if let Some(model) = &meta.model {
+                argv.extend(["--model".to_string(), model.clone()]);
+            }
+            if let Some(id) = &meta.resume_id {
+                argv.extend(["--resume".to_string(), id.clone()]);
+            }
+            if meta.account.as_deref() == Some("claude-b") {
+                let dir = state.profiles_dir().join("claude-b");
+                env.push((
+                    "CLAUDE_CONFIG_DIR".to_string(),
+                    dir.to_string_lossy().into_owned(),
+                ));
+            }
+        }
+        Kind::Codex => {
+            // `-c` 값은 JSON이 아니라 TOML이다. JSON 문자열 이스케이프는 TOML 기본 문자열에도 통한다.
+            let value = format!(
+                "[{{hooks=[{{type=\"command\",command={}}}]}}]",
+                json!(command)
+            );
+            argv.push("codex".to_string());
+            for event in ["UserPromptSubmit", "Stop"] {
+                argv.extend(["-c".to_string(), format!("hooks.{event}={value}")]);
+            }
+            if let Some(model) = &meta.model {
+                argv.extend(["--model".to_string(), model.clone()]);
+            }
+            if let Some(id) = &meta.resume_id {
+                argv.extend(["resume".to_string(), id.clone()]);
+            }
+        }
+    }
+    Launch {
+        argv,
+        env,
+        cwd: meta.project.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,5 +290,179 @@ mod tests {
     fn load_missing_is_an_error() {
         let t = tmp();
         assert!(Meta::load(t.path()).is_err());
+    }
+
+    fn st() -> State {
+        State {
+            root: PathBuf::from("/s"),
+        }
+    }
+
+    fn meta(kind: Kind, account: Option<&str>) -> Meta {
+        Meta {
+            id: "k1-rust".into(),
+            project: PathBuf::from("/work/mine"),
+            name: "rust".into(),
+            kind,
+            account: account.map(Into::into),
+            model: None,
+            restore: Restore::Resume,
+            created_ms: 0,
+            resume_id: None,
+            closed: false,
+        }
+    }
+
+    fn has_pair(argv: &[String], a: &str, b: &str) -> bool {
+        argv.windows(2).any(|w| w[0] == a && w[1] == b)
+    }
+
+    fn session_env(l: &Launch) -> Option<&str> {
+        l.env
+            .iter()
+            .find(|(k, _)| k == "MINE_SESSION")
+            .map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn shell_launch_uses_login_shell() {
+        let l = launch(&meta(Kind::Shell, None), &st(), Path::new("/x/mine"));
+        assert_eq!(l.argv, vec![login_shell(), "-l".to_string()]);
+        assert_eq!(l.cwd, PathBuf::from("/work/mine"));
+        assert_eq!(session_env(&l), Some("k1-rust"));
+    }
+
+    #[test]
+    fn claude_a_launch_keeps_default_config_dir() {
+        let l = launch(
+            &meta(Kind::Claude, Some("claude-a")),
+            &st(),
+            Path::new("/x/mine"),
+        );
+        assert_eq!(l.argv[0], "claude");
+        assert_eq!(l.argv[1], "--settings");
+        assert!(!l.env.iter().any(|(k, _)| k == "CLAUDE_CONFIG_DIR"));
+        assert_eq!(session_env(&l), Some("k1-rust"));
+        assert_eq!(l.cwd, PathBuf::from("/work/mine"));
+        let v: serde_json::Value = serde_json::from_str(&l.argv[2]).unwrap();
+        assert_eq!(
+            v["hooks"]["Notification"][0]["matcher"],
+            "permission_prompt"
+        );
+        let command = "/x/mine _event /s/sessions/k1-rust";
+        for event in ["UserPromptSubmit", "Stop"] {
+            let c = &v["hooks"][event][0]["hooks"][0];
+            assert_eq!(c["type"], "command");
+            assert_eq!(c["command"], command);
+        }
+        assert_eq!(
+            v["hooks"]["Notification"][0]["hooks"][0]["command"],
+            command
+        );
+    }
+
+    #[test]
+    fn claude_without_account_keeps_default_config_dir() {
+        let l = launch(&meta(Kind::Claude, None), &st(), Path::new("/x/mine"));
+        assert!(!l.env.iter().any(|(k, _)| k == "CLAUDE_CONFIG_DIR"));
+    }
+
+    #[test]
+    fn claude_b_launch_sets_profile_dir() {
+        let l = launch(
+            &meta(Kind::Claude, Some("claude-b")),
+            &st(),
+            Path::new("/x/mine"),
+        );
+        assert!(l.env.contains(&(
+            "CLAUDE_CONFIG_DIR".to_string(),
+            "/s/profiles/claude-b".to_string()
+        )));
+        assert_eq!(session_env(&l), Some("k1-rust"));
+    }
+
+    #[test]
+    fn claude_model_and_resume_add_flags() {
+        let mut m = meta(Kind::Claude, Some("claude-a"));
+        m.model = Some("opus".into());
+        m.resume_id = Some("s1".into());
+        let l = launch(&m, &st(), Path::new("/x/mine"));
+        assert!(has_pair(&l.argv, "--model", "opus"));
+        assert!(has_pair(&l.argv, "--resume", "s1"));
+        let plain = launch(
+            &meta(Kind::Claude, Some("claude-a")),
+            &st(),
+            Path::new("/x/mine"),
+        );
+        assert_eq!(plain.argv.len(), 3);
+    }
+
+    #[test]
+    fn claude_resume_adds_flag() {
+        let mut m = meta(Kind::Claude, Some("claude-a"));
+        m.resume_id = Some("s1".into());
+        let l = launch(&m, &st(), Path::new("/x/mine"));
+        assert!(has_pair(&l.argv, "--resume", "s1"));
+    }
+
+    #[test]
+    fn codex_launch_injects_toml_hooks() {
+        let l = launch(
+            &meta(Kind::Codex, Some("codex")),
+            &st(),
+            Path::new("/x/mine"),
+        );
+        assert_eq!(l.argv[0], "codex");
+        assert!(l.argv.iter().any(|a| {
+            a.starts_with("hooks.UserPromptSubmit=[{hooks=[{type=\"command\",command=\"")
+        }));
+        assert!(
+            l.argv
+                .iter()
+                .any(|a| { a.starts_with("hooks.Stop=[{hooks=[{type=\"command\",command=\"") })
+        );
+        assert_eq!(l.argv.iter().filter(|a| *a == "-c").count(), 2);
+        assert_eq!(session_env(&l), Some("k1-rust"));
+        assert!(!l.env.iter().any(|(k, _)| k == "CLAUDE_CONFIG_DIR"));
+        // TOML 값 안의 문자열은 JSON 문자열로 읽혀 원래 명령이 되어야 한다.
+        let arg = l
+            .argv
+            .iter()
+            .find(|a| a.starts_with("hooks.Stop="))
+            .unwrap();
+        let quoted = arg
+            .strip_prefix("hooks.Stop=[{hooks=[{type=\"command\",command=")
+            .and_then(|r| r.strip_suffix("}]}]"))
+            .unwrap();
+        let command: String = serde_json::from_str(quoted).unwrap();
+        assert_eq!(command, "/x/mine _event /s/sessions/k1-rust");
+    }
+
+    #[test]
+    fn codex_resume_uses_subcommand() {
+        let mut m = meta(Kind::Codex, Some("codex"));
+        m.model = Some("gpt-5".into());
+        m.resume_id = Some("t1".into());
+        let l = launch(&m, &st(), Path::new("/x/mine"));
+        assert!(has_pair(&l.argv, "--model", "gpt-5"));
+        assert_eq!(l.argv[l.argv.len() - 2..], ["resume", "t1"]);
+    }
+
+    #[test]
+    fn hook_command_quotes_unsafe_paths() {
+        assert_eq!(shell_quote("/x/mine"), "/x/mine");
+        assert_eq!(shell_quote("a b"), "'a b'");
+        assert_eq!(shell_quote("it's"), "'it'\\''s'");
+        assert_eq!(shell_quote(""), "''");
+        assert_eq!(shell_quote("$(x)"), "'$(x)'");
+        let st = State {
+            root: PathBuf::from("/s s"),
+        };
+        let l = launch(&meta(Kind::Claude, None), &st, Path::new("/my bin/mine"));
+        let v: serde_json::Value = serde_json::from_str(&l.argv[2]).unwrap();
+        assert_eq!(
+            v["hooks"]["Stop"][0]["hooks"][0]["command"],
+            "'/my bin/mine' _event '/s s/sessions/k1-rust'"
+        );
     }
 }

@@ -4,6 +4,8 @@
 
 #![allow(dead_code)]
 
+#[path = "../src/paths.rs"]
+mod paths;
 #[path = "../src/proto.rs"]
 mod proto;
 #[path = "../src/session.rs"]

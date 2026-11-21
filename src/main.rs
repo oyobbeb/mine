@@ -2,6 +2,7 @@
 #![allow(dead_code)]
 
 mod hold;
+mod hooks;
 mod paths;
 mod project;
 mod proto;
@@ -46,6 +47,12 @@ enum Cmd {
         #[arg(last = true, required = true)]
         argv: Vec<String>,
     },
+    /// CLI 훅이 부른다. 표준 입력의 훅 페이로드를 세션 폴더에 기록하고 데몬에 알린다.
+    #[command(name = "_event", hide = true)]
+    Event {
+        /// 세션 폴더(`<상태 폴더>/sessions/<id>`).
+        dir: PathBuf,
+    },
 }
 
 /// `K=V`를 첫 `=` 기준으로 나눈다.
@@ -67,6 +74,11 @@ fn main() -> Result<()> {
             env,
             argv,
         }) => hold::run(&sock, &exit, &cwd, env, argv)?,
+        // 훅은 순정 CLI를 막거나 실패시키면 안 되므로 어떤 오류도 종료 코드에 반영하지 않는다.
+        Some(Cmd::Event { dir }) => {
+            let _ = paths::State::from_env()
+                .and_then(|state| hooks::run_event_cmd(&state, &dir, std::io::stdin().lock()));
+        }
         Some(Cmd::Projects) => {
             let state = paths::State::from_env()?;
             for p in project::registered(&state)? {
