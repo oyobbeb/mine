@@ -3,6 +3,7 @@
 //! 이 작업 하나가 상태를 모두 쥐고 표준 입력(스레드)·데몬 메시지(읽기 작업)·SIGWINCH·다시 그릴 때를
 //! `select!` 하나로 기다린다. `select!`에는 취소에 안전한 채널 수신과 타이머만 넣는다.
 
+pub mod copymode;
 pub mod input;
 pub mod select;
 mod tty;
@@ -30,6 +31,7 @@ use crate::paths::State;
 use crate::proto::{FromDaemon, ToDaemon};
 use crate::screen::Screen;
 use crate::session::SessionInfo;
+use copymode::{CopyMode, CopyOut};
 use input::{Action, Cmd, InputParser, MouseEv, MouseKind};
 use select::Select;
 use ui::{Hit, LinkRun, Model, Prompt};
@@ -99,6 +101,19 @@ pub async fn run(state: State, project: PathBuf) -> Result<()> {
     Ok(())
 }
 
+/// 복사 모드에서 돌아다니는 얼린 화면. `lines`는 들어갈 때의 스크롤백 + 보이는 줄이다.
+struct Copying {
+    mode: CopyMode,
+    lines: Vec<String>,
+    /// 그동안 온 세션 출력. 나갈 때 화면에 먹인다.
+    held: Vec<u8>,
+}
+
+/// 복사 모드 동안 쌓아 두는 출력의 최대 바이트.
+///
+/// ponytail: 넘으면 복사 모드를 끝내고 따라잡는다. 디스크로 넘기거나 오래된 출력을 줄이는 일은 필요해지면 한다.
+const MAX_HELD: usize = 8 << 20;
+
 struct App {
     m: Model,
     /// 붙은 세션의 화면. 데몬이 보낸 스냅숏으로 만들고 출력을 먹인다. 질의 답은 데몬이 하므로 버린다.
@@ -117,6 +132,8 @@ struct App {
     select: Select,
     /// 바깥 터미널에 쓸 클립보드 OSC 52. 그릴 때 화면과 같은 쓰기 통로로 내보낸다.
     clipboard: Vec<u8>,
+    /// 복사 모드. 들어갈 때 화면을 얼려 두고, 그동안 온 출력은 쌓아 둔다.
+    copy: Option<Copying>,
     /// 세션에 넘긴 누름이 아직 눌려 있다. 이 동안 칸 밖 끌기·뗌도 칸 안으로 눌러 넘겨 세션이 뗌을 받게 한다.
     held: bool,
     dirty: bool,
@@ -135,6 +152,7 @@ impl App {
                 prompt: None,
                 message: String::new(),
                 toggled: Vec::new(),
+                status: None,
             },
             screen: None,
             tx,
@@ -145,6 +163,7 @@ impl App {
             links: Vec::new(),
             select: Select::default(),
             clipboard: Vec::new(),
+            copy: None,
             held: false,
             dirty: true,
             quit: false,
@@ -172,6 +191,9 @@ impl App {
         match msg {
             FromDaemon::Sessions { sessions } => self.on_sessions(sessions),
             FromDaemon::Snapshot { id, data } if attached(&id) => {
+                // 새 화면이 얼려 둔 줄을 대신한다. 쌓아 둔 출력도 스냅숏에 들어 있다.
+                self.copy = None;
+                self.m.status = None;
                 let (cols, rows) = self.term_size();
                 let mut screen = Screen::new(cols, rows);
                 screen.feed(&data);
@@ -182,7 +204,14 @@ impl App {
                 self.dirty = true;
             }
             FromDaemon::Output { id, data } if attached(&id) => {
-                if let Some(screen) = &mut self.screen {
+                if let Some(copy) = &mut self.copy {
+                    // 줄 번호가 흔들리지 않게 얼린 화면에는 먹이지 않고 쌓아 둔다.
+                    copy.held.extend_from_slice(&data);
+                    if copy.held.len() > MAX_HELD {
+                        self.exit_copy();
+                        self.say("복사 모드 종료: 출력이 너무 많다");
+                    }
+                } else if let Some(screen) = &mut self.screen {
                     screen.feed(&data);
                     screen.take_replies();
                     // 반전은 보이는 칸에 걸려 있어 출력이 칸을 밀면 엉뚱한 글자를 가린다. 끄는 중에는 뗄 때 읽는다.
@@ -253,6 +282,7 @@ impl App {
         if self.m.attached.as_ref() != Some(&id) {
             self.screen = None;
         }
+        self.exit_copy();
         self.m.attached = Some(id);
         self.select.clear();
         self.held = false;
@@ -263,6 +293,7 @@ impl App {
     fn detach(&mut self) {
         self.m.attached = None;
         self.screen = None;
+        self.exit_copy();
         self.select.clear();
         self.held = false;
         self.dirty = true;
@@ -299,8 +330,11 @@ impl App {
         }
         match action {
             Action::Pass(bytes) if self.m.prompt.is_some() => self.prompt_keys(&bytes),
+            Action::Pass(bytes) if self.copy.is_some() => self.copy_keys(&bytes),
             Action::Pass(data) => self.input(data),
             Action::Paste(text) if self.m.prompt.is_some() => self.prompt_paste(&text),
+            // 복사 모드에서는 입력이 세션으로 가지 않는다.
+            Action::Paste(_) if self.copy.is_some() => {}
             Action::Paste(text) => {
                 let bracketed = self
                     .screen
@@ -345,6 +379,10 @@ impl App {
     }
 
     fn command(&mut self, cmd: Cmd) {
+        // 복사 모드 안에서 다른 명령을 하면 복사 모드를 끝내고 한다.
+        if cmd != Cmd::CopyMode {
+            self.exit_copy();
+        }
         match cmd {
             Cmd::NextSession => self.step_session(1),
             Cmd::PrevSession => self.step_session(-1),
@@ -366,8 +404,7 @@ impl App {
                 self.m.list_open = !self.m.list_open;
                 self.resize_session();
             }
-            // 복사 모드는 Task 11에서 한다.
-            Cmd::CopyMode => {}
+            Cmd::CopyMode => self.enter_copy(),
             Cmd::Detach => self.quit = true,
         }
     }
@@ -422,6 +459,10 @@ impl App {
         }
         let hit = ui::hit(&areas, &self.m, ev.col, ev.row);
         if let Hit::Term(x, y) = hit {
+            // 복사 모드에서는 터미널 칸의 마우스를 쓰지 않는다. 얼린 화면이라 세션에 넘길 것도, 스크롤할 것도 없다.
+            if self.copy.is_some() {
+                return;
+            }
             return self.term_mouse(ev, (x, y));
         }
         if ev.kind != MouseKind::Down || ev.button != 0 {
@@ -499,6 +540,77 @@ impl App {
         self.dirty = true;
     }
 
+    /// `⌃a [`: 지금 화면(스크롤백 포함)을 얼려 두고 복사 모드에 들어간다. 이미 들어가 있으면 그대로 둔다.
+    fn enter_copy(&mut self) {
+        if self.copy.is_some() {
+            return;
+        }
+        let Some(screen) = &self.screen else {
+            return self.say("복사할 세션 화면이 없다");
+        };
+        let (lines, mode) = copymode::freeze(screen);
+        self.copy = Some(Copying {
+            mode,
+            lines,
+            held: Vec::new(),
+        });
+        self.select.clear();
+        self.held = false;
+        self.sync_copy();
+    }
+
+    /// 복사 모드의 키를 먹인다. 끝나는 키(`q`, `y`)가 오면 그 뒤 바이트는 버린다.
+    fn copy_keys(&mut self, bytes: &[u8]) {
+        let Some(copy) = &mut self.copy else {
+            return;
+        };
+        let mut out = CopyOut::Stay;
+        for key in copymode::split(bytes) {
+            out = match key {
+                copymode::Key::Byte(b) => copy.mode.key(&copy.lines, b),
+                copymode::Key::Arrow(dir) => copy.mode.arrow(&copy.lines, dir),
+            };
+            if out != CopyOut::Stay {
+                break;
+            }
+        }
+        match out {
+            CopyOut::Stay => self.sync_copy(),
+            CopyOut::Exit => self.exit_copy(),
+            CopyOut::Copy(text) => {
+                self.exit_copy();
+                if let Some((osc, message)) = select::copy(&text) {
+                    self.clipboard.extend(osc);
+                    self.say(&message);
+                }
+            }
+        }
+    }
+
+    /// 커서 줄이 보이게 화면을 스크롤하고 상태줄을 복사 모드 글로 바꾼다.
+    fn sync_copy(&mut self) {
+        if let (Some(copy), Some(screen)) = (&self.copy, &mut self.screen) {
+            copy.mode.reveal(screen);
+            self.m.status = Some(copy.mode.status(copy.lines.len()));
+        }
+        self.dirty = true;
+    }
+
+    /// 복사 모드를 끝낸다. 쌓아 둔 출력을 화면에 먹이고 맨 아래로 돌아간다.
+    fn exit_copy(&mut self) {
+        let Some(copy) = self.copy.take() else {
+            return;
+        };
+        self.m.status = None;
+        if let Some(screen) = &mut self.screen {
+            screen.feed(&copy.held);
+            screen.take_replies();
+            let scrolled = screen.term().grid().display_offset();
+            screen.scroll(-(scrolled as i32));
+        }
+        self.dirty = true;
+    }
+
     /// 입력 중인 상태줄에 키를 넣는다. `⌃a x` 확인은 `y`만 닫고 다른 키는 취소다.
     fn prompt_keys(&mut self, bytes: &[u8]) {
         self.dirty = true;
@@ -569,6 +681,8 @@ impl App {
 
     /// 터미널 칸 크기가 바뀌었다(창 크기, 목록 접기). 화면과 세션 PTY를 맞춘다.
     fn resize_session(&mut self) {
+        // 크기가 바뀌면 줄 바꿈이 달라져 얼려 둔 줄과 화면이 어긋난다.
+        self.exit_copy();
         let (cols, rows) = self.term_size();
         if let Some(screen) = &mut self.screen {
             screen.resize(cols, rows);
@@ -585,11 +699,18 @@ impl App {
     }
 
     fn sync_deadline(&self) -> Option<Instant> {
+        // 복사 모드 동안은 화면을 얼려 둔다. 끝내지 않은 동기화 갱신이 줄을 바꾸지 않게 한다.
+        if self.copy.is_some() {
+            return None;
+        }
         self.screen.as_ref()?.sync_deadline()
     }
 
     /// 세션이 끝내지 않은 동기화 갱신(`?2026`)이 시간을 넘겼으면 끝내고 다시 그린다. 칸이 멈춘 채 남지 않게 한다.
     fn end_stale_sync(&mut self) {
+        if self.copy.is_some() {
+            return;
+        }
         if let Some(screen) = &mut self.screen
             && screen.sync_deadline().is_some_and(|t| t <= Instant::now())
         {
@@ -615,9 +736,21 @@ impl App {
         queue!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
         let frame = terminal.draw(|f| {
             ui::draw(f, &self.m, self.screen.as_ref());
-            if let Some(sel) = self.select.selection() {
-                let term = ui::layout(f.area(), self.m.list_open).term;
-                select::paint_selection(f.buffer_mut(), term, sel);
+            let areas = ui::layout(f.area(), self.m.list_open);
+            if let (Some(copy), Some(screen)) = (&self.copy, &self.screen) {
+                // 복사 모드의 커서와 선택은 같은 반전으로 칠한다. 검색어를 입력하는 중이면 커서는 상태줄에 둔다.
+                if let Some(sel) = copy.mode.highlight(screen) {
+                    select::paint_selection(f.buffer_mut(), areas.term, &sel);
+                }
+                if copy.mode.typing {
+                    let x = 1 + Span::raw(copy.mode.query.as_str()).width() as u16;
+                    f.set_cursor_position((
+                        areas.status.x + x.min(areas.status.width.saturating_sub(1)),
+                        areas.status.y,
+                    ));
+                }
+            } else if let Some(sel) = self.select.selection() {
+                select::paint_selection(f.buffer_mut(), areas.term, sel);
             }
         })?;
         let term = ui::layout(frame.area, self.m.list_open).term;
@@ -880,5 +1013,217 @@ mod tests {
             data: b"more".to_vec(),
         });
         assert!(app.select.selection().is_some());
+    }
+
+    /// `⌃a [`로 복사 모드에 들어간다.
+    fn enter_copy(app: &mut App) {
+        app.on_input(b"\x01[");
+        assert!(app.copy.is_some());
+    }
+
+    fn history(app: &App) -> Vec<String> {
+        app.screen.as_ref().unwrap().history_text()
+    }
+
+    #[test]
+    fn copy_mode_swallows_keys_and_only_exit_sends_them_on() {
+        let (mut app, mut rx) = app(&lines(100));
+        enter_copy(&mut app);
+        // l, s는 복사 모드 키고, 선택이 없는 Enter는 끝낸다. 어느 것도 세션에 가지 않는다.
+        app.on_input(b"ls\r");
+        assert!(app.copy.is_none());
+        assert!(sent(&mut rx).is_empty());
+        app.on_input(b"x");
+        assert_eq!(sent(&mut rx), [input(b"x")]);
+        // 화살표와 붙여넣기도 가지 않는다.
+        enter_copy(&mut app);
+        app.on_input(b"\x1b[A\x1bOB");
+        app.on_action(Action::Paste(b"pasted".to_vec()));
+        assert!(app.copy.is_some());
+        assert!(sent(&mut rx).is_empty());
+        // 단독 Esc가 끝낸다.
+        app.on_input(b"\x1b");
+        assert!(app.copy.is_none());
+    }
+
+    #[test]
+    fn mouse_in_the_term_pane_is_ignored_in_copy_mode() {
+        let (mut app, mut rx) = app(&[lines(100), b"\x1b[?1000h\x1b[?1002h".to_vec()].concat());
+        enter_copy(&mut app);
+        let before = offset(&app);
+        app.mouse(ev(MouseKind::WheelUp, 40, 5));
+        app.mouse(ev(MouseKind::Down, 40, 5));
+        app.mouse(ev(MouseKind::Drag, 45, 5));
+        app.mouse(ev(MouseKind::Up, 45, 5));
+        assert_eq!(offset(&app), before);
+        assert!(app.select.selection().is_none() && app.clipboard.is_empty());
+        assert!(sent(&mut rx).is_empty());
+        assert!(app.copy.is_some());
+    }
+
+    #[test]
+    fn output_during_copy_mode_is_held_and_fed_on_exit() {
+        let (mut app, _rx) = app(b"hello");
+        enter_copy(&mut app);
+        let frozen = history(&app);
+        app.on_msg(FromDaemon::Output {
+            id: "s1".into(),
+            data: b"\r\nlater".to_vec(),
+        });
+        // 줄 번호가 흔들리지 않게 화면은 그대로고, 출력은 쌓아 둔다.
+        assert_eq!(history(&app), frozen);
+        assert_eq!(app.copy.as_ref().unwrap().held, b"\r\nlater");
+        // 다른 세션의 출력은 쌓지 않는다.
+        app.on_msg(FromDaemon::Output {
+            id: "s2".into(),
+            data: b"other".to_vec(),
+        });
+        assert_eq!(app.copy.as_ref().unwrap().held, b"\r\nlater");
+        app.on_input(b"q");
+        assert_eq!(app.screen.as_ref().unwrap().lines()[1], "later");
+        assert_eq!(offset(&app), 0);
+        assert!(app.copy.is_none() && app.m.status.is_none());
+        // 나온 뒤의 출력은 바로 화면으로 간다.
+        app.on_msg(FromDaemon::Output {
+            id: "s1".into(),
+            data: b"!".to_vec(),
+        });
+        assert_eq!(app.screen.as_ref().unwrap().lines()[1], "later!");
+    }
+
+    #[test]
+    fn yank_writes_osc52_through_the_clipboard_path_and_says_how_much() {
+        let (mut app, mut rx) = app(b"alpha\r\nbeta");
+        enter_copy(&mut app);
+        app.on_input(b"gvjl");
+        assert!(app.clipboard.is_empty());
+        app.on_input(b"y");
+        assert_eq!(app.clipboard, select::osc52("alpha\nbe"));
+        assert_eq!(app.m.message, "복사됨 8자");
+        assert!(app.copy.is_none() && app.m.status.is_none());
+        assert!(sent(&mut rx).is_empty());
+        // 선택 없이 y는 복사하지 않고 끝낸다.
+        app.clipboard.clear();
+        app.m.message.clear();
+        enter_copy(&mut app);
+        app.on_input(b"y");
+        assert!(app.copy.is_none() && app.clipboard.is_empty() && app.m.message.is_empty());
+    }
+
+    #[test]
+    fn status_and_view_follow_the_cursor() {
+        // 100줄을 쓴 39줄 화면: 스크롤백 62줄 + 보이는 39줄에 line99가 마지막 글자 줄이다.
+        let (mut app, _rx) = app(&lines(100));
+        enter_copy(&mut app);
+        assert_eq!(
+            app.m.status.as_deref(),
+            Some("복사 모드 │ 100/101 │ v 선택 · y 복사 · / 검색 · q 끝")
+        );
+        assert_eq!(offset(&app), 0);
+        app.on_input(b"g");
+        assert_eq!(offset(&app), 62);
+        assert!(app.m.status.as_deref().unwrap().contains("│ 1/101 │"));
+        // 검색어는 상태줄에 보이고, 찾으면 그 줄이 보이게 스크롤한다.
+        app.on_input(b"/line5");
+        assert_eq!(app.m.status.as_deref(), Some("/line5"));
+        app.on_input(b"\r");
+        assert_eq!(app.copy.as_ref().unwrap().mode.line, 5);
+        assert!(app.m.status.as_deref().unwrap().contains("│ 6/101 │"));
+        assert_eq!(offset(&app), 62);
+        app.on_input(b"G");
+        assert_eq!(offset(&app), 0);
+        // 못 찾으면 그 자리에서 알린다.
+        app.on_input(b"/nothing\r");
+        assert!(app.m.status.as_deref().unwrap().contains("검색 결과 없음"));
+    }
+
+    #[test]
+    fn snapshot_switch_resize_detach_and_commands_leave_copy_mode() {
+        let (mut app, _rx) = app(&lines(100));
+        enter_copy(&mut app);
+        app.on_msg(FromDaemon::Snapshot {
+            id: "s1".into(),
+            data: b"fresh".to_vec(),
+        });
+        assert!(app.copy.is_none() && app.m.status.is_none());
+        assert_eq!(app.screen.as_ref().unwrap().lines()[0], "fresh");
+
+        enter_copy(&mut app);
+        app.attach("s2".into());
+        assert!(app.copy.is_none() && app.m.status.is_none());
+
+        app.m.attached = Some("s1".into());
+        app.screen = Some(Screen::new(86, 39));
+        enter_copy(&mut app);
+        app.on_resize(Size::new(100, 30));
+        assert!(app.copy.is_none() && app.m.status.is_none());
+
+        enter_copy(&mut app);
+        app.detach();
+        assert!(app.copy.is_none() && app.m.status.is_none());
+
+        // 다른 접두 명령은 복사 모드를 끝내고 실행된다. 복사 모드 안의 `⌃a [`는 아무것도 바꾸지 않는다.
+        app.m.attached = Some("s1".into());
+        app.screen = Some(Screen::new(86, 39));
+        enter_copy(&mut app);
+        app.on_input(b"\x01[");
+        assert!(app.copy.is_some());
+        app.on_input(b"\x01b");
+        assert!(app.copy.is_none() && app.m.status.is_none());
+        assert!(!app.m.list_open);
+    }
+
+    #[test]
+    fn rail_clicks_still_work_and_switching_leaves_copy_mode() {
+        let (mut app, _rx) = app(&lines(100));
+        enter_copy(&mut app);
+        // 아이콘 줄 첫 항목(∗)을 누르면 프로젝트를 고르고, 붙은 세션이 사라지니 복사 모드도 끝난다.
+        app.mouse(ev(MouseKind::Down, 1, 1));
+        assert_eq!(app.m.filter, None);
+        assert!(app.copy.is_none());
+    }
+
+    #[test]
+    fn too_much_output_ends_copy_mode_and_catches_up() {
+        let (mut app, _rx) = app(b"hello");
+        enter_copy(&mut app);
+        app.on_msg(FromDaemon::Output {
+            id: "s1".into(),
+            data: vec![b'x'; MAX_HELD - 10],
+        });
+        assert!(app.copy.is_some());
+        app.on_msg(FromDaemon::Output {
+            id: "s1".into(),
+            data: b"\r\nend".to_vec().into_iter().chain([b'!'; 10]).collect(),
+        });
+        assert!(app.copy.is_none() && app.m.status.is_none());
+        assert_eq!(app.m.message, "복사 모드 종료: 출력이 너무 많다");
+        // 넘친 덩이까지 화면에 먹였고 맨 아래로 돌아와 있다.
+        assert_eq!(offset(&app), 0);
+        assert!(
+            app.screen
+                .as_ref()
+                .unwrap()
+                .lines()
+                .iter()
+                .any(|l| l.starts_with("end!"))
+        );
+    }
+
+    #[test]
+    fn frozen_screen_does_not_end_a_stale_sync_update() {
+        // 동기화 갱신(`?2026`) 중이라 `buffered`는 아직 화면에 반영되지 않았다.
+        let (mut app, _rx) = app(b"hello\x1b[?2026hbuffered");
+        assert!(app.sync_deadline().is_some());
+        enter_copy(&mut app);
+        assert!(app.sync_deadline().is_none());
+        std::thread::sleep(Duration::from_millis(300));
+        app.end_stale_sync();
+        assert_eq!(history(&app)[0], "hello");
+        // 나온 뒤에는 시간이 넘은 갱신을 끝내 화면에 반영한다.
+        app.on_input(b"q");
+        assert!(app.sync_deadline().is_some());
+        app.end_stale_sync();
+        assert_eq!(app.screen.as_ref().unwrap().lines()[0], "hellobuffered");
     }
 }

@@ -33,6 +33,8 @@ pub struct Model {
     pub message: String,
     /// 사용자가 머리를 눌러 기본(대기만 접힘)과 반대로 접거나 편 묶음의 상태.
     pub toggled: Vec<SessionState>,
+    /// 복사 모드처럼 상태줄 전체를 대신할 글. 있으면 세션 경로·키 안내·알림 대신 이것을 그리고, 세션 커서는 숨긴다.
+    pub status: Option<String>,
 }
 
 impl Model {
@@ -164,6 +166,7 @@ pub fn draw(f: &mut Frame, m: &Model, screen: Option<&Screen>) {
     if let Some(sc) = screen {
         draw_term(f.buffer_mut(), a.term, sc);
         if m.attached.is_some()
+            && m.status.is_none()
             && let Some(pos) = term_cursor(sc, a.term)
         {
             f.set_cursor_position(pos);
@@ -522,6 +525,10 @@ fn term_cursor(sc: &Screen, area: Rect) -> Option<Position> {
 
 /// `mine │ <위치> │ <계정>`과 오른쪽 키 안내(또는 알림). 입력 중이면 그 입력과 안내를 보여 준다.
 fn draw_status(f: &mut Frame, area: Rect, m: &Model) {
+    if let Some(text) = &m.status {
+        f.render_widget(Paragraph::new(text.as_str()), area);
+        return;
+    }
     let sep = || Span::styled(" │ ", MUTED);
     let mut left = vec![
         Span::styled("mine", Style::new().add_modifier(Modifier::BOLD)),
@@ -641,6 +648,7 @@ mod tests {
             prompt: None,
             message: String::new(),
             toggled: Vec::new(),
+            status: None,
         }
     }
 
@@ -873,6 +881,30 @@ mod tests {
         assert!(row_text(&render(&m, 140, 20), 19).contains("shell de"));
         m.prompt = Some(Prompt::ConfirmKill("k-billing".into()));
         assert!(row_text(&render(&m, 140, 20), 19).contains("billing"));
+    }
+
+    #[test]
+    fn status_override_replaces_the_status_line_and_hides_the_session_cursor() {
+        use ratatui::backend::Backend as _;
+        let mut m = kyoto();
+        m.attached = Some("k-billing".into());
+        let mut sc = Screen::new(20, 3);
+        sc.feed(b"ab");
+        let drawn = |m: &Model| {
+            let mut t = Terminal::new(TestBackend::new(140, 20)).unwrap();
+            t.draw(|f| draw(f, m, Some(&sc))).unwrap();
+            let pos = t.backend_mut().get_cursor_position().unwrap();
+            (row_text(t.backend().buffer(), 19), pos)
+        };
+        let term_x = layout(Rect::new(0, 0, 140, 20), true).term.x;
+        let (status, pos) = drawn(&m);
+        assert!(status.starts_with("mine │ /p/kyoto/billing"), "{status}");
+        assert_eq!(pos, Position::new(term_x + 2, 0));
+        // 상태줄 전체가 그 글로 바뀌고, 세션 커서는 옮기지 않는다.
+        m.status = Some("복사 모드 │ 1/3 │ v 선택".into());
+        let (status, pos) = drawn(&m);
+        assert_eq!(status, "복사 모드 │ 1/3 │ v 선택");
+        assert_eq!(pos, Position::ORIGIN);
     }
 
     #[test]
