@@ -134,6 +134,20 @@ pub struct Launch {
     pub cwd: PathBuf,
 }
 
+/// 데몬을 띄운 셸에서 물려받았지만 세션 자식에게 넘기면 안 되는 환경 변수인가. 보관 프로세스를 띄울 때 지우고,
+/// 필요한 값은 [`launch`]가 다시 넣는다(`MINE_SESSION`, claude-b의 `CLAUDE_CONFIG_DIR`).
+///
+/// tmux 안에서 띄운 데몬이면 `TMUX`가 tmux를 아는 도구를 바깥 tmux로 보내고, claude 세션 안에서 띄운 데몬이면
+/// `CLAUDECODE`가 중첩 실행을 막거나 `CLAUDE_CONFIG_DIR`가 claude-a 세션을 claude-b 계정으로 돌린다.
+/// `MINE_STATE_DIR`는 훅(`mine _event`)이 이 데몬을 찾는 데 쓰므로 남긴다.
+// ponytail: SSH_*(SSH_AUTH_SOCK 등)는 그대로 둔다. 원격 호스트를 다루는 5단계에서 정한다.
+pub fn is_leaked_env(name: &str) -> bool {
+    matches!(
+        name,
+        "TMUX" | "TMUX_PANE" | "CLAUDECODE" | "CLAUDE_CONFIG_DIR" | "MINE_SESSION"
+    ) || name.starts_with("CLAUDE_CODE_")
+}
+
 /// 로그인 셸 경로. `SHELL`이 비어 있거나 없으면 `/bin/zsh`다.
 pub fn login_shell() -> String {
     std::env::var("SHELL")
@@ -446,6 +460,23 @@ mod tests {
         let l = launch(&m, &st(), Path::new("/x/mine"));
         assert!(has_pair(&l.argv, "--model", "gpt-5"));
         assert_eq!(l.argv[l.argv.len() - 2..], ["resume", "t1"]);
+    }
+
+    #[test]
+    fn leaked_env_covers_tmux_claude_and_mine_variables() {
+        for leaked in [
+            "TMUX",
+            "TMUX_PANE",
+            "CLAUDECODE",
+            "CLAUDE_CODE_ENTRYPOINT",
+            "CLAUDE_CONFIG_DIR",
+            "MINE_SESSION",
+        ] {
+            assert!(is_leaked_env(leaked), "{leaked}");
+        }
+        for kept in ["PATH", "HOME", "MINE_STATE_DIR", "SSH_AUTH_SOCK", "CLAUDE"] {
+            assert!(!is_leaked_env(kept), "{kept}");
+        }
     }
 
     #[test]

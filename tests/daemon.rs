@@ -789,3 +789,83 @@ fn new_is_refused_while_the_same_name_is_closing() {
     mine(&st, &["new", "dev"]);
     assert!(listed_alive(&st, "dev"));
 }
+
+#[test]
+fn sessions_do_not_inherit_the_daemon_spawners_environment() {
+    // 데몬을 tmux 안이나 claude-b 세션 안에서 띄웠어도 그 환경이 세션 자식에게 새면 안 된다.
+    // 가짜 로그인 셸과 가짜 `claude`는 환경을 `<dump>/<MINE_SESSION>`에 적는다.
+    let bin = tmp();
+    let dump = bin.path().join("env");
+    fs::create_dir(&dump).unwrap();
+    let write = |name: &str, tail: &str| {
+        let path = bin.path().join(name);
+        let script = format!(
+            "#!/bin/sh\nenv > '{}'/\"$MINE_SESSION\"\n{tail}",
+            dump.display()
+        );
+        fs::write(&path, script).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    };
+    let shell = write("sh", "exec sleep 60\n");
+    write("claude", "");
+    let mut st = state_with_path(bin.path());
+    st.env.extend([
+        ("SHELL", shell.into_os_string()),
+        ("TMUX", "/tmp/tmux-501/default,1,0".into()),
+        ("TMUX_PANE", "%1".into()),
+        ("CLAUDECODE", "1".into()),
+        ("CLAUDE_CODE_ENTRYPOINT", "cli".into()),
+        ("CLAUDE_CONFIG_DIR", "/tmp/fake-claude-b".into()),
+        ("MINE_SESSION", "stale".into()),
+    ]);
+    mine(&st, &["new", "s"]);
+    mine(
+        &st,
+        &["new", "a", "--kind", "claude", "--account", "claude-a"],
+    );
+    mine(
+        &st,
+        &["new", "b", "--kind", "claude", "--account", "claude-b"],
+    );
+    let env_of = |name: &str| -> Vec<String> {
+        let path = dump.join(st.id(name));
+        wait_until(|| fs::metadata(&path).is_ok_and(|m| m.len() > 0));
+        fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    };
+    let profile = format!(
+        "CLAUDE_CONFIG_DIR={}",
+        st.root.join("profiles").join("claude-b").display()
+    );
+    for name in ["s", "a", "b"] {
+        let env = env_of(name);
+        let leaked: Vec<&String> = env
+            .iter()
+            .filter(|kv| {
+                [
+                    "TMUX=",
+                    "TMUX_PANE=",
+                    "CLAUDECODE=",
+                    "CLAUDE_CODE_",
+                    "CLAUDE_CONFIG_DIR=",
+                ]
+                .iter()
+                .any(|p| kv.starts_with(p))
+            })
+            .filter(|kv| !(name == "b" && **kv == profile))
+            .collect();
+        assert!(leaked.is_empty(), "{name}: {leaked:?}");
+        for want in [
+            "TERM=xterm-256color".to_string(),
+            "COLORTERM=truecolor".to_string(),
+            format!("MINE_SESSION={}", st.id(name)),
+        ] {
+            assert!(env.contains(&want), "{name}: {want} 없음: {env:?}");
+        }
+    }
+    assert!(env_of("b").contains(&profile));
+}

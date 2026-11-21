@@ -546,6 +546,12 @@ async fn start_holder(state: &State, exe: &Path, meta: &Meta) -> Result<Started>
         .with_context(|| format!("로그 파일을 열 수 없다: {}", log_path.display()))?;
     let launch = session::launch(meta, state, exe);
     let mut cmd = tokio::process::Command::new(exe);
+    // portable-pty는 보관 프로세스의 환경을 자식에 그대로 넘기므로, 데몬을 띄운 셸의 환경은 여기서 지운다.
+    for (key, _) in std::env::vars_os() {
+        if key.to_str().is_some_and(session::is_leaked_env) {
+            cmd.env_remove(&key);
+        }
+    }
     cmd.arg("hold")
         .arg("--sock")
         .arg(&sock)
@@ -553,7 +559,12 @@ async fn start_holder(state: &State, exe: &Path, meta: &Meta) -> Result<Started>
         .arg(&exit)
         .arg("--cwd")
         .arg(&launch.cwd)
-        .args(["--env", "TERM=xterm-256color"]);
+        .args([
+            "--env",
+            "TERM=xterm-256color",
+            "--env",
+            "COLORTERM=truecolor",
+        ]);
     for (key, value) in &launch.env {
         cmd.arg("--env").arg(format!("{key}={value}"));
     }
