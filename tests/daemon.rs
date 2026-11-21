@@ -3,6 +3,7 @@
 //! 모든 `mine` 명령은 `.git` 폴더가 있는 임시 프로젝트 폴더에서, 따로 만든 짧은 `/tmp` 상태 폴더
 //! (`MINE_STATE_DIR`)와 `SHELL=/bin/sh`로 실행한다. 테스트 프로세스의 환경은 건드리지 않는다.
 
+use std::ffi::OsString;
 use std::fs::{self, File, TryLockError};
 use std::io::{BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -25,6 +26,8 @@ struct St {
     project: PathBuf,
     /// 있으면 `PATH` 앞에 붙인다(가짜 `claude` 등).
     path_front: Option<PathBuf>,
+    /// `mine` 명령(과 그 명령이 띄우는 데몬)에 더할 환경 변수. 앞의 기본값(`SHELL` 등)을 덮어쓴다.
+    env: Vec<(&'static str, OsString)>,
     _state: tempfile::TempDir,
     _project: tempfile::TempDir,
 }
@@ -44,6 +47,7 @@ fn state() -> St {
         root: state.path().join("s"),
         project: project.path().canonicalize().unwrap(),
         path_front: None,
+        env: Vec::new(),
         _state: state,
         _project: project,
     }
@@ -76,6 +80,9 @@ impl St {
             joined.push(":");
             joined.push(path);
             cmd.env("PATH", joined);
+        }
+        for (key, value) in &self.env {
+            cmd.env(key, value);
         }
         cmd
     }
@@ -693,4 +700,92 @@ fn flood_output_keeps_ls_responsive() {
     }
     // 같은 데몬이 답했다(죽고 다시 뜬 것이 아니다).
     assert_eq!(daemon_pid(&st), pid);
+}
+
+/// SIGHUP을 무시하고 `ready`를 찍은 뒤 오래 도는 가짜 로그인 셸을 `dir`에 만든다. `Kill`을 받은 보관 프로세스가
+/// 2초 뒤 SIGKILL을 보내야 끝나므로, 그동안 끝나 가는 보관 프로세스가 남는다.
+fn stubborn_shell(dir: &Path) -> PathBuf {
+    let shell = dir.join("sh");
+    fs::write(
+        &shell,
+        "#!/bin/sh\ntrap '' HUP\necho ready\nexec sleep 60\n",
+    )
+    .unwrap();
+    fs::set_permissions(&shell, fs::Permissions::from_mode(0o755)).unwrap();
+    shell
+}
+
+/// `stubborn_shell`로 `dev` 세션을 만들고, trap이 걸려 SIGHUP을 무시하게 될 때까지 기다린다.
+fn new_stubborn_session(bin: &Path) -> St {
+    let mut st = state();
+    st.env.push(("SHELL", stubborn_shell(bin).into_os_string()));
+    mine(&st, &["new", "dev"]);
+    wait_until(|| client(&st).attach("dev").contains("ready"));
+    st
+}
+
+/// 세션 `name`이 목록에 있고 보관 프로세스에 붙어 있다.
+fn listed_alive(st: &St, name: &str) -> bool {
+    let mut c = client(st);
+    c.send(&ToDaemon::List);
+    match c.recv() {
+        Some(FromDaemon::Sessions { sessions }) => {
+            sessions.iter().any(|s| s.meta.name == name && s.alive)
+        }
+        other => panic!("List에 Sessions가 오지 않았다: {other:?}"),
+    }
+}
+
+#[test]
+fn kill_then_new_with_same_name_keeps_the_new_session() {
+    // 끝나 가는 보관 프로세스(SIGHUP 무시, 2초 뒤 SIGKILL)가 남은 채 같은 이름으로 다시 만들면, 데몬이 옛 보관
+    // 프로세스에 붙어 새 세션이 사라지거나 옛 쪽이 새 소켓을 지우고 새 세션 폴더에 exit 파일을 썼다.
+    let bin = tmp();
+    let st = new_stubborn_session(bin.path());
+    mine(&st, &["kill", "dev"]);
+    mine(&st, &["new", "dev"]);
+    assert!(listed_alive(&st, "dev"));
+    client(&st).attach("dev");
+    // 옛 보관 프로세스는 이미 끝났어야 하지만, 남아 있다면 SIGKILL로 끝날 때까지 기다리고도 남는 시간이다.
+    std::thread::sleep(Duration::from_secs(3));
+    assert!(listed_alive(&st, "dev"));
+    assert!(client(&st).attach("dev").contains("ready"));
+    assert!(
+        st.root
+            .join("run")
+            .join(hold_sock_name(&st, "dev"))
+            .exists()
+    );
+    assert!(!Path::new(&session_dir(&st, "dev")).join("exit").exists());
+}
+
+#[test]
+fn new_is_refused_while_the_same_name_is_closing() {
+    let bin = tmp();
+    let st = new_stubborn_session(bin.path());
+    let mut c = client(&st);
+    let killed_at = Instant::now();
+    c.send(&ToDaemon::Kill { id: st.id("dev") });
+    // 보관 프로세스가 아직 끝나지 않았다. 같은 이름은 거절한다.
+    let out = mine_raw(&st, &["new", "dev"]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("닫는 중"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Kill의 답은 보관 프로세스가 SIGKILL로 끝난 뒤에 온다.
+    loop {
+        match c.recv().expect("연결이 끊겼다") {
+            FromDaemon::Sessions { sessions } => {
+                assert!(sessions.is_empty());
+                break;
+            }
+            FromDaemon::Error { message } => panic!("Kill이 실패했다: {message}"),
+            _ => {}
+        }
+    }
+    assert!(killed_at.elapsed() >= Duration::from_millis(1500));
+    mine(&st, &["new", "dev"]);
+    assert!(listed_alive(&st, "dev"));
 }

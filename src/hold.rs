@@ -7,7 +7,9 @@
 //! 2. PTY 출력을 링 버퍼에 쌓고, 연결된 데몬이 있으면 `Output`으로 실시간 전송한다.
 //! 3. 소켓 연결을 받는다. 연결은 한 번에 하나라서 새 연결이 오면 이전 연결을 끊는다. 새 연결에는 `Hello`와
 //!    링 전체를 담은 `Output` 하나(비어 있어도 보낸다)를 먼저 보내고, 그 뒤로 실시간 출력을 이어 보낸다.
-//! 4. 자식이 끝나면 종료 코드를 exit 파일에 쓰고, `Exited`를 보내고, 소켓 파일을 지우고 끝난다.
+//! 4. `Kill`을 받거나 자식이 끝나면 리스너를 닫아 새 연결을 그만 받는다. 자식이 끝나면 종료 코드를 exit 파일에
+//!    쓰고, 소켓 파일을 지우고, `Exited`를 보내고 끝난다. 같은 세션을 새로 띄운 보관 프로세스가 소켓 경로를
+//!    차지했으면 exit 파일과 소켓 파일은 그쪽 것이므로 건드리지 않는다.
 //!
 //! exit 파일에는 종료 코드를 십진수 글자로 쓴다(`3`, 줄바꿈 없음). 시그널로 죽었으면 `signal`을 쓰고
 //! `Exited`의 `code`는 `None`이다. 파일은 임시 파일에 쓴 뒤 이름을 바꿔 놓아서, 파일이 보이면 내용이 완성돼 있다.
@@ -19,7 +21,8 @@ use std::collections::VecDeque;
 use std::fs;
 use std::io::{BufReader, Read, Write};
 use std::net::Shutdown;
-use std::os::unix::fs::PermissionsExt;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -37,9 +40,9 @@ use crate::proto::{HOLD_VERSION, HoldIn, HoldOut, read_msg, write_msg};
 pub const RING_CAP: usize = 2 * 1024 * 1024;
 
 /// `Kill`을 받고 SIGHUP을 보낸 뒤 SIGKILL로 넘어가기까지 기다리는 시간.
-const KILL_GRACE: Duration = Duration::from_secs(2);
+pub const KILL_GRACE: Duration = Duration::from_secs(2);
 /// 자식이 끝난 뒤 PTY에 남은 출력을 마저 읽도록 기다리는 최대 시간. 손자가 슬레이브를 붙들고 있어도 멈추지 않게 한다.
-const DRAIN_GRACE: Duration = Duration::from_millis(500);
+pub const DRAIN_GRACE: Duration = Duration::from_millis(500);
 /// 데몬 연결에 쓰다가 이만큼 막히면 그 연결을 버린다. 멈춘 데몬이 새 연결과 PTY 읽기를 막지 않게 한다.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -128,6 +131,8 @@ struct Ctx {
     /// 자식을 거둔 뒤 켠다. 이미 사라진 pid에 시그널을 보내지 않으려고 본다.
     exited: AtomicBool,
     killing: AtomicBool,
+    /// 이 끝을 버리면 accept 루프가 깨어나 리스너를 닫는다.
+    stop_accept: Mutex<Option<UnixStream>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -152,11 +157,17 @@ impl Ctx {
         }
     }
 
+    /// 새 연결을 그만 받는다. 끝나 가는 이 보관 프로세스에, 같은 세션을 새로 띄운 데몬이 잘못 붙지 않게 한다.
+    fn stop_accepting(&self) {
+        drop(lock(&self.stop_accept).take());
+    }
+
     /// 자식의 프로세스 그룹에 SIGHUP을 보내고, 그래도 살아 있으면 `KILL_GRACE` 뒤 SIGKILL을 보낸다.
     fn kill(self: &Arc<Self>) {
         if self.killing.swap(true, Ordering::SeqCst) {
             return;
         }
+        self.stop_accepting();
         signal_group(self.child_pid, libc::SIGHUP);
         let ctx = Arc::clone(self);
         thread::spawn(move || {
@@ -174,12 +185,36 @@ fn signal_group(pid: u32, sig: libc::c_int) {
     unsafe { libc::killpg(pid as libc::pid_t, sig) };
 }
 
-/// 종료 시(오류 경로 포함) 소켓 파일을 지운다.
-struct SockGuard(PathBuf);
+/// 파일을 알아보는 값(장치, 아이노드, 변경 시각의 초와 나노초).
+type FileId = (u64, u64, i64, i64);
+
+fn file_id(path: &Path) -> Option<FileId> {
+    let m = fs::symlink_metadata(path).ok()?;
+    Some((m.dev(), m.ino(), m.ctime(), m.ctime_nsec()))
+}
+
+/// 이 보관 프로세스가 만든 소켓 파일. 종료 시(오류 경로 포함) 경로에 아직 그 파일이 있을 때만 지운다.
+// ponytail: 같은 세션을 새로 띄운 보관 프로세스는 같은 경로를 지우고 소켓을 다시 만든다. 그래서 "경로에 아직 내가
+// 만든 파일이 있다"를 "더 새로 띄운 보관 프로세스가 없다"는 표시로 쓰고, 따로 nonce를 넘기지 않는다. 리스너를 먼저
+// 닫으므로 Linux ext4처럼 아이노드 번호를 곧바로 다시 쓰는 파일 시스템을 생각해 변경 시각(나노초)까지 비교한다.
+// 확인한 뒤 지우거나 쓰기까지의 아주 짧은 틈은 남는다. 데몬이 Kill 뒤 이 연결이 끝날 때까지 같은 id의 New를 막아서
+// 보통은 그 틈에 새로 띄울 일이 없다.
+struct SockGuard {
+    path: PathBuf,
+    file: Option<FileId>,
+}
+
+impl SockGuard {
+    fn still_mine(&self) -> bool {
+        self.file.is_some() && file_id(&self.path) == self.file
+    }
+}
 
 impl Drop for SockGuard {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
+        if self.still_mine() {
+            let _ = fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -203,9 +238,22 @@ pub fn run(
     let _ = fs::remove_file(sock);
     let listener = UnixListener::bind(sock)
         .with_context(|| format!("소켓을 만들지 못했다: {}", sock.display()))?;
-    let _sock_guard = SockGuard(sock.to_path_buf());
+    let mut sock_guard = SockGuard {
+        path: sock.to_path_buf(),
+        file: file_id(sock),
+    };
     fs::set_permissions(sock, fs::Permissions::from_mode(0o600))
         .with_context(|| format!("소켓 권한을 바꾸지 못했다: {}", sock.display()))?;
+    // 권한을 바꾸면 변경 시각이 바뀐다.
+    sock_guard.file = file_id(sock);
+    // 같은 세션의 지난 보관 프로세스가 늦게 남긴 exit 파일을 지운다. 그쪽은 이제 소켓이 바뀐 것을 보고 쓰지 않는다.
+    let _ = fs::remove_file(exit_file);
+    // poll이 준비됐다고 한 연결이 그새 끊겨도 accept에서 멈추지 않게 논블로킹으로 둔다.
+    listener
+        .set_nonblocking(true)
+        .context("소켓을 논블로킹으로 바꾸지 못했다")?;
+    let (stop_tx, stop_rx) =
+        UnixStream::pair().context("accept 루프를 깨울 소켓을 만들지 못했다")?;
 
     let pair = native_pty_system()
         .openpty(PtySize {
@@ -247,6 +295,7 @@ pub fn run(
         child_pid,
         exited: AtomicBool::new(false),
         killing: AtomicBool::new(false),
+        stop_accept: Mutex::new(Some(stop_tx)),
     });
 
     // PTY 입력은 한 스레드가 순서대로 쓴다. 자식이 읽지 않아 막혀도 다른 처리는 멈추지 않는다.
@@ -270,13 +319,16 @@ pub fn run(
             let _ = drained_tx.send(());
         });
     }
-    {
+    let accept = {
         let ctx = Arc::clone(&ctx);
-        thread::spawn(move || accept_loop(&listener, &ctx));
-    }
+        thread::spawn(move || accept_loop(listener, stop_rx, &ctx))
+    };
 
     let status = child.wait().context("자식 종료를 기다리지 못했다")?;
     ctx.exited.store(true, Ordering::SeqCst);
+    // Exited를 알리기 전에 리스너가 닫혔음을 확인한다. 그 뒤로 이 경로에 붙는 데몬은 새로 띄운 보관 프로세스를 찾는다.
+    ctx.stop_accepting();
+    let _ = accept.join();
     // 마지막 출력이 Exited보다 먼저 가도록 PTY가 비워지길 잠깐 기다린다.
     let _ = drained_rx.recv_timeout(DRAIN_GRACE);
 
@@ -284,8 +336,15 @@ pub fn run(
         Some(_) => None,
         None => Some(status.exit_code() as i32),
     };
+    // 소켓 경로를 새로 띄운 보관 프로세스가 차지했으면 exit 파일도 그쪽 것이다.
     // 파일 쓰기가 실패해도 데몬에는 알린 뒤 오류로 끝낸다.
-    let written = write_exit_file(exit_file, code);
+    let written = if sock_guard.still_mine() {
+        write_exit_file(exit_file, code)
+    } else {
+        Ok(())
+    };
+    // 소켓을 Exited보다 먼저 지운다. Exited를 받은 데몬이 곧바로 같은 세션을 새로 띄워도 새 소켓은 남는다.
+    drop(sock_guard);
     announce_exit(&ctx, code);
     written
 }
@@ -304,17 +363,39 @@ fn pump_output(mut pty: Box<dyn Read + Send>, ctx: &Ctx) {
     }
 }
 
-/// 연결을 받는 대로 데몬으로 붙이고 입력을 읽는 스레드를 띄운다.
-fn accept_loop(listener: &UnixListener, ctx: &Arc<Ctx>) {
-    for stream in listener.incoming() {
-        let stream = match stream {
-            Ok(stream) => stream,
+/// 연결을 받는 대로 데몬으로 붙이고 입력을 읽는 스레드를 띄운다. `stop`의 맞은편이 닫히면 돌아와 리스너를 닫는다.
+///
+/// 다른 스레드에서 막힌 accept를 이식성 있게 깨울 방법이 없어서, 리스너와 `stop`을 함께 poll한다.
+fn accept_loop(listener: UnixListener, stop: UnixStream, ctx: &Arc<Ctx>) {
+    let mut fds = [listener.as_raw_fd(), stop.as_raw_fd()].map(|fd| libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    });
+    loop {
+        // SAFETY: 두 fd는 이 함수가 끝까지 쥐는 리스너와 소켓의 것이고, 배열 길이를 함께 넘긴다.
+        if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) } < 0 {
+            if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                thread::sleep(Duration::from_millis(100));
+            }
+            continue;
+        }
+        if fds[1].revents != 0 {
+            return;
+        }
+        let stream = match listener.accept() {
+            Ok((stream, _)) => stream,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
             Err(_) => {
                 // EMFILE 같은 일시 오류에서 바쁜 반복을 피한다.
                 thread::sleep(Duration::from_millis(100));
                 continue;
             }
         };
+        // macOS는 받은 연결에 리스너의 논블로킹 설정을 물려준다.
+        if stream.set_nonblocking(false).is_err() {
+            continue;
+        }
         if let Some(id) = attach(ctx, &stream) {
             let ctx = Arc::clone(ctx);
             thread::spawn(move || read_input(&ctx, stream, id));

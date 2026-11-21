@@ -28,10 +28,11 @@ use anyhow::{Context, Result, bail};
 use tokio::io::BufReader;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::AbortHandle;
 use tokio::time::timeout;
 
+use crate::hold;
 use crate::hooks::{self, Event, EventKind, now_ms};
 use crate::paths::{State, check_sock_path, ensure_dir};
 use crate::project::{self, project_key};
@@ -49,6 +50,11 @@ const EXIT_FILE: &str = "exit";
 const VIEWED_FILE: &str = "viewed";
 /// 새로 띄운 보관 프로세스의 PTY 크기이자, 데몬이 다시 떴을 때 화면을 다시 만드는 크기.
 const INITIAL_SIZE: (u16, u16) = (80, 24);
+/// `Kill` 뒤 보관 프로세스 연결이 끝나기를 기다리는 최대 시간. 보관 프로세스는 SIGHUP을 보내고 `KILL_GRACE`가
+/// 지나면 SIGKILL을 보낸 뒤, 남은 출력을 `DRAIN_GRACE`까지 읽고 끝난다. 그 위에 여유를 둔다.
+const KILL_WAIT: Duration = hold::KILL_GRACE
+    .saturating_add(hold::DRAIN_GRACE)
+    .saturating_add(Duration::from_millis(1500));
 /// 띄운 보관 프로세스가 연결을 받기까지 기다리는 최대 시간.
 const START_WAIT: Duration = Duration::from_secs(5);
 /// 보관 프로세스 연결에서 `Hello`와 출력 버퍼를 기다리는 최대 시간.
@@ -76,6 +82,8 @@ struct Daemon {
     sessions: BTreeMap<String, Sess>,
     /// `New`가 보관 프로세스를 띄우는 중인 세션 id. 같은 이름을 동시에 두 번 만들지 않게 한다.
     starting: HashSet<String>,
+    /// `Kill`로 닫았지만 보관 프로세스 연결이 아직 끝나지 않은 세션. 끝날 때까지 같은 id로 `New`를 받지 않는다.
+    closing: HashMap<String, Closing>,
     clients: HashMap<u64, Client>,
     next_id: u64,
     /// 구독한 클라이언트에 마지막으로 알린 목록. 바뀌었을 때만 다시 알린다.
@@ -110,6 +118,15 @@ struct Hold {
     link: u64,
     tx: mpsc::UnboundedSender<HoldIn>,
     since: Instant,
+}
+
+/// 닫는 중인 세션의 보관 프로세스 연결.
+///
+/// 연결을 쥐고 있어야 보관 프로세스가 입력 EOF를 보고 연결을 먼저 끊지 않고, 자식이 끝난 뒤 `Exited`를 보낸다.
+/// 버리면 `_done`이 닫혀 `Kill`을 기다리는 쪽이 깨어난다.
+struct Closing {
+    hold: Hold,
+    _done: oneshot::Sender<()>,
 }
 
 struct Client {
@@ -166,6 +183,7 @@ pub async fn run(state: State) -> Result<()> {
         exe,
         sessions: BTreeMap::new(),
         starting: HashSet::new(),
+        closing: HashMap::new(),
         clients: HashMap::new(),
         next_id: 0,
         last: Vec::new(),
@@ -326,7 +344,7 @@ async fn handle(shared: &Shared, client: u64, msg: ToDaemon) -> bool {
         ToDaemon::Resize { id, cols, rows } => {
             shared.lock().await.resize(client, &id, (cols, rows))
         }
-        ToDaemon::Kill { id } => shared.lock().await.kill(client, &id),
+        ToDaemon::Kill { id } => kill(shared, client, &id).await,
         ToDaemon::Poke { id } => {
             let mut d = shared.lock().await;
             d.refresh(&id);
@@ -364,6 +382,12 @@ async fn create(shared: &Shared, spec: NewSession) -> Result<()> {
     let id = session_id(&project_key(&project), &spec.name);
     let (state, exe) = {
         let mut d = shared.lock().await;
+        if d.closing.contains_key(&id) {
+            bail!(
+                "같은 이름의 세션을 아직 닫는 중이다. 잠시 뒤 다시 만든다: {}",
+                spec.name
+            );
+        }
         if d.sessions.contains_key(&id) || !d.starting.insert(id.clone()) {
             bail!("같은 이름의 세션이 이미 있다: {}", spec.name);
         }
@@ -414,6 +438,32 @@ async fn create(shared: &Shared, spec: NewSession) -> Result<()> {
             Err(e)
         }
     }
+}
+
+/// `Kill`: 세션을 닫고, 보관 프로세스 연결이 끝난 뒤(최대 `KILL_WAIT`) 답한다. 답을 받고 곧바로 같은 이름으로
+/// 다시 만들어도 끝나 가는 보관 프로세스와 엉키지 않는다. 기다리는 동안에도 이 클라이언트의 다른 요청은 처리한다.
+async fn kill(shared: &Shared, client: u64, id: &str) {
+    let mut d = shared.lock().await;
+    let ended = match d.kill(client, id) {
+        Err(message) => return d.send(client, FromDaemon::Error { message }),
+        Ok(None) => return d.reply_sessions(client),
+        Ok(Some(ended)) => ended,
+    };
+    let shared = Arc::clone(shared);
+    let id = id.to_string();
+    tokio::spawn(async move {
+        let done = timeout(KILL_WAIT, ended).await.is_ok();
+        let mut d = shared.lock().await;
+        if done {
+            d.reply_sessions(client);
+        } else {
+            let message = format!(
+                "보관 프로세스가 {}초 안에 끝나지 않았다. 아직 돌고 있을 수 있다: {id}",
+                KILL_WAIT.as_secs()
+            );
+            d.send(client, FromDaemon::Error { message });
+        }
+    });
 }
 
 fn close_meta(mut meta: Meta, dir: &Path) -> Result<()> {
@@ -668,7 +718,7 @@ fn spawn_hold_writer(mut writer: OwnedWriteHalf) -> mpsc::UnboundedSender<HoldIn
 /// 기다리지 않고 모아서(`BATCH_MAX`까지) 한 번에 처리한다. 잠금 횟수와 클라이언트 큐 항목 수가 줄어든다.
 fn spawn_hold_reader(shared: Shared, id: String, link: u64, mut reader: BufReader<OwnedReadHalf>) {
     tokio::spawn(async move {
-        loop {
+        'read: loop {
             let mut msg = recv::<_, HoldOut>(&mut reader).await;
             let mut after = None;
             if let Ok(Some(HoldOut::Output { data })) = &mut msg {
@@ -694,15 +744,16 @@ fn spawn_hold_reader(shared: Shared, id: String, link: u64, mut reader: BufReade
                     Ok(Some(HoldOut::Hello { .. })) => {}
                     Ok(Some(HoldOut::Exited { .. })) => {
                         shared.lock().await.on_exit(&id, link);
-                        return;
+                        break 'read;
                     }
                     Ok(None) | Err(_) => {
-                        lost_holder(shared, id, link).await;
-                        return;
+                        lost_holder(Arc::clone(&shared), id.clone(), link).await;
+                        break 'read;
                     }
                 }
             }
         }
+        shared.lock().await.end_closing(&id, link);
     });
 }
 
@@ -1081,10 +1132,12 @@ impl Daemon {
     }
 
     /// `Kill`: 보관 프로세스에 `Kill`을 보내고 `closed=true`로 저장한다. 폴더와 기록은 남긴다.
-    fn kill(&mut self, client: u64, id: &str) {
+    ///
+    /// 보관 프로세스 연결이 있었으면 그 연결이 끝날 때까지 세션을 `closing`에 두고, 끝나면 닫히는 수신자를
+    /// 돌려준다. 세션이 없으면 클라이언트에 보낼 오류 문구를 돌려준다.
+    fn kill(&mut self, client: u64, id: &str) -> Result<Option<oneshot::Receiver<()>>, String> {
         let Some(s) = self.sessions.remove(id) else {
-            let message = format!("세션이 없다: {id}");
-            return self.send(client, FromDaemon::Error { message });
+            return Err(format!("세션이 없다: {id}"));
         };
         s.send_hold(HoldIn::Kill);
         if s.unlinked {
@@ -1096,7 +1149,20 @@ impl Daemon {
             self.send(client, FromDaemon::Error { message });
         }
         self.publish();
-        self.reply_sessions(client);
+        let Some(hold) = s.hold else {
+            return Ok(None);
+        };
+        let (done, ended) = oneshot::channel();
+        self.closing
+            .insert(id.to_string(), Closing { hold, _done: done });
+        Ok(Some(ended))
+    }
+
+    /// 보관 프로세스 연결 `link`가 끝났다. `Kill`로 닫는 중이던 연결이면 `closing`에서 빼고 기다리는 쪽을 깨운다.
+    fn end_closing(&mut self, id: &str, link: u64) {
+        if self.closing.get(id).is_some_and(|c| c.hold.link == link) {
+            self.closing.remove(id);
+        }
     }
 
     fn detach_all(&mut self, id: &str) {

@@ -312,3 +312,16 @@ fn survives_a_dropped_connection_and_keeps_running() {
     assert!(c2.read_until_contains("42"));
     assert!(!h.exit.exists());
 }
+
+#[test]
+fn stops_accepting_once_killed() {
+    // 끝나 가는 보관 프로세스에, 같은 세션을 새로 띄운 데몬이 잘못 붙지 않아야 한다.
+    let h = spawn_hold(&["sh", "-c", "trap '' HUP; echo ready; sleep 30"]);
+    let mut c = connect(&h.sock);
+    c.recv();
+    assert!(c.read_until_contains("ready"));
+    c.send(HoldIn::Kill);
+    // SIGKILL(2초 뒤)보다 먼저 새 연결을 거절한다.
+    wait_until(1000, || UnixStream::connect(&h.sock).is_err());
+    wait_until(5000, || h.exit.exists());
+}
