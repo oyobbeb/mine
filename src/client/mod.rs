@@ -4,6 +4,7 @@
 //! `select!` 하나로 기다린다. `select!`에는 취소에 안전한 채널 수신과 타이머만 넣는다.
 
 pub mod input;
+pub mod select;
 mod tty;
 pub mod ui;
 pub mod view;
@@ -30,10 +31,13 @@ use crate::proto::{FromDaemon, ToDaemon};
 use crate::screen::Screen;
 use crate::session::SessionInfo;
 use input::{Action, Cmd, InputParser, MouseEv, MouseKind};
+use select::Select;
 use ui::{Hit, LinkRun, Model, Prompt};
 
 /// 다시 그리는 최소 간격(초당 60번).
 const FRAME: Duration = Duration::from_micros(16_667);
+/// 휠 한 칸에 스크롤하는 줄 수.
+const WHEEL_LINES: i32 = 3;
 
 type Term = Terminal<CrosstermBackend<BufWriter<Stdout>>>;
 /// 바깥 화면 좌표와 그 칸.
@@ -109,6 +113,12 @@ struct App {
     pending: Option<(PathBuf, String)>,
     /// 지난 화면에서 하이퍼링크로 다시 쓴 구간.
     links: Vec<LinkRun>,
+    /// 터미널 칸의 드래그 선택.
+    select: Select,
+    /// 바깥 터미널에 쓸 클립보드 OSC 52. 그릴 때 화면과 같은 쓰기 통로로 내보낸다.
+    clipboard: Vec<u8>,
+    /// 세션에 넘긴 누름이 아직 눌려 있다. 이 동안 칸 밖 끌기·뗌도 칸 안으로 눌러 넘겨 세션이 뗌을 받게 한다.
+    held: bool,
     dirty: bool,
     quit: bool,
 }
@@ -133,6 +143,9 @@ impl App {
             started: false,
             pending: None,
             links: Vec::new(),
+            select: Select::default(),
+            clipboard: Vec::new(),
+            held: false,
             dirty: true,
             quit: false,
         }
@@ -164,12 +177,18 @@ impl App {
                 screen.feed(&data);
                 screen.take_replies();
                 self.screen = Some(screen);
+                self.select.clear();
+                self.held = false;
                 self.dirty = true;
             }
             FromDaemon::Output { id, data } if attached(&id) => {
                 if let Some(screen) = &mut self.screen {
                     screen.feed(&data);
                     screen.take_replies();
+                    // 반전은 보이는 칸에 걸려 있어 출력이 칸을 밀면 엉뚱한 글자를 가린다. 끄는 중에는 뗄 때 읽는다.
+                    if !self.select.dragging() {
+                        self.select.clear();
+                    }
                     self.dirty = true;
                 }
             }
@@ -235,6 +254,8 @@ impl App {
             self.screen = None;
         }
         self.m.attached = Some(id);
+        self.select.clear();
+        self.held = false;
         self.dirty = true;
     }
 
@@ -242,6 +263,8 @@ impl App {
     fn detach(&mut self) {
         self.m.attached = None;
         self.screen = None;
+        self.select.clear();
+        self.held = false;
         self.dirty = true;
     }
 
@@ -267,9 +290,12 @@ impl App {
     }
 
     fn on_action(&mut self, action: Action) {
-        if !matches!(action, Action::Mouse(_)) && !self.m.message.is_empty() {
-            self.m.message.clear();
-            self.dirty = true;
+        if !matches!(action, Action::Mouse(_)) {
+            // 키를 누르면 선택 반전과 알림은 걷는다.
+            if self.select.clear() || !self.m.message.is_empty() {
+                self.m.message.clear();
+                self.dirty = true;
+            }
         }
         match action {
             Action::Pass(bytes) if self.m.prompt.is_some() => self.prompt_keys(&bytes),
@@ -297,7 +323,19 @@ impl App {
         }
     }
 
-    fn input(&self, data: Vec<u8>) {
+    /// 키 입력과 붙여넣기를 세션에 넘긴다. 스크롤해 둔 화면은 맨 아래로 돌려놓고 넘긴다.
+    fn input(&mut self, data: Vec<u8>) {
+        if let Some(screen) = &mut self.screen {
+            let scrolled = screen.term().grid().display_offset();
+            if scrolled > 0 {
+                screen.scroll(-(scrolled as i32));
+                self.dirty = true;
+            }
+        }
+        self.forward(data);
+    }
+
+    fn forward(&self, data: Vec<u8>) {
         if let Some(id) = &self.m.attached {
             self.send(ToDaemon::Input {
                 id: id.clone(),
@@ -365,11 +403,31 @@ impl App {
     }
 
     fn mouse(&mut self, ev: MouseEv) {
-        if ev.kind != MouseKind::Down || ev.button != 0 || self.m.prompt.is_some() {
+        if self.m.prompt.is_some() {
             return;
         }
         let areas = ui::layout(self.area, self.m.list_open);
-        match ui::hit(&areas, &self.m, ev.col, ev.row) {
+        // 선택을 끄는 중이면 터미널 칸 밖에서 끌거나 떼도 칸 안으로 눌러 이어 간다.
+        if self.select.dragging() && matches!(ev.kind, MouseKind::Drag | MouseKind::Up) {
+            let at = select::local(areas.term, ev.col, ev.row);
+            return self.select_event(ev, at);
+        }
+        // 세션에 넘긴 누름이 눌려 있으면 칸 밖에서 끌거나 떼도 칸 안으로 눌러 넘긴다. 앱이 뗌을 놓치지 않게 한다.
+        if self.held && matches!(ev.kind, MouseKind::Drag | MouseKind::Up) {
+            let at = select::local(areas.term, ev.col, ev.row);
+            return self.term_mouse(ev, at);
+        }
+        if ev.kind == MouseKind::Down && self.select.clear() {
+            self.dirty = true;
+        }
+        let hit = ui::hit(&areas, &self.m, ev.col, ev.row);
+        if let Hit::Term(x, y) = hit {
+            return self.term_mouse(ev, (x, y));
+        }
+        if ev.kind != MouseKind::Down || ev.button != 0 {
+            return;
+        }
+        match hit {
             Hit::Rail(i) => {
                 let rail = view::rail(&self.m.sessions, &self.m.current_project);
                 if let Some(item) = rail.get(i) {
@@ -381,9 +439,64 @@ impl App {
                 self.dirty = true;
             }
             Hit::Row(i) => self.attach(self.m.sessions[i].meta.id.clone()),
-            // 터미널 칸의 마우스(스크롤·선택·앱에 넘기기)는 Task 10에서 한다.
             Hit::Term(..) | Hit::None => {}
         }
+    }
+
+    /// 터미널 칸의 마우스(`at`은 칸 기준). 세션이 마우스를 쓰면 그대로 넘기고, 아니면 휠은 스크롤하고
+    /// 왼쪽 단추 끌기는 선택한다. 칸 안 누름이 눌려 있는 동안은 칸 밖에서 온 끌기·뗌도 여기로 눌려 온다.
+    fn term_mouse(&mut self, ev: MouseEv, at: (u16, u16)) {
+        let Some(screen) = &mut self.screen else {
+            return;
+        };
+        if select::wants_mouse(screen) {
+            if select::session_takes(screen, &ev) {
+                match ev.kind {
+                    MouseKind::Down => self.held = true,
+                    MouseKind::Up => self.held = false,
+                    _ => {}
+                }
+                self.forward(select::encode_sgr(&ev, at.0, at.1));
+            }
+            return;
+        }
+        // 세션이 마우스를 껐으면 누르고 있던 것도 끝난 셈이다.
+        self.held = false;
+        let step = match ev.kind {
+            MouseKind::WheelUp => WHEEL_LINES,
+            MouseKind::WheelDown => -WHEEL_LINES,
+            _ => return self.select_event(ev, at),
+        };
+        // 클라이언트가 가진 화면 사본만 스크롤한다. 세션에는 아무것도 보내지 않는다.
+        let before = screen.term().grid().display_offset();
+        screen.scroll(step);
+        if screen.term().grid().display_offset() != before {
+            self.select.clear();
+            self.dirty = true;
+        }
+    }
+
+    /// 왼쪽 단추의 누름·끌기·뗌으로 선택을 진행한다. 뗄 때 선택이 있으면 복사한다.
+    fn select_event(&mut self, ev: MouseEv, at: (u16, u16)) {
+        if ev.button != 0 {
+            return;
+        }
+        match ev.kind {
+            MouseKind::Down => self.select.down(at),
+            MouseKind::Drag => self.select.drag(at),
+            MouseKind::Up => {
+                let sel = self.select.up(at);
+                let text = sel
+                    .zip(self.screen.as_ref())
+                    .map(|(sel, screen)| select::selected_text(screen, &sel));
+                if let Some((osc, message)) = text.as_deref().and_then(select::copy) {
+                    self.clipboard.extend(osc);
+                    self.say(&message);
+                }
+            }
+            MouseKind::WheelUp | MouseKind::WheelDown => {}
+        }
+        self.dirty = true;
     }
 
     /// 입력 중인 상태줄에 키를 넣는다. `⌃a x` 확인은 `y`만 닫고 다른 키는 취소다.
@@ -460,6 +573,7 @@ impl App {
         if let Some(screen) = &mut self.screen {
             screen.resize(cols, rows);
         }
+        self.select.clear();
         if let Some(id) = &self.m.attached {
             self.send(ToDaemon::Resize {
                 id: id.clone(),
@@ -493,8 +607,19 @@ impl App {
     /// 글자가 같아 ratatui가 건너뛴 칸에 지난 링크가 남지 않게 한다. 커서는 DECSC/DECRC로 되돌린다.
     /// 링크가 많아 느려지면 바뀐 구간만 쓴다.
     fn draw(&mut self, terminal: &mut Term) -> io::Result<()> {
+        // 클립보드 OSC 52는 화면과 같은 쓰기 통로로, 그리는 도중이 아닌 프레임 사이에 내보낸다.
+        if !self.clipboard.is_empty() {
+            terminal.backend_mut().write_all(&self.clipboard)?;
+            self.clipboard.clear();
+        }
         queue!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
-        let frame = terminal.draw(|f| ui::draw(f, &self.m, self.screen.as_ref()))?;
+        let frame = terminal.draw(|f| {
+            ui::draw(f, &self.m, self.screen.as_ref());
+            if let Some(sel) = self.select.selection() {
+                let term = ui::layout(f.area(), self.m.list_open).term;
+                select::paint_selection(f.buffer_mut(), term, sel);
+            }
+        })?;
         let term = ui::layout(frame.area, self.m.list_open).term;
         let runs = self
             .screen
@@ -549,4 +674,211 @@ fn run_cells(buf: &Buffer, run: &LinkRun) -> Cells {
         x += width;
     }
     cells
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
+
+    use super::*;
+
+    /// 바깥 터미널 120x40, 목록이 열려 터미널 칸은 (34, 0)에서 86x39다. 세션 `s1`에 붙어 있고 화면에 `feed`를 먹였다.
+    fn app(feed: &[u8]) -> (App, UnboundedReceiver<ToDaemon>) {
+        let (tx, rx) = unbounded_channel();
+        let mut app = App::new(tx, PathBuf::from("/p"), Size::new(120, 40));
+        app.m.attached = Some("s1".into());
+        let mut screen = Screen::new(86, 39);
+        screen.feed(feed);
+        app.screen = Some(screen);
+        (app, rx)
+    }
+
+    fn lines(n: usize) -> Vec<u8> {
+        (0..n)
+            .flat_map(|i| format!("line{i}\r\n").into_bytes())
+            .collect()
+    }
+
+    fn ev(kind: MouseKind, col: u16, row: u16) -> MouseEv {
+        MouseEv {
+            kind,
+            button: 0,
+            col,
+            row,
+        }
+    }
+
+    fn offset(app: &App) -> usize {
+        app.screen.as_ref().unwrap().term().grid().display_offset()
+    }
+
+    fn sent(rx: &mut UnboundedReceiver<ToDaemon>) -> Vec<ToDaemon> {
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    fn input(data: &[u8]) -> ToDaemon {
+        ToDaemon::Input {
+            id: "s1".into(),
+            data: data.to_vec(),
+        }
+    }
+
+    #[test]
+    fn wheel_scrolls_the_client_copy_and_sends_nothing() {
+        let (mut app, mut rx) = app(&lines(100));
+        app.mouse(ev(MouseKind::WheelUp, 40, 5));
+        assert_eq!(offset(&app), 3);
+        app.mouse(ev(MouseKind::WheelUp, 40, 5));
+        assert_eq!(offset(&app), 6);
+        app.mouse(ev(MouseKind::WheelDown, 40, 5));
+        assert_eq!(offset(&app), 3);
+        assert!(sent(&mut rx).is_empty());
+        // 터미널 칸 밖의 휠은 스크롤하지 않는다.
+        app.mouse(ev(MouseKind::WheelUp, 10, 5));
+        assert_eq!(offset(&app), 3);
+    }
+
+    #[test]
+    fn mouse_goes_to_the_session_in_term_local_coords_when_it_asks() {
+        let (mut app, mut rx) = app(&[lines(100), b"\x1b[?1000h\x1b[?1002h".to_vec()].concat());
+        app.mouse(ev(MouseKind::Down, 40, 5));
+        app.mouse(ev(MouseKind::Drag, 41, 5));
+        app.mouse(ev(MouseKind::Up, 41, 5));
+        app.mouse(ev(MouseKind::WheelUp, 40, 5));
+        assert_eq!(
+            sent(&mut rx),
+            [
+                input(b"\x1b[<0;7;6M"),
+                input(b"\x1b[<32;8;6M"),
+                input(b"\x1b[<0;8;6m"),
+                input(b"\x1b[<64;7;6M"),
+            ]
+        );
+        // 휠은 넘겼을 뿐 클라이언트 화면은 스크롤하지 않고, 선택도 시작하지 않는다.
+        assert_eq!(offset(&app), 0);
+        assert!(app.select.selection().is_none());
+        // 터미널 칸 밖은 넘기지 않는다.
+        app.mouse(ev(MouseKind::Down, 10, 5));
+        app.mouse(ev(MouseKind::WheelUp, 2, 5));
+        assert!(sent(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn held_forwarded_press_gets_clamped_drag_and_release_outside_the_pane() {
+        let (mut app, mut rx) = app(b"\x1b[?1000h\x1b[?1002h");
+        // 누르기는 칸 안이다. 끌다가 목록 위로, 다시 상태줄 위로 벗어나 거기서 뗀다.
+        app.mouse(ev(MouseKind::Down, 40, 5));
+        app.mouse(ev(MouseKind::Drag, 10, 5));
+        app.mouse(ev(MouseKind::Drag, 50, 39));
+        app.mouse(ev(MouseKind::Up, 50, 39));
+        assert_eq!(
+            sent(&mut rx),
+            [
+                input(b"\x1b[<0;7;6M"),
+                input(b"\x1b[<32;1;6M"),
+                input(b"\x1b[<32;17;39M"),
+                input(b"\x1b[<0;17;39m"),
+            ]
+        );
+        // 뗌으로 누름이 끝났으니 칸 밖 끌기와 뗌은 다시 넘기지 않는다.
+        app.mouse(ev(MouseKind::Drag, 10, 5));
+        app.mouse(ev(MouseKind::Up, 10, 5));
+        assert!(sent(&mut rx).is_empty());
+        // 칸 밖에서 시작한 누름은 잡지 않는다.
+        app.mouse(ev(MouseKind::Down, 10, 5));
+        app.mouse(ev(MouseKind::Drag, 40, 5));
+        app.mouse(ev(MouseKind::Up, 40, 5));
+        assert_eq!(
+            sent(&mut rx),
+            [input(b"\x1b[<32;7;6M"), input(b"\x1b[<0;7;6m")]
+        );
+    }
+
+    #[test]
+    fn typing_or_pasting_while_scrolled_returns_to_the_bottom_first() {
+        let (mut app, mut rx) = app(&lines(100));
+        app.mouse(ev(MouseKind::WheelUp, 40, 5));
+        assert_eq!(offset(&app), 3);
+        app.on_action(Action::Pass(b"a".to_vec()));
+        assert_eq!(offset(&app), 0);
+        app.mouse(ev(MouseKind::WheelUp, 40, 5));
+        app.on_action(Action::Paste(b"b".to_vec()));
+        assert_eq!(offset(&app), 0);
+        assert_eq!(sent(&mut rx), [input(b"a"), input(b"b")]);
+    }
+
+    #[test]
+    fn drag_copies_with_osc52_and_the_highlight_stays_until_a_key() {
+        let (mut app, _rx) = app(b"hello world");
+        app.mouse(ev(MouseKind::Down, 34, 0));
+        app.mouse(ev(MouseKind::Drag, 36, 0));
+        assert!(app.clipboard.is_empty());
+        app.mouse(ev(MouseKind::Up, 38, 0));
+        assert_eq!(app.clipboard, select::osc52("hello"));
+        assert_eq!(app.m.message, "복사됨 5자");
+        assert!(app.select.selection().is_some());
+        // 복사 알림은 마우스로는 지워지지 않고, 키를 누르면 알림과 반전이 함께 사라진다.
+        app.mouse(ev(MouseKind::WheelDown, 40, 5));
+        assert_eq!(app.m.message, "복사됨 5자");
+        app.on_action(Action::Pass(b"x".to_vec()));
+        assert!(app.select.selection().is_none());
+        assert!(app.m.message.is_empty());
+    }
+
+    #[test]
+    fn plain_click_copies_nothing_and_clears_the_highlight() {
+        let (mut app, _rx) = app(b"hello world");
+        app.mouse(ev(MouseKind::Down, 34, 0));
+        app.mouse(ev(MouseKind::Drag, 38, 0));
+        app.mouse(ev(MouseKind::Up, 38, 0));
+        app.clipboard.clear();
+        app.mouse(ev(MouseKind::Down, 40, 0));
+        app.mouse(ev(MouseKind::Up, 40, 0));
+        assert!(app.clipboard.is_empty());
+        assert!(app.select.selection().is_none());
+    }
+
+    #[test]
+    fn dragging_outside_the_pane_clamps_into_it() {
+        let (mut app, _rx) = app(b"hello world\r\nsecond");
+        app.mouse(ev(MouseKind::Down, 34 + 6, 0));
+        // 목록 위로 벗어나도 선택은 이어지고 터미널 칸 왼쪽 끝으로 눌린다.
+        app.mouse(ev(MouseKind::Drag, 10, 1));
+        app.mouse(ev(MouseKind::Up, 10, 1));
+        assert_eq!(app.clipboard, select::osc52("world\ns"));
+    }
+
+    #[test]
+    fn selection_goes_away_with_scroll_output_and_session_switch() {
+        let (mut app, _rx) = app(&lines(100));
+        let select = |app: &mut App| {
+            app.mouse(ev(MouseKind::Down, 34, 0));
+            app.mouse(ev(MouseKind::Drag, 38, 0));
+            app.mouse(ev(MouseKind::Up, 38, 0));
+            assert!(app.select.selection().is_some());
+        };
+        select(&mut app);
+        app.mouse(ev(MouseKind::WheelUp, 40, 5));
+        assert!(app.select.selection().is_none());
+        select(&mut app);
+        app.on_msg(FromDaemon::Output {
+            id: "s1".into(),
+            data: b"more".to_vec(),
+        });
+        assert!(app.select.selection().is_none());
+        select(&mut app);
+        app.attach("s2".into());
+        assert!(app.select.selection().is_none());
+        assert!(app.screen.is_none());
+        // 끄는 도중에 온 출력은 선택을 끊지 않는다.
+        app.m.attached = Some("s1".into());
+        app.screen = Some(Screen::new(86, 39));
+        app.mouse(ev(MouseKind::Down, 34, 0));
+        app.mouse(ev(MouseKind::Drag, 38, 0));
+        app.on_msg(FromDaemon::Output {
+            id: "s1".into(),
+            data: b"more".to_vec(),
+        });
+        assert!(app.select.selection().is_some());
+    }
 }
