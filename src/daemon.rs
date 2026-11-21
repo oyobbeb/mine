@@ -55,6 +55,8 @@ const INITIAL_SIZE: (u16, u16) = (80, 24);
 const KILL_WAIT: Duration = hold::KILL_GRACE
     .saturating_add(hold::DRAIN_GRACE)
     .saturating_add(Duration::from_millis(1500));
+/// shell 세션이 출력 없이 이만큼 지나면 작업 중에서 대기로 돌아간다(설계 5.2).
+const SHELL_QUIET: Duration = Duration::from_secs(2);
 /// 띄운 보관 프로세스가 연결을 받기까지 기다리는 최대 시간.
 const START_WAIT: Duration = Duration::from_secs(5);
 /// 보관 프로세스 연결에서 `Hello`와 출력 버퍼를 기다리는 최대 시간.
@@ -109,6 +111,8 @@ struct Sess {
     viewed_ms: Option<u64>,
     /// 동기화 갱신 시간 제한을 지켜보는 작업이 있다.
     sync_timer: bool,
+    /// shell 세션이 마지막으로 출력한 시각. 출력 없이 `SHELL_QUIET`가 지나면 `None`으로 돌린다. 그동안 작업 중이다.
+    active: Option<Instant>,
     /// 보관 프로세스를 다시 띄우거나 다시 붙는 중이다.
     busy: bool,
 }
@@ -751,6 +755,9 @@ fn spawn_hold_reader(shared: Shared, id: String, link: u64, mut reader: BufReade
                         if let Some(deadline) = d.on_output(&id, link, data) {
                             spawn_sync_timer(Arc::clone(&shared), id.clone(), deadline);
                         }
+                        if d.mark_active(&id, link) {
+                            spawn_quiet_timer(Arc::clone(&shared), id.clone());
+                        }
                     }
                     Ok(Some(HoldOut::Hello { .. })) => {}
                     Ok(Some(HoldOut::Exited { .. })) => {
@@ -831,6 +838,30 @@ fn spawn_sync_timer(shared: Shared, id: String, mut deadline: Instant) {
     });
 }
 
+/// shell 세션이 `SHELL_QUIET` 동안 출력이 없으면 대기로 돌리고 알린다. 그사이 출력이 있었으면 그만큼 더 기다린다.
+fn spawn_quiet_timer(shared: Shared, id: String) {
+    tokio::spawn(async move {
+        let mut deadline = Instant::now() + SHELL_QUIET;
+        loop {
+            tokio::time::sleep_until(deadline.into()).await;
+            let mut d = shared.lock().await;
+            let Some(s) = d.sessions.get_mut(&id) else {
+                return;
+            };
+            match s.active {
+                Some(at) if at + SHELL_QUIET > Instant::now() => deadline = at + SHELL_QUIET,
+                Some(_) => {
+                    s.active = None;
+                    d.refresh(&id);
+                    d.publish();
+                    return;
+                }
+                None => return,
+            }
+        }
+    });
+}
+
 impl Sess {
     fn new(meta: Meta, viewed_ms: Option<u64>) -> Sess {
         Sess {
@@ -843,6 +874,7 @@ impl Sess {
             resume_id: None,
             viewed_ms,
             sync_timer: false,
+            active: None,
             unlinked: false,
             busy: false,
         }
@@ -1012,7 +1044,12 @@ impl Daemon {
             .into_iter()
             .filter(|ev| ev.ms >= s.meta.created_ms)
             .collect();
-        let (state, waiting, resume_id) = hooks::fold(&events, s.viewed_ms);
+        let (mut state, waiting, resume_id) = hooks::fold(&events, s.viewed_ms);
+        // shell 세션은 훅 대신 출력으로 작업 중을 정한다(`active`는 shell 세션에만 생긴다). 훅 기록이 대기 말고 다른
+        // 상태를 정했으면 그쪽을 따른다.
+        if s.active.is_some() && state == SessionState::Idle {
+            state = SessionState::Working;
+        }
         s.resume_id = resume_id.or_else(|| s.meta.resume_id.clone());
         (s.state, s.waiting) = if s.hold.is_some() || s.unlinked {
             (state, waiting)
@@ -1202,6 +1239,26 @@ impl Daemon {
             },
         );
         deadline
+    }
+
+    /// shell 세션의 보관 프로세스가 실시간 출력을 보냈다. 대기에서 작업 중으로 바뀌면 알린다. 조용해지기를
+    /// 지켜보는 작업을 새로 띄워야 하면 `true`다.
+    ///
+    /// 다시 붙을 때 받는 출력 버퍼는 `install`이 화면에 먹이고, 터미널 질의 답은 보관 프로세스로 가는 입력이라
+    /// 둘 다 여기에 오지 않는다. 출력 조각마다 목록을 다시 계산하지 않고, 바뀔 때만 계산해 알린다.
+    fn mark_active(&mut self, id: &str, link: u64) -> bool {
+        let Some(s) = self.sessions.get_mut(id) else {
+            return false;
+        };
+        if s.meta.kind != Kind::Shell || s.hold.as_ref().is_none_or(|h| h.link != link) {
+            return false;
+        }
+        if s.active.replace(Instant::now()).is_some() {
+            return false;
+        }
+        self.refresh(id);
+        self.publish();
+        true
     }
 
     /// 세션에 붙은 보관 프로세스 연결이 `link`인가.

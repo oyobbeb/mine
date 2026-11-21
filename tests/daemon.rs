@@ -317,10 +317,22 @@ impl Client {
     }
 }
 
+/// 셸 세션이 다 뜨고 출력이 잦아들어 대기가 될 때까지 기다린다. 셸은 시작 프롬프트를 언제 낼지 모르므로
+/// (늦게 오면 다시 작업 중이 된다) 명령 하나의 결과를 먼저 보고 나서 기다린다. 붙었던 연결은 끊고 기다린다.
+fn wait_shell_quiet(st: &St, name: &str) {
+    let mut c = client(st);
+    c.attach(name);
+    c.input("echo up-$((1+1))\n");
+    c.wait_output("up-2");
+    drop(c);
+    wait_until(|| ls(st).iter().any(|row| row[2] == name && row[4] == "idle"));
+}
+
 #[test]
 fn new_and_ls_show_shell_session() {
     let st = state();
     mine(&st, &["new", "dev"]);
+    wait_shell_quiet(&st, "dev");
     let rows = ls(&st);
     assert_eq!(rows.len(), 1);
     let folder = st.project.file_name().unwrap().to_str().unwrap();
@@ -517,6 +529,8 @@ fn input_during_approval_returns_to_working() {
 fn viewing_a_done_session_makes_it_idle() {
     let st = state();
     mine(&st, &["new", "d"]);
+    // 셸 출력으로 정해지는 작업 중이 대기로 돌아간 뒤에 훅 상태만 본다.
+    wait_shell_quiet(&st, "d");
     mine_stdin(
         &st,
         &["_event", &session_dir(&st, "d")],
@@ -868,4 +882,30 @@ fn sessions_do_not_inherit_the_daemon_spawners_environment() {
         }
     }
     assert!(env_of("b").contains(&profile));
+}
+
+#[test]
+fn shell_output_shows_working_then_idle_after_quiet() {
+    // shell 세션은 훅이 없으므로 출력이 있으면 작업 중, 2초 동안 없으면 대기다(설계 5.2).
+    let st = state();
+    mine(&st, &["new", "w"]);
+    wait_shell_quiet(&st, "w");
+    let mut c = client(&st);
+    c.attach("w");
+    c.send(&ToDaemon::List);
+    let state_push = |c: &mut Client| loop {
+        if let FromDaemon::Sessions { sessions } = c.recv().expect("연결이 끊겼다") {
+            break sessions[0].state.clone();
+        }
+    };
+    assert_eq!(state_push(&mut c), SessionState::Idle);
+    c.input("echo hi\n");
+    // 바뀔 때만 알리므로 다음 목록은 작업 중이고, 그다음 목록은 조용해진 뒤의 대기다.
+    assert_eq!(state_push(&mut c), SessionState::Working);
+    let working_at = Instant::now();
+    let row = &ls(&st)[0];
+    assert_eq!((row[0].as_str(), row[4].as_str()), ("◐", "working"));
+    assert_eq!(state_push(&mut c), SessionState::Idle);
+    assert!(working_at.elapsed() >= Duration::from_millis(1500));
+    assert_eq!(ls(&st)[0][4], "idle");
 }
