@@ -5,6 +5,7 @@ mod hold;
 mod paths;
 mod project;
 mod proto;
+mod screen;
 mod session;
 
 use std::path::PathBuf;
