@@ -14,6 +14,7 @@ use tokio::sync::mpsc;
 
 use crate::paths::{State, check_sock_path, ensure_dir};
 use crate::proto::{FromDaemon, ToDaemon, VERSION, read_msg, recv, send, write_msg};
+use crate::session::shell_quote;
 
 /// 띄운 데몬에 다시 붙기까지 기다리는 최대 시간.
 const SPAWN_WAIT: Duration = Duration::from_secs(2);
@@ -50,7 +51,7 @@ impl Conn {
                 wait_connect(&sock)?
             }
         };
-        Conn::handshake(stream)
+        Conn::handshake(stream, state)
     }
 
     /// [`Conn::connect_or_spawn`]의 비동기 판. 데몬을 띄우고 기다리는 방법은 같다.
@@ -73,7 +74,7 @@ impl Conn {
             .await
             .map_err(|_| no_reply())?
             .context("데몬 응답을 읽지 못했다")?;
-        check_hello(hello)?;
+        check_hello(hello, state)?;
         let (tx, mut outgoing) = mpsc::unbounded_channel::<ToDaemon>();
         tokio::spawn(async move {
             while let Some(msg) = outgoing.recv().await {
@@ -96,7 +97,7 @@ impl Conn {
     }
 
     /// `Hello`를 주고받고 버전을 확인한다.
-    fn handshake(stream: UnixStream) -> Result<Conn> {
+    fn handshake(stream: UnixStream, state: &State) -> Result<Conn> {
         stream.set_read_timeout(Some(REPLY_WAIT))?;
         let mut conn = Conn {
             writer: stream.try_clone()?,
@@ -104,7 +105,7 @@ impl Conn {
         };
         write_msg(&mut conn.writer, &ToDaemon::Hello { version: VERSION })?;
         let hello = conn.recv()?;
-        check_hello(Some(hello))?;
+        check_hello(Some(hello), state)?;
         Ok(conn)
     }
 
@@ -141,13 +142,23 @@ fn no_reply() -> anyhow::Error {
     anyhow::anyhow!("데몬이 {}초 안에 답하지 않았다", REPLY_WAIT.as_secs())
 }
 
+/// 떠 있는 데몬을 끝내고 다시 띄우는 방법. 버전이 다르다는 오류에 붙인다. 세션은 보관 프로세스가 쥐고 있어
+/// 데몬이 끝나도 남고, 다음 `mine`이 띄운 새 데몬이 다시 붙는다.
+pub fn restart_hint(state: &State) -> String {
+    format!(
+        "다음 명령으로 데몬을 끝내고 mine을 다시 실행한다(세션은 그대로 남는다): kill \"$(cat {})\"",
+        shell_quote(&state.daemon_pid().to_string_lossy())
+    )
+}
+
 /// 데몬의 첫 메시지가 같은 버전의 `Hello`인지 확인한다.
-fn check_hello(msg: Option<FromDaemon>) -> Result<()> {
+fn check_hello(msg: Option<FromDaemon>, state: &State) -> Result<()> {
     match msg {
         Some(FromDaemon::Hello { version }) if version == VERSION => Ok(()),
         Some(FromDaemon::Hello { version }) => {
             bail!(
-                "데몬 프로토콜 버전이 다르다(데몬 {version}, 이 명령 {VERSION}). 데몬을 다시 띄운다"
+                "데몬 프로토콜 버전이 다르다(데몬 {version}, 이 명령 {VERSION}). {}",
+                restart_hint(state)
             )
         }
         Some(FromDaemon::Error { message }) => bail!("데몬이 연결을 거절했다: {message}"),
@@ -209,5 +220,22 @@ fn wait_connect(sock: &Path) -> Result<UnixStream> {
             }
             Err(_) => std::thread::sleep(Duration::from_millis(10)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_mismatch_tells_how_to_restart_the_daemon() {
+        let state = State {
+            root: "/s s".into(),
+        };
+        let hello = FromDaemon::Hello {
+            version: VERSION + 1,
+        };
+        let e = check_hello(Some(hello), &state).unwrap_err().to_string();
+        assert!(e.contains("kill \"$(cat '/s s/daemon.pid')\""), "{e}");
     }
 }

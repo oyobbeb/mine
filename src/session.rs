@@ -157,7 +157,7 @@ pub fn login_shell() -> String {
 }
 
 /// 셸이 한 단어로 읽도록 POSIX 작은따옴표로 감싼다. 안전한 글자만 있으면 그대로 둔다.
-fn shell_quote(s: &str) -> String {
+pub(crate) fn shell_quote(s: &str) -> String {
     let plain = !s.is_empty()
         && s.chars().all(|c| {
             c.is_ascii_alphanumeric()

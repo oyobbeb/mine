@@ -443,11 +443,16 @@ fn version_mismatch_is_rejected() {
     let mut r = BufReader::new(stream.try_clone().unwrap());
     stream.set_read_timeout(Some(WAIT)).unwrap();
     write_msg(&mut &stream, &ToDaemon::Hello { version: 999 }).unwrap();
-    let mut saw_error = false;
+    let mut error = None;
     while let Some(msg) = read_msg::<_, FromDaemon>(&mut r).unwrap() {
-        saw_error |= matches!(msg, FromDaemon::Error { .. });
+        if let FromDaemon::Error { message } = msg {
+            error = Some(message);
+        }
     }
-    assert!(saw_error);
+    // 데몬을 다시 띄우는 실제 명령을 알려 준다.
+    let want = format!("kill \"$(cat {})\"", st.root.join("daemon.pid").display());
+    let error = error.expect("Error가 오지 않았다");
+    assert!(error.contains(&want), "{error}");
 }
 
 #[test]

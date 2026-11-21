@@ -92,7 +92,7 @@ pub async fn run(state: State, project: PathBuf) -> Result<()> {
             },
             msg = rx.recv() => match msg {
                 Some(msg) => app.on_msg(msg),
-                None => bail!("데몬 연결이 끊겼다"),
+                None => bail!("데몬 연결이 끊겼다. mine을 다시 실행하면 세션에 다시 붙는다"),
             },
             _ = winch.recv() => app.on_resize(terminal.size()?),
             () = tokio::time::sleep_until(wake.into()) => {}

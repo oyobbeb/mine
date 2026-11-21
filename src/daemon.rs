@@ -32,6 +32,7 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::AbortHandle;
 use tokio::time::timeout;
 
+use crate::conn::restart_hint;
 use crate::hold;
 use crate::hooks::{self, Event, EventKind, now_ms};
 use crate::paths::{State, check_sock_path, ensure_dir};
@@ -311,9 +312,12 @@ async fn serve_client(shared: Shared, stream: UnixStream) {
     let mut reader = BufReader::new(read);
     let refused = match recv::<_, ToDaemon>(&mut reader).await {
         Ok(Some(ToDaemon::Hello { version })) if version == VERSION => None,
-        Ok(Some(ToDaemon::Hello { version })) => Some(format!(
-            "프로토콜 버전이 다르다(클라이언트 {version}, 데몬 {VERSION}). 데몬을 다시 띄운다"
-        )),
+        Ok(Some(ToDaemon::Hello { version })) => {
+            let hint = restart_hint(&shared.lock().await.state);
+            Some(format!(
+                "프로토콜 버전이 다르다(클라이언트 {version}, 데몬 {VERSION}). {hint}"
+            ))
+        }
         Ok(Some(_)) => Some("첫 메시지는 Hello여야 한다".to_string()),
         Ok(None) | Err(_) => Some(String::new()),
     };
