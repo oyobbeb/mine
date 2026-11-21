@@ -1,11 +1,11 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{Parser, Subcommand};
 use mine::conn::Conn;
 use mine::proto::{FromDaemon, ToDaemon};
 use mine::session::{Kind, NewSession, SessionInfo, SessionState, session_id};
-use mine::{daemon, hold, hooks, paths, project};
+use mine::{client, daemon, hold, hooks, paths, project};
 
 #[derive(Parser)]
 #[command(name = "mine", version, about = "AI 코딩 에이전트 세션 멀티플렉서")]
@@ -196,7 +196,12 @@ fn main() -> Result<()> {
             request_sessions(&state, &ToDaemon::Kill { id })
                 .with_context(|| format!("세션을 닫지 못했다: {name}"))?;
         }
-        None => Cli::command().print_help()?,
+        // 명령이 없으면 클라이언트 화면이다. 프로젝트는 `mine new`와 같은 방법으로 찾는다.
+        None => {
+            let state = paths::State::from_env()?;
+            let project = project_root(cli.project, &state)?;
+            tokio::runtime::Runtime::new()?.block_on(client::run(state, project))?;
+        }
     }
     Ok(())
 }

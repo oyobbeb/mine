@@ -11,8 +11,8 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::session::{NewSession, SessionInfo};
 
-/// 클라이언트와 데몬 사이 프로토콜 버전.
-pub const VERSION: u32 = 1;
+/// 클라이언트와 데몬 사이 프로토콜 버전. 2에서 `Colors`가 생겼다(1인 데몬은 모르는 메시지에 연결을 끊는다).
+pub const VERSION: u32 = 2;
 /// 데몬과 보관 프로세스 사이 프로토콜 버전.
 pub const HOLD_VERSION: u32 = 1;
 
@@ -95,6 +95,11 @@ pub enum ToDaemon {
     },
     Poke {
         id: String,
+    },
+    /// 바깥 터미널의 기본 전경색과 배경색(`#rrggbb`). 데몬이 모든 화면의 색 질의 답에 쓴다.
+    Colors {
+        fg: String,
+        bg: String,
     },
 }
 

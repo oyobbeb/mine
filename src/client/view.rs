@@ -113,16 +113,34 @@ pub fn groups(sessions: &[SessionInfo], filter: Option<&Path>) -> Vec<Group> {
         .collect()
 }
 
-/// 접힌 묶음을 뺀, 화면에 보이는 줄의 순서. `⌃a n/p`가 이 순서로 움직인다.
-pub fn order(sessions: &[SessionInfo], filter: Option<&Path>) -> Vec<usize> {
-    groups(sessions, filter)
-        .into_iter()
+/// 기본 접힘(`groups`)에 클라이언트 상태를 얹는다. `toggled`에 든 상태의 묶음은 기본과 반대로 접거나 펴고,
+/// 붙은 세션(`attached`, `sessions` 인덱스)이 든 묶음은 늘 펼친다.
+pub fn expand(
+    mut groups: Vec<Group>,
+    toggled: &[SessionState],
+    attached: Option<usize>,
+) -> Vec<Group> {
+    for g in &mut groups {
+        g.collapsed ^= toggled.contains(&g.state);
+        if attached.is_some_and(|i| g.rows.contains(&i)) {
+            g.collapsed = false;
+        }
+    }
+    groups
+}
+
+/// 접힌 묶음을 뺀, 화면에 보이는 줄의 순서. 목록이 그리는 묶음(`expand`를 거친 것)을 받는다.
+/// `⌃a n/p`가 이 순서로 움직인다.
+pub fn order(groups: &[Group]) -> Vec<usize> {
+    groups
+        .iter()
         .filter(|g| !g.collapsed)
-        .flat_map(|g| g.rows)
+        .flat_map(|g| g.rows.iter().copied())
         .collect()
 }
 
-const NEW_USAGE: &str = "<claude-a|claude-b|codex|shell> <이름> [모델]";
+/// `⌃a c` 입력 형식.
+pub const NEW_USAGE: &str = "<claude-a|claude-b|codex|shell> <이름> [모델]";
 
 /// `"<claude-a|claude-b|codex|shell> <이름> [모델]"`을 새 세션 명세로 바꾼다.
 pub fn parse_new(input: &str, project: &Path) -> Result<NewSession> {
@@ -272,7 +290,7 @@ mod tests {
         let rows: Vec<usize> = g.iter().flat_map(|g| g.rows.clone()).collect();
         assert_eq!(rows, vec![0, 2]);
         assert!(!rows.contains(&1));
-        assert_eq!(order(&ss, Some(Path::new("/p/b"))), vec![1]);
+        assert_eq!(order(&groups(&ss, Some(Path::new("/p/b")))), vec![1]);
         assert!(groups(&ss, Some(Path::new("/p/none"))).is_empty());
     }
 
@@ -284,7 +302,25 @@ mod tests {
             s("/p", "c", Approval),
             s("/p", "d", Ended),
         ];
-        assert_eq!(order(&ss, None), vec![2, 1, 3]);
+        assert_eq!(order(&groups(&ss, None)), vec![2, 1, 3]);
+    }
+
+    #[test]
+    fn expand_applies_toggles_and_keeps_attached_group_open() {
+        let ss = [
+            s("/p", "a", Idle),
+            s("/p", "b", Working),
+            s("/p", "c", Idle),
+        ];
+        let g = groups(&ss, None);
+        assert_eq!(order(&g), vec![1]);
+        // 사용자가 대기 묶음을 펼치면 그 줄도 순서에 든다.
+        assert_eq!(order(&expand(g.clone(), &[Idle], None)), vec![1, 0, 2]);
+        // 처음에 펼친 묶음은 접을 수 있다.
+        assert!(order(&expand(g.clone(), &[Working], None)).is_empty());
+        // 붙은 세션의 묶음은 기본이나 사용자 접힘과 상관없이 펼친다.
+        assert_eq!(order(&expand(g.clone(), &[], Some(2))), vec![1, 0, 2]);
+        assert_eq!(order(&expand(g, &[Idle, Working], Some(2))), vec![0, 2]);
     }
 
     #[test]

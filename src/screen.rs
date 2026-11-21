@@ -2,8 +2,8 @@
 //! 똑같은 화면을 되살릴 수 있는 바이트열(스냅숏)을 만든다.
 //!
 //! 안쪽 앱의 터미널 질의(DA1, 커서 위치 DSR, OSC 10/11 색, kitty 키보드 모드)에 대한 답은
-//! `Replies`가 모아 두고 `take_replies`로 꺼낸다. 데몬만 꺼내서 보관 프로세스에 입력으로 보낸다.
-//! 클라이언트의 `Screen`은 꺼내지 않는다(같은 질의에 두 번 답하지 않도록).
+//! `Replies`가 모아 두고 `take_replies`로 꺼낸다. 데몬만 꺼낸 답을 보관 프로세스에 입력으로 보낸다.
+//! 클라이언트의 `Screen`은 꺼내서 버린다(같은 질의에 두 번 답하지 않도록).
 
 use std::fmt::Write as _;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -49,8 +49,8 @@ impl Dimensions for Size {
     }
 }
 
-/// 색 질의(OSC 10/11/12)에 답하는 기본 전경색과 배경색. 앱이 OSC로 바꾼 색이 있으면 그 색이 먼저다.
-// ponytail: 클라이언트가 바깥 터미널의 실제 색을 알려 주면(이후 태스크) 그 값으로 바꾼다.
+/// 색 질의(OSC 10/11/12)에 답하는 처음 기본 전경색과 배경색. 클라이언트가 바깥 터미널의 실제 색을 알려 주면
+/// `set_default_colors`로 바꾼다. 앱이 OSC로 바꾼 색이 있으면 그 색이 먼저다.
 const DEFAULT_FG: Rgb = Rgb {
     r: 0xff,
     g: 0xff,
@@ -62,7 +62,7 @@ const DEFAULT_BG: Rgb = Rgb {
     b: 0x34,
 };
 
-/// 꺼내지 않고 쌓아 둘 답의 최대 개수. 클라이언트 쪽 `Screen`은 꺼내지 않으므로 무한히 늘지 않게 막는다.
+/// 꺼내지 않고 쌓아 둘 답의 최대 개수. 꺼내지 않는 `Screen`(테스트 등)에서도 무한히 늘지 않게 막는다.
 const MAX_PENDING_REPLIES: usize = 256;
 
 /// 질의에 대한 답 하나. 색 답은 꺼낼 때 그 시점 색으로 채운다.
@@ -97,6 +97,9 @@ pub struct Screen {
     /// 대체 화면에 있는 동안 가려진 주 화면(스크롤백 포함). `Term`은 비활성 화면을 내주지 않으므로
     /// 진입한 순간에 복사해 두고, 스냅숏이 대체 화면 뒤의 주 화면을 되살릴 때 쓴다.
     primary: Option<Grid<Cell>>,
+    /// 색 질의에 답하는 기본 전경색(커서 색도 같다)과 배경색.
+    default_fg: Rgb,
+    default_bg: Rgb,
 }
 
 impl Screen {
@@ -113,7 +116,15 @@ impl Screen {
             parser: Processor::new(),
             replies,
             primary: None,
+            default_fg: DEFAULT_FG,
+            default_bg: DEFAULT_BG,
         }
+    }
+
+    /// 색 질의에 답하는 기본 전경색과 배경색을 바꾼다. 커서 색은 전경색을 따른다.
+    pub fn set_default_colors(&mut self, fg: Rgb, bg: Rgb) {
+        self.default_fg = fg;
+        self.default_bg = bg;
     }
 
     pub fn feed(&mut self, bytes: &[u8]) {
@@ -161,9 +172,9 @@ impl Screen {
     /// 색 질의에 답할 색. 앱이 정한 색이 먼저고, 없으면 기본 전경·배경색이다. 그 밖의 색 번호는 답하지 않는다.
     fn color(&self, index: usize) -> Option<Rgb> {
         let fallback = match index {
-            i if i == NamedColor::Background as usize => DEFAULT_BG,
+            i if i == NamedColor::Background as usize => self.default_bg,
             i if i == NamedColor::Foreground as usize || i == NamedColor::Cursor as usize => {
-                DEFAULT_FG
+                self.default_fg
             }
             _ => return self.term.colors()[index],
         };
@@ -913,6 +924,25 @@ mod tests {
         // 앱이 OSC로 바꾼 색으로 답한다.
         s.feed(b"\x1b]11;rgb:01/02/03\x07\x1b]11;?\x07");
         assert_eq!(s.take_replies(), b"\x1b]11;rgb:0101/0202/0303\x07");
+    }
+
+    #[test]
+    fn colour_queries_use_set_default_colours() {
+        let mut s = Screen::new(40, 10);
+        let fg = Rgb {
+            r: 0x0a,
+            g: 0x0b,
+            b: 0x0c,
+        };
+        let bg = Rgb {
+            r: 0x01,
+            g: 0x02,
+            b: 0x03,
+        };
+        s.set_default_colors(fg, bg);
+        s.feed(b"\x1b]10;?\x07\x1b]11;?\x07\x1b]12;?\x07");
+        let want = "\x1b]10;rgb:0a0a/0b0b/0c0c\x07\x1b]11;rgb:0101/0202/0303\x07\x1b]12;rgb:0a0a/0b0b/0c0c\x07";
+        assert_eq!(String::from_utf8(s.take_replies()).unwrap(), want);
     }
 
     #[test]

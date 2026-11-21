@@ -7,6 +7,8 @@
 //! - `List`를 보낸 클라이언트는 그 뒤로 목록이 바뀔 때마다 `Sessions`를 받는다. `List`·`New`·`Kill`에는
 //!   요청한 클라이언트에 `Sessions`(또는 `Error`)로 직접 답한다. 구독하지 않은 헤드리스 연결이 다른 사건의
 //!   알림을 자기 요청의 답으로 잘못 읽지 않게 하려는 것이다.
+//! - 클라이언트가 `Colors`로 바깥 터미널의 기본색을 알려 주면 모든 세션 화면(앞으로 붙일 화면 포함)이
+//!   안쪽 앱의 색 질의에 그 색으로 답한다.
 //! - 데몬이 다시 뜨면 `sessions/*/meta.json`을 훑어 살아 있는 보관 프로세스에 다시 붙고, 보관 프로세스의
 //!   출력 버퍼로 80x24 화면을 다시 만든다. 첫 `Attach`가 클라이언트 크기로 바꾼다.
 //!
@@ -21,6 +23,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use alacritty_terminal::vte::ansi::Rgb;
 use anyhow::{Context, Result, bail};
 use tokio::io::BufReader;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
@@ -77,6 +80,8 @@ struct Daemon {
     next_id: u64,
     /// 구독한 클라이언트에 마지막으로 알린 목록. 바뀌었을 때만 다시 알린다.
     last: Vec<SessionInfo>,
+    /// 클라이언트가 알려 준 바깥 터미널의 기본 전경·배경색. 새로 만드는 화면에도 쓴다.
+    colors: Option<(Rgb, Rgb)>,
 }
 
 /// 세션 하나.
@@ -164,6 +169,7 @@ pub async fn run(state: State) -> Result<()> {
         clients: HashMap::new(),
         next_id: 0,
         last: Vec::new(),
+        colors: None,
     }));
     restore(&shared).await;
     eprintln!("데몬 시작: pid {}", std::process::id());
@@ -326,6 +332,7 @@ async fn handle(shared: &Shared, client: u64, msg: ToDaemon) -> bool {
             d.refresh(&id);
             d.publish();
         }
+        ToDaemon::Colors { fg, bg } => shared.lock().await.set_colors(&fg, &bg),
     }
     shared.lock().await.clients.contains_key(&client)
 }
@@ -595,6 +602,7 @@ async fn connect_holder(sock: &Path) -> Result<Option<Link>> {
 /// 답을 보낸다. 다시 붙는 경우(데몬 재시작 등)에는 질의에 이미 답했으므로 답을 버리고, PTY 크기를 화면에 맞춘다.
 fn install(d: &mut Daemon, shared: &Shared, id: &str, link: Link, fresh: bool) {
     let link_id = d.next_id();
+    let colors = d.colors;
     let Some(s) = d.sessions.get_mut(id) else {
         return;
     };
@@ -611,6 +619,9 @@ fn install(d: &mut Daemon, shared: &Shared, id: &str, link: Link, fresh: bool) {
         let _ = tx.send(HoldIn::Resize { cols, rows });
     }
     s.screen = Screen::new(s.size.0, s.size.1);
+    if let Some((fg, bg)) = colors {
+        s.screen.set_default_colors(fg, bg);
+    }
     s.screen.feed(&ring);
     s.unlinked = false;
     s.hold = Some(Hold {
@@ -1042,6 +1053,19 @@ impl Daemon {
             }
             self.refresh(id);
             self.publish();
+        }
+    }
+
+    /// `Colors`: 바깥 터미널 색을 지금 있는 모든 화면과 앞으로 붙일 화면(`install`)의 기본색으로 삼는다.
+    /// 보관 프로세스가 붙지 않은 화면은 질의할 앱이 없고, 붙을 때 `install`이 화면을 새로 만든다.
+    fn set_colors(&mut self, fg: &str, bg: &str) {
+        let (Ok(fg), Ok(bg)) = (fg.parse::<Rgb>(), bg.parse::<Rgb>()) else {
+            eprintln!("색 형식이 올바르지 않다: {fg} {bg}");
+            return;
+        };
+        self.colors = Some((fg, bg));
+        for s in self.sessions.values_mut() {
+            s.screen.set_default_colors(fg, bg);
         }
     }
 

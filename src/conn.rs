@@ -1,4 +1,5 @@
-//! 데몬 연결. 데몬이 없으면 띄운다. 헤드리스 명령(`mine ls`, `new`, `kill`)이 함께 쓴다.
+//! 데몬 연결. 데몬이 없으면 띄운다. 헤드리스 명령(`mine ls`, `new`, `kill`)은 동기 `Conn`을,
+//! 클라이언트 화면은 비동기 `AsyncConn`을 쓴다.
 
 use std::fs::OpenOptions;
 use std::io::{self, BufReader};
@@ -9,9 +10,10 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use tokio::sync::mpsc;
 
 use crate::paths::{State, check_sock_path, ensure_dir};
-use crate::proto::{FromDaemon, ToDaemon, VERSION, read_msg, write_msg};
+use crate::proto::{FromDaemon, ToDaemon, VERSION, read_msg, recv, send, write_msg};
 
 /// 띄운 데몬에 다시 붙기까지 기다리는 최대 시간.
 const SPAWN_WAIT: Duration = Duration::from_secs(2);
@@ -22,6 +24,15 @@ const REPLY_WAIT: Duration = Duration::from_secs(15);
 pub struct Conn {
     reader: BufReader<UnixStream>,
     writer: UnixStream,
+}
+
+/// 데몬과의 비동기 연결(클라이언트 화면용). `tx`로 보낸 메시지는 쓰기 작업 하나가 차례로 쓰고,
+/// 읽기 작업 하나가 받은 메시지를 `rx`로 넘긴다. 연결이 끊기면 `rx`가 `None`을 돌려준다.
+///
+/// `proto::recv`는 취소에 안전하지 않으므로 `select!`에는 `rx.recv()`(취소에 안전하다)만 넣는다.
+pub struct AsyncConn {
+    pub tx: mpsc::UnboundedSender<ToDaemon>,
+    pub rx: mpsc::UnboundedReceiver<FromDaemon>,
 }
 
 impl Conn {
@@ -42,6 +53,48 @@ impl Conn {
         Conn::handshake(stream)
     }
 
+    /// [`Conn::connect_or_spawn`]의 비동기 판. 데몬을 띄우고 기다리는 방법은 같다.
+    pub async fn connect_or_spawn_async(state: &State) -> Result<AsyncConn> {
+        let sock = state.daemon_sock();
+        check_sock_path(&sock)?;
+        let stream = match tokio::net::UnixStream::connect(&sock).await {
+            Ok(stream) => stream,
+            Err(_) => {
+                spawn_daemon(state)?;
+                let stream = tokio::task::spawn_blocking(move || wait_connect(&sock)).await??;
+                stream.set_nonblocking(true)?;
+                tokio::net::UnixStream::from_std(stream)?
+            }
+        };
+        let (read, mut write) = stream.into_split();
+        let mut reader = tokio::io::BufReader::new(read);
+        send(&mut write, &ToDaemon::Hello { version: VERSION }).await?;
+        let hello = tokio::time::timeout(REPLY_WAIT, recv(&mut reader))
+            .await
+            .map_err(|_| no_reply())?
+            .context("데몬 응답을 읽지 못했다")?;
+        check_hello(hello)?;
+        let (tx, mut outgoing) = mpsc::unbounded_channel::<ToDaemon>();
+        tokio::spawn(async move {
+            while let Some(msg) = outgoing.recv().await {
+                if send(&mut write, &msg).await.is_err() {
+                    break;
+                }
+            }
+        });
+        // ponytail: 받는 쪽은 무한 큐다. 클라이언트도 데몬과 같은 양의 출력을 화면에 먹이므로 따라간다고 보고,
+        // 처지면 데몬이 이 연결을 끊기 전에 클라이언트 메모리가 는다. 문제가 되면 바이트로 센 상한을 둔다.
+        let (incoming, rx) = mpsc::unbounded_channel::<FromDaemon>();
+        tokio::spawn(async move {
+            while let Ok(Some(msg)) = recv(&mut reader).await {
+                if incoming.send(msg).is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(AsyncConn { tx, rx })
+    }
+
     /// `Hello`를 주고받고 버전을 확인한다.
     fn handshake(stream: UnixStream) -> Result<Conn> {
         stream.set_read_timeout(Some(REPLY_WAIT))?;
@@ -50,16 +103,9 @@ impl Conn {
             reader: BufReader::new(stream),
         };
         write_msg(&mut conn.writer, &ToDaemon::Hello { version: VERSION })?;
-        match conn.recv()? {
-            FromDaemon::Hello { version } if version == VERSION => Ok(conn),
-            FromDaemon::Hello { version } => {
-                bail!(
-                    "데몬 프로토콜 버전이 다르다(데몬 {version}, 이 명령 {VERSION}). 데몬을 다시 띄운다"
-                )
-            }
-            FromDaemon::Error { message } => bail!("데몬이 연결을 거절했다: {message}"),
-            other => bail!("데몬이 Hello 대신 다른 메시지를 보냈다: {other:?}"),
-        }
+        let hello = conn.recv()?;
+        check_hello(Some(hello))?;
+        Ok(conn)
     }
 
     /// 요청을 보내고 응답을 기다린다. 세션 출력(`Output`)은 건너뛰고, `Error`는 오류로 돌려준다.
@@ -84,14 +130,36 @@ impl Conn {
                     io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
                 ) =>
             {
-                bail!("데몬이 {}초 안에 답하지 않았다", REPLY_WAIT.as_secs())
+                Err(no_reply())
             }
             Err(e) => Err(e).context("데몬 응답을 읽지 못했다"),
         }
     }
 }
 
+fn no_reply() -> anyhow::Error {
+    anyhow::anyhow!("데몬이 {}초 안에 답하지 않았다", REPLY_WAIT.as_secs())
+}
+
+/// 데몬의 첫 메시지가 같은 버전의 `Hello`인지 확인한다.
+fn check_hello(msg: Option<FromDaemon>) -> Result<()> {
+    match msg {
+        Some(FromDaemon::Hello { version }) if version == VERSION => Ok(()),
+        Some(FromDaemon::Hello { version }) => {
+            bail!(
+                "데몬 프로토콜 버전이 다르다(데몬 {version}, 이 명령 {VERSION}). 데몬을 다시 띄운다"
+            )
+        }
+        Some(FromDaemon::Error { message }) => bail!("데몬이 연결을 거절했다: {message}"),
+        Some(other) => bail!("데몬이 Hello 대신 다른 메시지를 보냈다: {other:?}"),
+        None => bail!("데몬 연결이 끊겼다"),
+    }
+}
+
 /// 데몬을 새 세션 리더로 띄운다. 표준 출력과 오류는 `logs/daemon.log`에 붙인다.
+///
+/// 오래 도는 클라이언트 화면이 끝난 데몬을 좀비로 남기지 않게 스레드 하나가 기다려 거둔다. 이 프로세스가
+/// 먼저 끝나면 데몬은 계속 돌고 init이 거둔다.
 fn spawn_daemon(state: &State) -> Result<()> {
     ensure_dir(&state.root)?;
     ensure_dir(&state.log_dir())?;
@@ -119,7 +187,8 @@ fn spawn_daemon(state: &State) -> Result<()> {
             Ok(())
         });
     }
-    cmd.spawn().context("데몬을 띄우지 못했다")?;
+    let mut child = cmd.spawn().context("데몬을 띄우지 못했다")?;
+    std::thread::spawn(move || child.wait());
     Ok(())
 }
 

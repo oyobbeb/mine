@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use mine::paths::State;
 use mine::project::project_key;
 use mine::proto::{FromDaemon, HoldIn, HoldOut, ToDaemon, VERSION, read_msg, write_msg};
-use mine::session::{Kind, Meta, Restore, session_id};
+use mine::session::{Kind, Meta, Restore, SessionState, session_id};
 
 /// 소켓 읽기와 조건 기다리기의 최대 시간. 테스트를 여럿 함께 돌려 느려져도 넉넉하게 잡는다.
 const WAIT: Duration = Duration::from_secs(10);
@@ -219,7 +219,7 @@ fn client(st: &St) -> Client {
         attached: None,
     };
     c.send(&ToDaemon::Hello { version: VERSION });
-    assert!(matches!(c.recv(), Some(FromDaemon::Hello { version: 1 })));
+    assert!(matches!(c.recv(), Some(FromDaemon::Hello { version }) if version == VERSION));
     c
 }
 
@@ -444,6 +444,51 @@ fn hook_poke_updates_state() {
     assert_eq!(r[0], "◆");
     assert_eq!(r[4], "approval");
     assert_eq!(r[5], "npm run deploy 승인?");
+}
+
+#[test]
+fn subscribed_client_gets_pushed_sessions_after_hook() {
+    let st = state();
+    mine(&st, &["new", "h"]);
+    let mut c = client(&st);
+    c.send(&ToDaemon::List);
+    assert!(matches!(c.recv(), Some(FromDaemon::Sessions { .. })));
+    mine_stdin(
+        &st,
+        &["_event", &session_dir(&st, "h")],
+        r#"{"hook_event_name":"Notification","message":"승인?"}"#,
+    );
+    // List를 다시 보내지 않아도 바뀐 목록이 온다.
+    loop {
+        match c.recv().expect("연결이 끊겼다") {
+            FromDaemon::Sessions { sessions } if sessions[0].state == SessionState::Approval => {
+                assert_eq!(sessions[0].waiting.as_deref(), Some("승인?"));
+                break;
+            }
+            _ => {}
+        }
+    }
+}
+
+#[test]
+fn client_colours_answer_inner_colour_queries() {
+    // 먼저 만든 세션(이미 있는 화면)과 색을 받은 뒤 만든 세션(새 화면) 모두 받은 색으로 답한다.
+    let st = state();
+    mine(&st, &["new", "old"]);
+    let mut c = client(&st);
+    c.send(&ToDaemon::Colors {
+        fg: "#0a0b0c".into(),
+        bg: "#010203".into(),
+    });
+    // 같은 연결의 메시지는 차례로 처리되므로, List의 답이 오면 Colors도 처리됐다.
+    c.send(&ToDaemon::List);
+    assert!(matches!(c.recv(), Some(FromDaemon::Sessions { .. })));
+    mine(&st, &["new", "new"]);
+    for name in ["old", "new"] {
+        c.attach(name);
+        c.input("stty -icanon -echo; printf '\\033]11;?\\007'; read -d \"$(printf '\\007')\" p; stty icanon echo; case \"$p\" in *rgb:0101/0202/0303*) echo BG-$((1+1));; esac\n");
+        c.wait_output("BG-2");
+    }
 }
 
 #[test]

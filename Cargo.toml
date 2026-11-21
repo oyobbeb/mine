@@ -10,10 +10,11 @@ base64 = "0.23.1"
 clap = { version = "4.6.9", features = ["derive"] }
 libc = "0.2.191"
 portable-pty = "0.9.0"
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "underline-color"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha2 = "0.11.1"
-tokio = { version = "1.54.1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1.54.1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"
