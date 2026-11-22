@@ -53,6 +53,9 @@ pub async fn run(state: State, project: PathBuf) -> Result<()> {
     let conn = Conn::connect_or_spawn_async(&state).await?;
     let mut stdin = tty::spawn_stdin_reader();
     let mut winch = signal(SignalKind::window_change())?;
+    // 종료·끊김 신호도 `⌃a d`처럼 끝낸다. 키 인코딩 모드를 되돌리고 `Tty`가 바깥 터미널을 되돌린다.
+    let mut term = signal(SignalKind::terminate())?;
+    let mut hangup = signal(SignalKind::hangup())?;
     let mut terminal = Terminal::new(CrosstermBackend::new(BufWriter::with_capacity(
         1 << 16,
         io::stdout(),
@@ -69,8 +72,18 @@ pub async fn run(state: State, project: PathBuf) -> Result<()> {
     app.send(ToDaemon::List);
     app.on_input(&early);
     let mut last_draw: Option<Instant> = None;
-    while !app.quit {
+    loop {
         app.end_stale_sync();
+        // 키 인코딩 모드는 상태가 바뀐 바로 다음, 프레임 사이에 화면과 같은 쓰기 통로로 건다.
+        let keys = app.sync_keys();
+        if !keys.is_empty() {
+            let out = terminal.backend_mut();
+            out.write_all(&keys)?;
+            Write::flush(out)?;
+        }
+        if app.quit {
+            break;
+        }
         let next_frame = last_draw.map_or_else(Instant::now, |t| t + FRAME);
         if app.dirty && Instant::now() >= next_frame {
             app.draw(&mut terminal)?;
@@ -95,10 +108,72 @@ pub async fn run(state: State, project: PathBuf) -> Result<()> {
                 None => bail!("데몬 연결이 끊겼다. mine을 다시 실행하면 세션에 다시 붙는다"),
             },
             _ = winch.recv() => app.on_resize(terminal.size()?),
+            _ = term.recv() => app.quit = true,
+            _ = hangup.recv() => app.quit = true,
             () = tokio::time::sleep_until(wake.into()) => {}
         }
     }
     Ok(())
+}
+
+/// 바깥 터미널(Ghostty)에 건 키 인코딩 모드. 붙은 세션이 켠 모드를 따라 걸어, 키가 세션이 바란 인코딩으로 온다.
+/// 그래야 Claude Code의 Shift+Enter가 CR이 아닌 인코딩된 키로 간다.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct KeyModes {
+    /// DECCKM(`CSI ? 1 h`): 화살표를 `ESC O A`로 보낸다.
+    app_cursor: bool,
+    /// DECKPAM(`ESC =`): 숫자판을 응용 모드로 보낸다.
+    app_keypad: bool,
+    /// xterm modifyOtherKeys 단계(0~2).
+    modify_other_keys: u8,
+    /// kitty 키보드 플래그.
+    kitty: u8,
+}
+
+impl KeyModes {
+    fn of(screen: &Screen) -> KeyModes {
+        let mode = screen.mode();
+        KeyModes {
+            app_cursor: mode.contains(TermMode::APP_CURSOR),
+            app_keypad: mode.contains(TermMode::APP_KEYPAD),
+            modify_other_keys: screen.modify_other_keys(),
+            kitty: screen.kitty_flags(),
+        }
+    }
+}
+
+/// 바깥에 거는 kitty 플래그.
+///
+/// ponytail: 플래그 2(뗌·반복 이벤트 보고)는 빼고 건다. 뗌·반복까지 오면 접두 키 처리가 훨씬 복잡해지고,
+/// CLI 앱은 거의 쓰지 않는다. 이 플래그를 켠 앱은 누름만 받는다.
+const KITTY_MIRRORED: u8 = !2;
+
+/// 바깥 터미널에 `applied`가 걸려 있을 때 `wanted`로 바꾸는 바이트. 달라진 모드만 쓴다.
+/// kitty 플래그는 시작할 때 쌓은 한 단(`tty::ENTER`)에 통째로 건다.
+fn mode_diff(applied: KeyModes, wanted: KeyModes) -> Vec<u8> {
+    let mut out = Vec::new();
+    if applied.app_cursor != wanted.app_cursor {
+        out.extend_from_slice(if wanted.app_cursor {
+            b"\x1b[?1h"
+        } else {
+            b"\x1b[?1l"
+        });
+    }
+    if applied.app_keypad != wanted.app_keypad {
+        out.extend_from_slice(if wanted.app_keypad {
+            b"\x1b="
+        } else {
+            b"\x1b>"
+        });
+    }
+    if applied.modify_other_keys != wanted.modify_other_keys {
+        let _ = write!(out, "\x1b[>4;{}m", wanted.modify_other_keys);
+    }
+    let kitty = wanted.kitty & KITTY_MIRRORED;
+    if applied.kitty & KITTY_MIRRORED != kitty {
+        let _ = write!(out, "\x1b[={kitty};1u");
+    }
+    out
 }
 
 /// 복사 모드에서 돌아다니는 얼린 화면. `lines`는 들어갈 때의 스크롤백 + 보이는 줄이다.
@@ -136,6 +211,8 @@ struct App {
     copy: Option<Copying>,
     /// 세션에 넘긴 누름이 아직 눌려 있다. 이 동안 칸 밖 끌기·뗌도 칸 안으로 눌러 넘겨 세션이 뗌을 받게 한다.
     held: bool,
+    /// 바깥 터미널에 지금 걸린 키 인코딩 모드.
+    keys: KeyModes,
     dirty: bool,
     quit: bool,
 }
@@ -165,9 +242,26 @@ impl App {
             clipboard: Vec::new(),
             copy: None,
             held: false,
+            keys: KeyModes::default(),
             dirty: true,
             quit: false,
         }
+    }
+
+    /// 바깥 터미널에 걸 키 인코딩 모드를 맞추는 바이트. 돌려준 바이트를 썼다고 보고 걸린 상태를 바꾼다.
+    ///
+    /// 붙은 세션 화면의 모드를 따르되, 세션 화면이 없을 때, mine이 키를 직접 읽는 복사 모드·상태줄 입력 동안,
+    /// 끝낼 때는 기본값으로 돌린다. 이때 키는 평범한(레거시) 인코딩으로 와야 한다.
+    fn sync_keys(&mut self) -> Vec<u8> {
+        let wanted = match &self.screen {
+            Some(screen) if self.copy.is_none() && self.m.prompt.is_none() && !self.quit => {
+                KeyModes::of(screen)
+            }
+            _ => KeyModes::default(),
+        };
+        let out = mode_diff(self.keys, wanted);
+        self.keys = wanted;
+        out
     }
 
     /// 쓰기 작업이 끝났으면(연결이 끊겼으면) 버린다. 곧 `rx`가 끝을 알린다.
@@ -1208,6 +1302,115 @@ mod tests {
                 .iter()
                 .any(|l| l.starts_with("end!"))
         );
+    }
+
+    /// 바깥 터미널에 쓸 키 인코딩 모드 바이트(지난번과 달라진 것만).
+    fn keys(app: &mut App) -> String {
+        String::from_utf8(app.sync_keys()).unwrap()
+    }
+
+    /// 세션이 켠 키 인코딩 모드(DECCKM, modifyOtherKeys 2, kitty 1)와, 그것을 바깥에 걸고 푸는 바이트.
+    const KEY_MODES: &[u8] = b"\x1b[?1h\x1b[>4;2m\x1b[>1u";
+    const APPLY: &str = "\x1b[?1h\x1b[>4;2m\x1b[=1;1u";
+    const RESET: &str = "\x1b[?1l\x1b[>4;0m\x1b[=0;1u";
+
+    #[test]
+    fn mode_diff_writes_only_what_changed() {
+        let none = KeyModes::default();
+        let all = KeyModes {
+            app_cursor: true,
+            app_keypad: true,
+            modify_other_keys: 2,
+            kitty: 1,
+        };
+        let diff = |a, w| String::from_utf8(mode_diff(a, w)).unwrap();
+        assert_eq!(diff(none, all), "\x1b[?1h\x1b=\x1b[>4;2m\x1b[=1;1u");
+        assert_eq!(diff(all, all), "");
+        let changed = KeyModes {
+            modify_other_keys: 1,
+            kitty: 9,
+            ..all
+        };
+        assert_eq!(diff(all, changed), "\x1b[>4;1m\x1b[=9;1u");
+        assert_eq!(diff(all, none), "\x1b[?1l\x1b>\x1b[>4;0m\x1b[=0;1u");
+        // kitty 플래그 2(이벤트 종류)는 걸지 않는다. 2만 달라지면 쓸 것이 없다.
+        let kitty = |kitty| KeyModes { kitty, ..none };
+        assert_eq!(diff(none, kitty(3)), "\x1b[=1;1u");
+        assert_eq!(diff(none, kitty(31)), "\x1b[=29;1u");
+        assert_eq!(diff(kitty(1), kitty(3)), "");
+        assert_eq!(diff(none, kitty(2)), "");
+    }
+
+    #[test]
+    fn output_enabling_kitty_flags_reaches_the_outer_terminal() {
+        let (mut app, _rx) = app(b"");
+        assert_eq!(keys(&mut app), "");
+        let output = |id: &str, data: &[u8]| FromDaemon::Output {
+            id: id.into(),
+            data: data.to_vec(),
+        };
+        app.on_msg(output("s1", b"\x1b[>1u"));
+        assert_eq!(keys(&mut app), "\x1b[=1;1u");
+        // 이미 건 모드는 다시 쓰지 않는다.
+        assert_eq!(keys(&mut app), "");
+        app.on_msg(output("s1", b"\x1b[?1h\x1b=\x1b[>4;2m"));
+        assert_eq!(keys(&mut app), "\x1b[?1h\x1b=\x1b[>4;2m");
+        // 다른 세션의 출력은 따르지 않는다.
+        app.on_msg(output("s2", b"\x1b[<u\x1b[>4m"));
+        assert_eq!(keys(&mut app), "");
+        // 앱이 끄면 따라 끈다.
+        app.on_msg(output("s1", b"\x1b[<u\x1b[>4m\x1b[?1l\x1b>"));
+        assert_eq!(keys(&mut app), "\x1b[?1l\x1b>\x1b[>4;0m\x1b[=0;1u");
+    }
+
+    #[test]
+    fn session_switch_resets_then_applies_the_new_sessions_modes() {
+        let (mut app, _rx) = app(KEY_MODES);
+        assert_eq!(keys(&mut app), APPLY);
+        app.attach("s2".into());
+        assert_eq!(keys(&mut app), RESET);
+        let mut s2 = Screen::new(86, 39);
+        s2.feed(b"\x1b=\x1b[>4;1m");
+        app.on_msg(FromDaemon::Snapshot {
+            id: "s2".into(),
+            data: s2.snapshot(),
+        });
+        assert_eq!(keys(&mut app), "\x1b=\x1b[>4;1m");
+    }
+
+    #[test]
+    fn copy_mode_and_prompts_get_plain_keys_and_give_the_modes_back() {
+        let (mut app, mut rx) = app(KEY_MODES);
+        assert_eq!(keys(&mut app), APPLY);
+        // 세션이 kitty를 켰으니 `⌃a`는 인코딩되어 온다.
+        app.on_input(b"\x1b[97;5u[");
+        assert!(app.copy.is_some());
+        assert_eq!(keys(&mut app), RESET);
+        app.on_input(b"q");
+        assert!(app.copy.is_none());
+        assert_eq!(keys(&mut app), APPLY);
+        // `⌃a c` 상태줄 입력도 같다. Esc로 닫으면 되돌린다.
+        app.on_input(b"\x1b[97;5uc");
+        assert!(app.m.prompt.is_some());
+        assert_eq!(keys(&mut app), RESET);
+        app.on_input(b"\x1b");
+        assert!(app.m.prompt.is_none());
+        assert_eq!(keys(&mut app), APPLY);
+        assert!(sent(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn detach_and_losing_the_session_reset_the_modes() {
+        let (mut quitting, _rx) = app(KEY_MODES);
+        assert_eq!(keys(&mut quitting), APPLY);
+        quitting.on_input(b"\x1b[27;5;97~d");
+        assert!(quitting.quit);
+        assert_eq!(keys(&mut quitting), RESET);
+
+        let (mut alone, _rx) = app(KEY_MODES);
+        assert_eq!(keys(&mut alone), APPLY);
+        alone.detach();
+        assert_eq!(keys(&mut alone), RESET);
     }
 
     #[test]

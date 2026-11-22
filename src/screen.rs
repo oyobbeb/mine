@@ -62,6 +62,9 @@ const DEFAULT_BG: Rgb = Rgb {
     b: 0x34,
 };
 
+/// 읽기 경계에 걸린 modifyOtherKeys 시퀀스 앞부분을 붙들어 두는 최대 길이.
+const MOK_MAX: usize = 16;
+
 /// 꺼내지 않고 쌓아 둘 답의 최대 개수. 꺼내지 않는 `Screen`(테스트 등)에서도 무한히 늘지 않게 막는다.
 const MAX_PENDING_REPLIES: usize = 256;
 
@@ -100,6 +103,11 @@ pub struct Screen {
     /// 색 질의에 답하는 기본 전경색(커서 색도 같다)과 배경색.
     default_fg: Rgb,
     default_bg: Rgb,
+    /// 안쪽 앱이 정한 xterm modifyOtherKeys 단계(`CSI > 4 ; N m`). vte는 읽지만 alacritty `Term`은 기억하지 않아
+    /// 출력에서 따로 찾는다.
+    modify_other_keys: u8,
+    /// 읽기 경계에 걸린 그 시퀀스의 앞부분. 다음 `feed`에서 이어 읽는다.
+    mok_tail: Vec<u8>,
 }
 
 impl Screen {
@@ -118,6 +126,8 @@ impl Screen {
             primary: None,
             default_fg: DEFAULT_FG,
             default_bg: DEFAULT_BG,
+            modify_other_keys: 0,
+            mok_tail: Vec::new(),
         }
     }
 
@@ -128,11 +138,52 @@ impl Screen {
     }
 
     pub fn feed(&mut self, bytes: &[u8]) {
+        self.track_modify_other_keys(bytes);
         // 대체 화면 진입(`CSI ? 1049 h` 등)은 `h`로, 나감은 `l`로 끝난다. 그 바이트마다 끊어,
         // 진입 직후 주 화면이 아직 그대로일 때 붙잡고, 한 번에 나갔다 다시 들어와도 놓치지 않는다.
         for chunk in bytes.split_inclusive(|&b| b == b'h' || b == b'l') {
             self.parser.advance(&mut self.term, chunk);
             self.track_alt();
+        }
+    }
+
+    /// 출력에서 modifyOtherKeys 단계를 정하는 시퀀스를 찾아 기억한다. 전체 초기화(`ESC c`)는 0으로 돌린다.
+    ///
+    /// ponytail: vte 상태 기계를 따라가지 않고 ESC만 훑는다. 동기화 갱신(`?2026`) 안에서 바꾼 단계는 화면보다
+    /// 먼저 반영되고, DCS 안에 낀 같은 바이트도 센다. 둘 다 키 인코딩에는 해가 없다.
+    fn track_modify_other_keys(&mut self, bytes: &[u8]) {
+        let mut i = 0;
+        if !self.mok_tail.is_empty() {
+            // 걸친 앞부분은 다음 덩이의 앞 `MOK_MAX`바이트하고만 잇는다. 덩이 전체를 복사하지 않는다.
+            // 앞부분에는 첫 ESC 말고 ESC가 없으므로, 시퀀스가 아니면 덩이를 처음부터 훑으면 된다.
+            let tail = std::mem::take(&mut self.mok_tail);
+            let joined = [tail.as_slice(), &bytes[..bytes.len().min(MOK_MAX)]].concat();
+            match mok_seq(&joined) {
+                Mok::Set(level, len) => {
+                    self.modify_other_keys = level;
+                    i = len - tail.len();
+                }
+                // `MOK_MAX`보다 짧을 때만 앞부분이므로 덩이를 다 이은 것이다.
+                Mok::Partial => {
+                    self.mok_tail = joined;
+                    return;
+                }
+                Mok::No => {}
+            }
+        }
+        while let Some(at) = bytes[i..].iter().position(|&b| b == 0x1b) {
+            let at = i + at;
+            match mok_seq(&bytes[at..]) {
+                Mok::Set(level, len) => {
+                    self.modify_other_keys = level;
+                    i = at + len;
+                }
+                Mok::Partial => {
+                    self.mok_tail = bytes[at..].to_vec();
+                    return;
+                }
+                Mok::No => i = at + 1,
+            }
         }
     }
 
@@ -220,7 +271,7 @@ impl Screen {
             w.out.push_str("\x1b[2J");
         }
         w.grid(grid);
-        w.modes(mode);
+        w.modes(mode, self.modify_other_keys);
         w.cursor(grid);
         w.pen(&grid.cursor.template);
         w.out.into_bytes()
@@ -250,6 +301,16 @@ impl Screen {
 
     pub fn mode(&self) -> TermMode {
         *self.term.mode()
+    }
+
+    /// 안쪽 앱이 마지막으로 정한 xterm modifyOtherKeys 단계(0~2).
+    pub fn modify_other_keys(&self) -> u8 {
+        self.modify_other_keys
+    }
+
+    /// 켜진 kitty 키보드 플래그(1 모호한 키 구분, 2 이벤트 종류, 4 다른 키, 8 모든 키를 이스케이프로, 16 글자 함께).
+    pub fn kitty_flags(&self) -> u8 {
+        kitty_bits(self.mode())
     }
 
     /// 양수 = 과거로.
@@ -504,7 +565,7 @@ impl Writer {
         }
     }
 
-    fn modes(&mut self, mode: TermMode) {
+    fn modes(&mut self, mode: TermMode, modify_other_keys: u8) {
         for (flag, code) in MODES {
             let set = if mode.contains(flag) { 'h' } else { 'l' };
             let _ = write!(self.out, "\x1b[?{code}{set}");
@@ -514,12 +575,60 @@ impl Writer {
         } else {
             "\x1b>"
         });
-        let kitty: u8 = KITTY_FLAGS
-            .iter()
-            .filter(|(flag, _)| mode.contains(*flag))
-            .map(|(_, bit)| bit)
-            .sum();
-        let _ = write!(self.out, "\x1b[={kitty};1u");
+        let _ = write!(
+            self.out,
+            "\x1b[={};1u\x1b[>4;{modify_other_keys}m",
+            kitty_bits(mode)
+        );
+    }
+}
+
+/// `ESC`로 시작하는 출력이 modifyOtherKeys를 정하는 시퀀스인가.
+enum Mok {
+    /// 단계와 시퀀스 길이.
+    Set(u8, usize),
+    /// 앞부분만 왔다.
+    Partial,
+    No,
+}
+
+/// `CSI > 4 [; N] m`을 vte처럼 읽는다. 빈 값과 0은 기본값(첫째 1, 둘째 0)이고 셋째부터는 무시한다.
+/// 0~2 밖의 단계와 4가 아닌 자원(modifyCursorKeys 등)은 vte처럼 무시한다.
+fn mok_seq(buf: &[u8]) -> Mok {
+    const HEAD: &[u8] = b"\x1b[>";
+    if buf.starts_with(b"\x1bc") {
+        return Mok::Set(0, 2);
+    }
+    if buf.len() < HEAD.len() {
+        return if HEAD.starts_with(buf) {
+            Mok::Partial
+        } else {
+            Mok::No
+        };
+    }
+    let Some(body) = buf.strip_prefix(HEAD) else {
+        return Mok::No;
+    };
+    let Some(n) = body.iter().position(|c| !c.is_ascii_digit() && *c != b';') else {
+        return if buf.len() < MOK_MAX {
+            Mok::Partial
+        } else {
+            Mok::No
+        };
+    };
+    if body[n] != b'm' {
+        return Mok::No;
+    }
+    let mut params = body[..n].split(|&c| c == b';').map(|p| {
+        std::str::from_utf8(p)
+            .ok()
+            .and_then(|p| p.parse::<u16>().ok())
+            .filter(|&v| v != 0)
+    });
+    let mut next = |default| params.next().flatten().unwrap_or(default);
+    match (next(1), next(0)) {
+        (4, level @ 0..=2) => Mok::Set(level as u8, HEAD.len() + n + 1),
+        _ => Mok::No,
     }
 }
 
@@ -547,6 +656,15 @@ const KITTY_FLAGS: [(TermMode, u8); 5] = [
     (TermMode::REPORT_ALL_KEYS_AS_ESC, 8),
     (TermMode::REPORT_ASSOCIATED_TEXT, 16),
 ];
+
+/// `mode`에 켜진 kitty 키보드 플래그를 프로토콜 비트로 모은다.
+fn kitty_bits(mode: TermMode) -> u8 {
+    KITTY_FLAGS
+        .iter()
+        .filter(|(flag, _)| mode.contains(*flag))
+        .map(|(_, bit)| bit)
+        .sum()
+}
 
 /// OSC 8에 그대로 실어도 안전한 링크인가(제어 문자가 끼면 시퀀스를 깰 수 있다).
 fn link_is_plain(link: &Hyperlink) -> bool {
@@ -837,6 +955,55 @@ mod tests {
             assert!(!m.contains(not), "{not:?}");
         }
         assert!(m.contains(TermMode::SHOW_CURSOR));
+    }
+
+    #[test]
+    fn tracks_modify_other_keys_across_split_feeds() {
+        let all = b"ab\x1b[>4;2mcd";
+        for cut in 0..=all.len() {
+            let mut s = Screen::new(40, 10);
+            s.feed(&all[..cut]);
+            s.feed(&all[cut..]);
+            assert_eq!(s.modify_other_keys(), 2, "cut {cut}");
+        }
+        let mut s = Screen::new(40, 10);
+        s.feed(b"\x1b[>4;1m");
+        assert_eq!(s.modify_other_keys(), 1);
+        // 단계를 빼면 0이다(vte와 같다).
+        s.feed(b"\x1b[>4m");
+        assert_eq!(s.modify_other_keys(), 0);
+        // 다른 `CSI > … m`(modifyCursorKeys 등)와 SGR은 단계를 바꾸지 않는다.
+        s.feed(b"\x1b[>4;2m\x1b[>1;0m\x1b[4;0m\x1b[>4;9m");
+        assert_eq!(s.modify_other_keys(), 2);
+        // 전체 초기화(RIS)는 0으로 돌린다. 이것도 읽기 경계에 걸칠 수 있다.
+        s.feed(b"\x1b");
+        s.feed(b"c");
+        assert_eq!(s.modify_other_keys(), 0);
+        // 걸친 앞부분 뒤로 긴 덩이가 와도 끝까지 훑는다.
+        let long = "x".repeat(5000);
+        s.feed(b"\x1b[>4;");
+        s.feed(format!("2m{long}\x1b[>4;1m").as_bytes());
+        assert_eq!(s.modify_other_keys(), 1);
+        s.feed(b"\x1b[>");
+        s.feed(format!("{long}\x1b[>4;2m{long}").as_bytes());
+        assert_eq!(s.modify_other_keys(), 2);
+    }
+
+    #[test]
+    fn snapshot_restores_keyboard_modes() {
+        let mut s = Screen::new(40, 10);
+        s.feed(b"\x1b[>4;2m\x1b[>13u");
+        assert_eq!(s.kitty_flags(), 13);
+        let f = rebuilt(&s);
+        assert_eq!(f.modify_other_keys(), 2);
+        assert_eq!(f.kitty_flags(), 13);
+        // 끈 상태도 되살린다.
+        let mut s = Screen::new(40, 10);
+        s.feed(b"\x1b[>4;2m\x1b[>4;0m");
+        let mut f = Screen::new(40, 10);
+        f.feed(b"\x1b[>4;1m");
+        f.feed(&s.snapshot());
+        assert_eq!(f.modify_other_keys(), 0);
     }
 
     #[test]
