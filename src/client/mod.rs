@@ -184,6 +184,12 @@ struct Copying {
     held: Vec<u8>,
 }
 
+/// Esc로 복사 모드를 나온 뒤, 따로 읽혀 온 단독 Esc를 세션에 넘기지 않고 떼는 시간.
+/// Esc를 두 번 눌러 나오는 사람이 많고, 둘째 Esc는 보통 다른 읽기로 온다.
+///
+/// ponytail: 타이머를 걸지 않고 다음 입력이 올 때 지난 시간만 본다. 입력 간격을 재는 정교한 방법은 필요해지면 한다.
+const ESC_GRACE: Duration = Duration::from_millis(300);
+
 /// 복사 모드 동안 쌓아 두는 출력의 최대 바이트.
 ///
 /// ponytail: 넘으면 복사 모드를 끝내고 따라잡는다. 디스크로 넘기거나 오래된 출력을 줄이는 일은 필요해지면 한다.
@@ -209,6 +215,8 @@ struct App {
     clipboard: Vec<u8>,
     /// 복사 모드. 들어갈 때 화면을 얼려 두고, 그동안 온 출력은 쌓아 둔다.
     copy: Option<Copying>,
+    /// Esc로 복사 모드를 나온 때. `ESC_GRACE` 안에 오는 입력 앞의 단독 Esc는 뗀다.
+    esc_exit: Option<Instant>,
     /// 세션에 넘긴 누름이 아직 눌려 있다. 이 동안 칸 밖 끌기·뗌도 칸 안으로 눌러 넘겨 세션이 뗌을 받게 한다.
     held: bool,
     /// 바깥 터미널에 지금 걸린 키 인코딩 모드.
@@ -241,6 +249,7 @@ impl App {
             select: Select::default(),
             clipboard: Vec::new(),
             copy: None,
+            esc_exit: None,
             held: false,
             keys: KeyModes::default(),
             dirty: true,
@@ -367,6 +376,7 @@ impl App {
     }
 
     fn attach(&mut self, id: String) {
+        self.esc_exit = None;
         let (cols, rows) = self.term_size();
         self.send(ToDaemon::Attach {
             id: id.clone(),
@@ -425,7 +435,12 @@ impl App {
         match action {
             Action::Pass(bytes) if self.m.prompt.is_some() => self.prompt_keys(&bytes),
             Action::Pass(bytes) if self.copy.is_some() => self.copy_keys(&bytes),
-            Action::Pass(data) => self.input(data),
+            Action::Pass(data) => {
+                let data = self.after_esc_exit(data);
+                if !data.is_empty() {
+                    self.input(data);
+                }
+            }
             Action::Paste(text) if self.m.prompt.is_some() => self.prompt_paste(&text),
             // 복사 모드에서는 입력이 세션으로 가지 않는다.
             Action::Paste(_) if self.copy.is_some() => {}
@@ -451,6 +466,22 @@ impl App {
         }
     }
 
+    /// Esc로 복사 모드를 막 나왔으면(`ESC_GRACE` 안) 입력 앞의 단독 Esc를 뗀다. 뗀 뒤에 남은 입력이 있으면 창은 닫힌다.
+    fn after_esc_exit(&mut self, data: Vec<u8>) -> Vec<u8> {
+        let Some(at) = self.esc_exit else {
+            return data;
+        };
+        if at.elapsed() >= ESC_GRACE {
+            self.esc_exit = None;
+            return data;
+        }
+        let rest = copymode::drop_lone_esc(&data);
+        if !rest.is_empty() {
+            self.esc_exit = None;
+        }
+        rest.to_vec()
+    }
+
     /// 키 입력과 붙여넣기를 세션에 넘긴다. 스크롤해 둔 화면은 맨 아래로 돌려놓고 넘긴다.
     fn input(&mut self, data: Vec<u8>) {
         if let Some(screen) = &mut self.screen {
@@ -473,6 +504,7 @@ impl App {
     }
 
     fn command(&mut self, cmd: Cmd) {
+        self.esc_exit = None;
         // 복사 모드 안에서 다른 명령을 하면 복사 모드를 끝내고 한다.
         if cmd != Cmd::CopyMode {
             self.exit_copy();
@@ -553,8 +585,13 @@ impl App {
         }
         let hit = ui::hit(&areas, &self.m, ev.col, ev.row);
         if let Hit::Term(x, y) = hit {
-            // 복사 모드에서는 터미널 칸의 마우스를 쓰지 않는다. 얼린 화면이라 세션에 넘길 것도, 스크롤할 것도 없다.
+            // 복사 모드에서는 터미널 칸의 마우스를 세션에 넘기지도 선택에 쓰지도 않는다. 휠만 커서를 옮긴다.
             if self.copy.is_some() {
+                match ev.kind {
+                    MouseKind::WheelUp => self.copy_wheel(-WHEEL_LINES),
+                    MouseKind::WheelDown => self.copy_wheel(WHEEL_LINES),
+                    _ => {}
+                }
                 return;
             }
             return self.term_mouse(ev, (x, y));
@@ -642,6 +679,7 @@ impl App {
         let Some(screen) = &self.screen else {
             return self.say("복사할 세션 화면이 없다");
         };
+        // 쪽 넘김의 한 쪽(터미널 칸의 줄 수)은 `freeze`가 화면에서 읽는다. 크기가 바뀌면 복사 모드가 끝난다.
         let (lines, mode) = copymode::freeze(screen);
         self.copy = Some(Copying {
             mode,
@@ -650,21 +688,40 @@ impl App {
         });
         self.select.clear();
         self.held = false;
+        self.esc_exit = None;
         self.sync_copy();
     }
 
-    /// 복사 모드의 키를 먹인다. 끝나는 키(`q`, `y`)가 오면 그 뒤 바이트는 버린다.
+    /// 복사 모드의 휠: 커서를 `step`줄(아래가 양수) 옮기고 화면이 따라가게 한다.
+    fn copy_wheel(&mut self, step: i32) {
+        if let Some(copy) = &mut self.copy {
+            copy.mode.move_lines(&copy.lines, step as isize);
+        }
+        self.sync_copy();
+    }
+
+    /// 복사 모드의 키를 먹인다. 끝나는 키(`q`, `y`, Esc)가 오면 그 뒤 바이트는 복사 모드 키가 아니니,
+    /// 다음 읽기로 온 것처럼 평소 입력 경로로 세션에 넘긴다. 다만 Esc로 끝냈으면 바로 뒤의 단독 Esc는 뗀다
+    /// (Esc를 두 번 눌러 나오는 습관이 세션에 Esc를 보내지 않게).
     fn copy_keys(&mut self, bytes: &[u8]) {
         let Some(copy) = &mut self.copy else {
             return;
         };
         let mut out = CopyOut::Stay;
-        for key in copymode::split(bytes) {
+        let mut rest = &bytes[bytes.len()..];
+        let mut by_esc = false;
+        for (key, end) in copymode::split(bytes) {
             out = match key {
                 copymode::Key::Byte(b) => copy.mode.key(&copy.lines, b),
                 copymode::Key::Arrow(dir) => copy.mode.arrow(&copy.lines, dir),
+                // 검색어를 입력하는 중이면 ⌃b·⌃f는 무시되니 화살표처럼 입력에 섞이지 않는다.
+                copymode::Key::PageUp => copy.mode.key(&copy.lines, 0x02),
+                copymode::Key::PageDown => copy.mode.key(&copy.lines, 0x06),
             };
             if out != CopyOut::Stay {
+                rest = &bytes[end..];
+                by_esc = key == copymode::Key::Byte(0x1b);
+                self.esc_exit = by_esc.then(Instant::now);
                 break;
             }
         }
@@ -679,11 +736,19 @@ impl App {
                 }
             }
         }
+        if by_esc {
+            rest = copymode::drop_lone_esc(rest);
+        }
+        if !rest.is_empty() {
+            // 글자가 이어 가면 Esc 뒤의 일은 끝난 것이다.
+            self.esc_exit = None;
+            self.input(rest.to_vec());
+        }
     }
 
     /// 커서 줄이 보이게 화면을 스크롤하고 상태줄을 복사 모드 글로 바꾼다.
     fn sync_copy(&mut self) {
-        if let (Some(copy), Some(screen)) = (&self.copy, &mut self.screen) {
+        if let (Some(copy), Some(screen)) = (&mut self.copy, &mut self.screen) {
             copy.mode.reveal(screen);
             self.m.status = Some(copy.mode.status(copy.lines.len()));
         }
@@ -837,7 +902,7 @@ impl App {
                     select::paint_selection(f.buffer_mut(), areas.term, &sel);
                 }
                 if copy.mode.typing {
-                    let x = 1 + Span::raw(copy.mode.query.as_str()).width() as u16;
+                    let x = 1 + Span::raw(copy.mode.input.as_str()).width() as u16;
                     f.set_cursor_position((
                         areas.status.x + x.min(areas.status.width.saturating_sub(1)),
                         areas.status.y,
@@ -1286,18 +1351,228 @@ mod tests {
     }
 
     #[test]
-    fn mouse_in_the_term_pane_is_ignored_in_copy_mode() {
+    fn clicks_and_drags_in_the_term_pane_are_ignored_in_copy_mode() {
         let (mut app, mut rx) = app(&[lines(100), b"\x1b[?1000h\x1b[?1002h".to_vec()].concat());
         enter_copy(&mut app);
-        let before = offset(&app);
-        app.mouse(ev(MouseKind::WheelUp, 40, 5));
+        let before = (offset(&app), copy_line(&app));
         app.mouse(ev(MouseKind::Down, 40, 5));
         app.mouse(ev(MouseKind::Drag, 45, 5));
         app.mouse(ev(MouseKind::Up, 45, 5));
-        assert_eq!(offset(&app), before);
+        assert_eq!((offset(&app), copy_line(&app)), before);
         assert!(app.select.selection().is_none() && app.clipboard.is_empty());
         assert!(sent(&mut rx).is_empty());
         assert!(app.copy.is_some());
+    }
+
+    fn copy_line(app: &App) -> usize {
+        app.copy.as_ref().unwrap().mode.line
+    }
+
+    #[test]
+    fn wheel_in_copy_mode_moves_the_cursor_three_lines_and_the_view_with_it() {
+        // 세션이 마우스를 쓰고 있어도 얼린 화면이라 세션에는 아무것도 가지 않는다.
+        let (mut app, mut rx) = app(&[lines(100), b"\x1b[?1000h\x1b[?1002h".to_vec()].concat());
+        enter_copy(&mut app);
+        assert_eq!((copy_line(&app), offset(&app)), (99, 0));
+        app.mouse(ev(MouseKind::WheelUp, 40, 5));
+        assert_eq!((copy_line(&app), offset(&app)), (96, 3));
+        app.mouse(ev(MouseKind::WheelUp, 40, 5));
+        assert_eq!((copy_line(&app), offset(&app)), (93, 6));
+        app.mouse(ev(MouseKind::WheelDown, 40, 5));
+        assert_eq!((copy_line(&app), offset(&app)), (96, 3));
+        assert!(app.m.status.as_deref().unwrap().contains("│ 97/101 │"));
+        // 터미널 칸 밖의 휠은 커서를 옮기지 않는다.
+        app.mouse(ev(MouseKind::WheelUp, 10, 5));
+        assert_eq!(copy_line(&app), 96);
+        assert!(app.copy.is_some() && sent(&mut rx).is_empty());
+        // 휠로 움직이면 "검색 결과 없음"이 걷힌다.
+        app.on_input(b"/nothing\r");
+        assert!(app.m.status.as_deref().unwrap().contains("검색 결과 없음"));
+        app.mouse(ev(MouseKind::WheelDown, 40, 5));
+        assert!(!app.m.status.as_deref().unwrap().contains("검색 결과 없음"));
+    }
+
+    #[test]
+    fn bytes_after_the_key_that_ends_copy_mode_go_to_the_session() {
+        let (mut app, mut rx) = app(&lines(100));
+        enter_copy(&mut app);
+        // q 뒤의 `ls\r`은 복사 모드 키가 아니라 세션 입력이다.
+        app.on_input(b"qls\r");
+        assert!(app.copy.is_none());
+        assert_eq!(sent(&mut rx), [input(b"ls\r")]);
+        // 복사하고 끝내는 y도 같다.
+        enter_copy(&mut app);
+        app.on_input(b"gvlyecho\r");
+        assert!(app.copy.is_none());
+        assert_eq!(app.clipboard, select::osc52("li"));
+        assert_eq!(sent(&mut rx), [input(b"echo\r")]);
+        // 선택 없는 Enter도 끝내는 키다.
+        enter_copy(&mut app);
+        app.on_input(b"\rx");
+        assert_eq!(sent(&mut rx), [input(b"x")]);
+        // q로 끝낸 뒤의 Esc는 그대로 세션으로 간다.
+        enter_copy(&mut app);
+        app.on_input(b"q\x1b");
+        assert!(app.copy.is_none());
+        assert_eq!(sent(&mut rx), [input(b"\x1b")]);
+    }
+
+    #[test]
+    fn esc_that_ends_copy_mode_drops_the_bare_escs_right_after_it() {
+        // Esc를 빠르게 두 번 눌러 나오는 사람이 많다. 세션(Claude Code)에 Esc가 가면 턴을 끊고 Esc Esc는 되감기를 연다.
+        let (mut app, mut rx) = app(&lines(100));
+        enter_copy(&mut app);
+        app.on_input(b"\x1b\x1b");
+        assert!(app.copy.is_none());
+        assert!(sent(&mut rx).is_empty());
+        // 그 뒤에 이어 오는 입력은 평소처럼 간다.
+        enter_copy(&mut app);
+        app.on_input(b"\x1b\x1bls\r");
+        assert!(app.copy.is_none());
+        assert_eq!(sent(&mut rx), [input(b"ls\r")]);
+        // 세 번 와도 모두 뗀다.
+        enter_copy(&mut app);
+        app.on_input(b"\x1b\x1b\x1bx");
+        assert_eq!(sent(&mut rx), [input(b"x")]);
+        // 이스케이프 시퀀스의 시작(CSI)은 단독 Esc가 아니라서 남긴다.
+        enter_copy(&mut app);
+        app.on_input(b"\x1b\x1b\x1b[A");
+        assert_eq!(sent(&mut rx), [input(b"\x1b[A")]);
+        // 검색어를 입력하는 중의 Esc 둘: 첫째는 입력을 접고 둘째가 끝낸다. 보내는 것은 없다.
+        enter_copy(&mut app);
+        app.on_input(b"/ab\x1b\x1b");
+        assert!(app.copy.is_none());
+        assert!(sent(&mut rx).is_empty());
+        // q·y·Enter로 끝낸 뒤는 Esc도 그대로 간다.
+        enter_copy(&mut app);
+        app.on_input(b"q\x1b\x1b");
+        assert_eq!(sent(&mut rx), [input(b"\x1b\x1b")]);
+        enter_copy(&mut app);
+        app.on_input(b"\r\x1b");
+        assert_eq!(sent(&mut rx), [input(b"\x1b")]);
+    }
+
+    #[test]
+    fn a_second_esc_read_separately_is_dropped_within_the_grace_window() {
+        let (mut app, mut rx) = app(&lines(100));
+        enter_copy(&mut app);
+        // 첫 Esc가 복사 모드를 끝내고 시각을 적어 둔다.
+        app.on_input(b"\x1b");
+        assert!(app.copy.is_none() && app.esc_exit.is_some());
+        assert!(sent(&mut rx).is_empty());
+        // 둘째 Esc는 따로 읽혀도 창 안이라 세션에 가지 않는다. 연달아 와도 같다.
+        app.esc_exit = Some(Instant::now());
+        app.on_input(b"\x1b");
+        app.on_input(b"\x1b");
+        assert!(sent(&mut rx).is_empty());
+        // Esc 뒤에 글자가 이어지면 글자는 가고, 그 뒤로는 창이 닫힌다.
+        app.on_input(b"\x1bx");
+        assert_eq!(sent(&mut rx), [input(b"x")]);
+        assert!(app.esc_exit.is_none());
+        app.on_input(b"\x1b");
+        assert_eq!(sent(&mut rx), [input(b"\x1b")]);
+    }
+
+    #[test]
+    fn esc_after_the_grace_window_or_after_q_goes_to_the_session() {
+        let (mut app, mut rx) = app(&lines(100));
+        enter_copy(&mut app);
+        app.on_input(b"\x1b");
+        // 창이 지났다(시각을 되돌려 흉내 낸다).
+        app.esc_exit = Some(Instant::now() - 2 * ESC_GRACE);
+        app.on_input(b"\x1b");
+        assert_eq!(sent(&mut rx), [input(b"\x1b")]);
+        assert!(app.esc_exit.is_none());
+        // q·y·Enter로 끝낸 뒤에는 창이 없다.
+        enter_copy(&mut app);
+        app.on_input(b"q");
+        assert!(app.esc_exit.is_none());
+        app.on_input(b"\x1b");
+        assert_eq!(sent(&mut rx), [input(b"\x1b")]);
+        // 복사 모드에 다시 들어가면 창은 닫힌다.
+        enter_copy(&mut app);
+        app.on_input(b"\x1b");
+        assert!(app.esc_exit.is_some());
+        enter_copy(&mut app);
+        assert!(app.esc_exit.is_none());
+    }
+
+    #[test]
+    fn kitty_encoded_esc_is_dropped_within_the_grace_window_too() {
+        let (mut app, mut rx) = app(&lines(100));
+        enter_copy(&mut app);
+        app.on_input(b"\x1b");
+        // 세션이 kitty 키보드를 켜면 둘째 Esc는 `CSI 27 u`로 온다. 수정 키 없는 누름 세 꼴을 모두 뗀다.
+        for esc in [&b"\x1b[27u"[..], b"\x1b[27;1u", b"\x1b[27;1:1u"] {
+            app.on_input(esc);
+        }
+        assert!(sent(&mut rx).is_empty());
+        // 수정 키가 붙은 것(⌃Esc)은 남긴다.
+        app.on_input(b"\x1b[27;5u");
+        assert_eq!(sent(&mut rx), [input(b"\x1b[27;5u")]);
+        assert!(app.esc_exit.is_none());
+        // 창이 지난 뒤에는 그대로 간다.
+        enter_copy(&mut app);
+        app.on_input(b"\x1b");
+        app.esc_exit = Some(Instant::now() - 2 * ESC_GRACE);
+        app.on_input(b"\x1b[27u");
+        assert_eq!(sent(&mut rx), [input(b"\x1b[27u")]);
+    }
+
+    #[test]
+    fn text_forwarded_after_the_exit_esc_closes_the_grace_window() {
+        let (mut app, mut rx) = app(&lines(100));
+        enter_copy(&mut app);
+        app.on_input(b"\x1b\x1bx");
+        assert_eq!(sent(&mut rx), [input(b"x")]);
+        assert!(app.esc_exit.is_none());
+        app.on_input(b"\x1b");
+        assert_eq!(sent(&mut rx), [input(b"\x1b")]);
+    }
+
+    #[test]
+    fn commands_and_attach_close_the_grace_window() {
+        let (mut app, mut rx) = app(&lines(100));
+        enter_copy(&mut app);
+        app.on_input(b"\x1b");
+        assert!(app.esc_exit.is_some());
+        // `⌃a n`은 명령이다. 세션이 하나도 없어 옮겨 가지는 않지만 창은 닫힌다.
+        app.on_input(b"\x01n");
+        assert!(app.esc_exit.is_none());
+        app.on_input(b"\x1b");
+        assert_eq!(sent(&mut rx), [input(b"\x1b")]);
+        // 세션에 붙어도 닫힌다.
+        enter_copy(&mut app);
+        app.on_input(b"\x1b");
+        assert!(app.esc_exit.is_some());
+        app.attach("s1".into());
+        assert!(app.esc_exit.is_none());
+    }
+
+    #[test]
+    fn paging_moves_the_cursor_and_the_view_by_a_page() {
+        // 39줄 화면에 스크롤백 62줄이다. 한 쪽은 39줄이다.
+        let (mut app, _rx) = app(&lines(100));
+        enter_copy(&mut app);
+        let at = |app: &App| (copy_line(app), offset(app));
+        assert_eq!(at(&app), (99, 0));
+        app.on_input(b"\x1b[5~");
+        assert_eq!(at(&app), (60, 39));
+        app.on_input(b"\x1b[6~");
+        assert_eq!(at(&app), (99, 0));
+        // 반 쪽은 19줄이다.
+        app.on_input(b"\x15");
+        assert_eq!(at(&app), (80, 19));
+        app.on_input(b"\x04");
+        assert_eq!(at(&app), (99, 0));
+        // 끝에서는 멈춘다. ⌃b·⌃f도 같은 쪽 넘김이다.
+        app.on_input(b"\x1b[6~\x06");
+        assert_eq!(at(&app), (100, 0));
+        app.on_input(b"\x02\x02\x02\x02");
+        assert_eq!(at(&app), (0, 62));
+        app.on_input(b"\x1b[5~");
+        assert_eq!(at(&app), (0, 62));
+        assert!(app.m.status.as_deref().unwrap().contains("│ 1/101 │"));
     }
 
     #[test]
@@ -1356,7 +1631,7 @@ mod tests {
         enter_copy(&mut app);
         assert_eq!(
             app.m.status.as_deref(),
-            Some("복사 모드 │ 100/101 │ v 선택 · y 복사 · / 검색 · q 끝")
+            Some("복사 모드 │ 100/101 │ v 선택 · y 복사 · / ? 검색 · q 끝")
         );
         assert_eq!(offset(&app), 0);
         app.on_input(b"g");
