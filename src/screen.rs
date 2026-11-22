@@ -531,8 +531,21 @@ impl Writer {
                 // 앞줄의 줄 바꿈 대기는 글자를 하나 써야 풀린다. 이어진 줄이 비었어도 첫 칸은 쓴다.
                 len = len.max(1);
             }
+            // 줄 끝의 빈자리는 다음 줄이 그 넓은 글자로 시작할 때만 건너뛴다(글자를 쓰면 클라이언트가 스스로 넘긴다).
+            // 이어진 줄을 다시 썼다면 공백으로 채워 줄 바꿈 대기를 만든다. 아니면 다음 줄 첫 칸이 이 줄 끝에 쓰인다.
+            // 되살린 칸은 빈자리 표시를 잃는다. 이어진 줄을 복사할 때 공백이 최대 하나 더 끼는 값이다.
+            let next_wide = line < bottom
+                && grid[Line(line + 1)][Column(0)]
+                    .flags
+                    .contains(Flags::WIDE_CHAR);
             for col in 0..len {
-                self.cell(&row[Column(col)]);
+                let cell = &row[Column(col)];
+                if !next_wide && cell.flags.contains(Flags::LEADING_WIDE_CHAR_SPACER) {
+                    self.pen(cell);
+                    self.out.push(' ');
+                } else {
+                    self.cell(cell);
+                }
             }
             if after_wrap && len < cols {
                 // 자동 줄 바꿈은 새 줄을 첫 글자의 펜 바탕색으로 채운다. 그리지 않은 칸은 기본으로 되돌린다.
@@ -890,6 +903,75 @@ mod tests {
         let f = rebuilt(&s);
         assert_same_cells(&f, &s);
         assert_eq!(f.cursor(), s.cursor());
+    }
+
+    /// 모든 줄의 글자와 줄 이음 표시(마지막 칸의 `WRAPLINE`)가 같은지 본다.
+    fn assert_same_rows_and_wraps(f: &Screen, s: &Screen) {
+        assert_eq!(f.lines(), s.lines());
+        let (gf, gs) = (f.term().grid(), s.term().grid());
+        assert_eq!(
+            gf.topmost_line(),
+            gs.topmost_line(),
+            "스크롤백 길이가 다르다"
+        );
+        let last = Column(gs.columns() - 1);
+        for line in gs.topmost_line().0..=gs.bottommost_line().0 {
+            assert_eq!(
+                gf[Line(line)][last].flags.contains(Flags::WRAPLINE),
+                gs[Line(line)][last].flags.contains(Flags::WRAPLINE),
+                "줄 {line}의 줄 이음 표시"
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_keeps_rows_after_leading_wide_spacer_when_next_row_was_rewritten() {
+        // 마지막 칸에 안 들어간 넓은 글자가 다음 줄로 넘어가며 앞 줄 끝에 빈자리를 남긴 뒤,
+        // 이어진 줄을 지워 그 글자가 사라진 경우. 아래 줄이 한 줄 밀리면 안 된다.
+        let mut s = Screen::new(40, 10);
+        s.feed(format!("{}한\r\x1b[K\r\nnext", "a".repeat(39)).as_bytes());
+        assert_eq!(s.lines()[2], "next");
+        let f = rebuilt(&s);
+        assert_same_rows_and_wraps(&f, &s);
+        assert_eq!(f.lines()[2], "next");
+        assert_eq!(f.cursor(), s.cursor());
+
+        // 이어진 줄을 지운 뒤 다른 글자를 써도 빈자리 표시와 줄 이음 표시가 둘 다 남는다.
+        // 첫 경우와 같은 분기를 이어진 줄이 비어 있지 않을 때 확인한다.
+        let mut s = Screen::new(40, 10);
+        s.feed(format!("{}한\r\x1b[K", "a".repeat(39)).as_bytes());
+        s.feed(b"x\r\nnext");
+        let flags = s.term().grid()[Line(0)][Column(39)].flags;
+        assert!(flags.contains(Flags::LEADING_WIDE_CHAR_SPACER | Flags::WRAPLINE));
+        let f = rebuilt(&s);
+        assert_same_rows_and_wraps(&f, &s);
+
+        // 넓은 글자를 지우지 않고 덮어쓰면 알라크리티가 빈자리 표시를 지워, 줄 이음 표시만 있는 공백이 남는다.
+        // 이 경우는 칸까지 똑같이 되살아난다.
+        let mut s = Screen::new(40, 10);
+        s.feed(format!("{}한\rx\r\nnext", "a".repeat(39)).as_bytes());
+        let flags = s.term().grid()[Line(0)][Column(39)].flags;
+        assert!(flags.contains(Flags::WRAPLINE));
+        assert!(!flags.contains(Flags::LEADING_WIDE_CHAR_SPACER));
+        let f = rebuilt(&s);
+        assert_same_cells(&f, &s);
+        assert_same_rows_and_wraps(&f, &s);
+
+        // 스크롤백이 있어도 보이는 줄이 밀리지 않는다.
+        let mut s = Screen::new(40, 10);
+        for i in 0..20 {
+            s.feed(format!("l{i}\r\n").as_bytes());
+        }
+        s.feed(format!("{}한\r\x1b[K\r\nnext", "a".repeat(39)).as_bytes());
+        let f = rebuilt(&s);
+        assert_same_rows_and_wraps(&f, &s);
+
+        // 이어진 줄이 여전히 그 넓은 글자로 시작하면 지금처럼 칸까지 똑같이 되살린다.
+        let mut s = Screen::new(40, 10);
+        s.feed(format!("{}한글\r\nend", "a".repeat(39)).as_bytes());
+        let f = rebuilt(&s);
+        assert_same_cells(&f, &s);
+        assert_same_rows_and_wraps(&f, &s);
     }
 
     #[test]
