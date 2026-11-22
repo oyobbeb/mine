@@ -10,7 +10,7 @@ mod tty;
 pub mod ui;
 pub mod view;
 
-use std::io::{self, BufWriter, Stdout, Write};
+use std::io::{self, BufWriter, Write};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -19,6 +19,7 @@ use anyhow::{Result, bail};
 use ratatui::Terminal;
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::buffer::{Buffer, Cell};
+use ratatui::crossterm::cursor::MoveTo;
 use ratatui::crossterm::queue;
 use ratatui::crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
 use ratatui::layout::{Position, Rect, Size};
@@ -41,7 +42,6 @@ const FRAME: Duration = Duration::from_micros(16_667);
 /// 휠 한 칸에 스크롤하는 줄 수.
 const WHEEL_LINES: i32 = 3;
 
-type Term = Terminal<CrosstermBackend<BufWriter<Stdout>>>;
 /// 바깥 화면 좌표와 그 칸.
 type Cells = Vec<(u16, u16, Cell)>;
 
@@ -821,7 +821,7 @@ impl App {
     /// 기억하므로 ratatui가 다시 쓰지 않은 칸도 링크가 남는다. 지난 화면에만 있던 구간은 링크 없이 다시 써서,
     /// 글자가 같아 ratatui가 건너뛴 칸에 지난 링크가 남지 않게 한다. 커서는 DECSC/DECRC로 되돌린다.
     /// 링크가 많아 느려지면 바뀐 구간만 쓴다.
-    fn draw(&mut self, terminal: &mut Term) -> io::Result<()> {
+    fn draw<W: Write>(&mut self, terminal: &mut Terminal<CrosstermBackend<W>>) -> io::Result<()> {
         // 클립보드 OSC 52는 화면과 같은 쓰기 통로로, 그리는 도중이 아닌 프레임 사이에 내보낸다.
         if !self.clipboard.is_empty() {
             terminal.backend_mut().write_all(&self.clipboard)?;
@@ -848,6 +848,10 @@ impl App {
             }
         })?;
         let term = ui::layout(frame.area, self.m.list_open).term;
+        let anchor = self
+            .screen
+            .as_ref()
+            .and_then(|screen| ime_anchor(&self.m, screen, term));
         let runs = self
             .screen
             .as_ref()
@@ -877,12 +881,36 @@ impl App {
             }
             backend.write_all(b"\x1b8")?;
         }
+        // 반드시 위 DECRC(`\x1b8`) 뒤에 쓴다. 앞에 쓰면 DECRC가 커서를 되돌려 버린다.
+        if let Some(pos) = anchor {
+            queue!(backend, MoveTo(pos.x, pos.y))?;
+        }
         queue!(backend, EndSynchronizedUpdate)?;
         Write::flush(backend)?;
         self.links = runs;
         self.dirty = false;
         Ok(())
     }
+}
+
+/// 세션이 커서를 숨겼을 때 바깥 커서를 둘 자리. 없으면 `None`이다.
+///
+/// 한글 조합(IME preedit)은 바깥 터미널의 실제 커서 자리에 뜨고, 숨겨도 그렇다. Claude Code는 커서를 숨기고 자기 입력줄에
+/// 두므로, 바깥 커서는 숨긴 채 그 자리로 옮겨야 조합이 입력줄에 뜬다. 보이는 커서는 `ui::term_cursor`가 맡는다.
+/// 상태줄 입력(프롬프트·복사 모드 검색)은 상태줄 커서가 우선이고, 스크롤해 과거를 보는 중에는 칸 안으로 옮기지 않는다.
+///
+/// ponytail: 칸 안 판정은 `ui::term_cursor`와 같은 두 줄이다. ui.rs를 키우지 않으려고 그쪽을 고치지 않고 여기에 두었다.
+fn ime_anchor(m: &Model, sc: &Screen, term: Rect) -> Option<Position> {
+    if m.attached.is_none()
+        || m.status.is_some()
+        || m.prompt.is_some()
+        || sc.mode().contains(TermMode::SHOW_CURSOR)
+        || sc.term().grid().display_offset() != 0
+    {
+        return None;
+    }
+    let (x, y) = sc.cursor();
+    (x < term.width && y < term.height).then(|| Position::new(term.x + x, term.y + y))
 }
 
 /// 링크 구간이 덮는 칸을 막 그린 버퍼에서 꺼낸다. 넓은 글자가 가린 다음 칸은 뺀다.
@@ -905,6 +933,7 @@ fn run_cells(buf: &Buffer, run: &LinkRun) -> Cells {
 
 #[cfg(test)]
 mod tests {
+    use ratatui::{TerminalOptions, Viewport};
     use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
     use super::*;
@@ -948,6 +977,122 @@ mod tests {
             id: "s1".into(),
             data: data.to_vec(),
         }
+    }
+
+    /// 한 프레임을 그리고 바깥 터미널(120x40)에 쓴 바이트를 돌려준다. 크기를 묻지 않도록 고정 영역으로 연다.
+    fn frame(app: &mut App) -> String {
+        let mut out = Vec::new();
+        let viewport = Viewport::Fixed(Rect::new(0, 0, 120, 40));
+        let mut terminal = Terminal::with_options(
+            CrosstermBackend::new(&mut out),
+            TerminalOptions { viewport },
+        )
+        .unwrap();
+        app.draw(&mut terminal).unwrap();
+        // Terminal의 Drop은 숨긴 커서를 보이는 시퀀스를 쓴다. 프레임이 쓴 것만 보려고 Drop을 건너뛴다.
+        std::mem::forget(terminal);
+        String::from_utf8(out).unwrap()
+    }
+
+    /// 세션 커서(행 3, 열 5)를 숨긴다. 터미널 칸이 (34, 0)에서 시작하므로 바깥 화면에서는 행 3, 열 39(CUP `4;40`)다.
+    const HIDDEN_AT_3_5: &[u8] = b"\x1b[?25l\x1b[4;6H";
+    const MOVE: &str = "\x1b[4;40H";
+    const SHOW: &str = "\x1b[?25h";
+
+    #[test]
+    fn ime_anchor_follows_the_hidden_cursor_inside_the_pane() {
+        let (app, _rx) = app(HIDDEN_AT_3_5);
+        let sc = app.screen.as_ref().unwrap();
+        let term = ui::layout(app.area, app.m.list_open).term;
+        assert_eq!(ime_anchor(&app.m, sc, term), Some(Position::new(39, 3)));
+        // 칸 밖(칸보다 좁은 영역)이면 옮기지 않는다.
+        assert_eq!(ime_anchor(&app.m, sc, Rect::new(34, 0, 5, 39)), None);
+        // 붙은 세션이 없으면 옮기지 않는다.
+        let mut detached = app.m;
+        detached.attached = None;
+        assert_eq!(ime_anchor(&detached, sc, term), None);
+    }
+
+    #[test]
+    fn ime_anchor_leaves_a_visible_cursor_to_the_existing_path() {
+        let (app, _rx) = app(b"\x1b[4;6H");
+        let term = ui::layout(app.area, app.m.list_open).term;
+        assert_eq!(ime_anchor(&app.m, app.screen.as_ref().unwrap(), term), None);
+    }
+
+    #[test]
+    fn ime_anchor_stays_out_of_scrollback_prompts_and_copy_mode() {
+        let (mut app, _rx) = app(&[lines(100), HIDDEN_AT_3_5.to_vec()].concat());
+        let term = ui::layout(app.area, app.m.list_open).term;
+        assert!(ime_anchor(&app.m, app.screen.as_ref().unwrap(), term).is_some());
+        app.mouse(ev(MouseKind::WheelUp, 40, 5));
+        assert_eq!(offset(&app), 3);
+        assert_eq!(ime_anchor(&app.m, app.screen.as_ref().unwrap(), term), None);
+        // 맨 아래로 돌아오고 나서 프롬프트(`⌃a c`)가 열리면 상태줄 커서가 우선이다.
+        app.on_action(Action::Pass(b"a".to_vec()));
+        assert!(ime_anchor(&app.m, app.screen.as_ref().unwrap(), term).is_some());
+        app.on_input(b"\x01c");
+        assert!(app.m.prompt.is_some());
+        assert_eq!(ime_anchor(&app.m, app.screen.as_ref().unwrap(), term), None);
+        app.on_input(b"\x1b");
+        // 복사 모드는 상태줄을 쓰니 검색어를 치는 중이든 아니든 옮기지 않는다.
+        enter_copy(&mut app);
+        app.on_input(b"/ab");
+        assert_eq!(ime_anchor(&app.m, app.screen.as_ref().unwrap(), term), None);
+    }
+
+    #[test]
+    fn hidden_cursor_is_parked_at_its_spot_after_the_frame_and_never_shown() {
+        let (mut app, _rx) = app(HIDDEN_AT_3_5);
+        let out = frame(&mut app);
+        // 옮기는 시퀀스는 프레임 끝, 동기화 갱신을 닫기 바로 앞에 쓴다.
+        assert!(out.ends_with(&format!("{MOVE}\x1b[?2026l")), "{out:?}");
+        assert!(!out.contains(SHOW), "{out:?}");
+        assert!(out.contains("\x1b[?25l"));
+    }
+
+    #[test]
+    fn visible_cursor_keeps_the_existing_set_cursor_path() {
+        let (mut app, _rx) = app(b"\x1b[4;6H");
+        let out = frame(&mut app);
+        // ratatui가 커서를 보이고 그 자리에 놓는다. 프레임 끝은 그 둘과 동기화 갱신 닫기뿐이고, 따로 더 옮기지 않는다.
+        // (칸에 무엇이 그려졌는지와 무관하게, 끝부분의 순서만 본다.)
+        assert!(
+            out.ends_with(&format!("{SHOW}{MOVE}\x1b[?2026l")),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn park_move_comes_after_the_link_patch_restores_the_cursor() {
+        // 첫 줄에 OSC 8 링크가 있고 세션 커서는 숨겨져 있다. 링크 패치는 DECSC/DECRC로 커서를 되돌린다.
+        let feed = [
+            b"\x1b]8;;https://x.example\x1b\\link\x1b]8;;\x1b\\".as_slice(),
+            HIDDEN_AT_3_5,
+        ]
+        .concat();
+        let (mut app, _rx) = app(&feed);
+        let out = frame(&mut app);
+        let (restore, park, end) = (
+            out.rfind("\x1b8").expect("DECRC"),
+            out.rfind(MOVE).expect("park move"),
+            out.rfind("\x1b[?2026l").expect("sync end"),
+        );
+        assert!(restore < park && park < end, "{out:?}");
+        assert!(out.contains("\x1b]8;;https://x.example\x1b\\"), "{out:?}");
+    }
+
+    #[test]
+    fn scrollback_and_prompt_frames_do_not_park_the_cursor_in_the_pane() {
+        let (mut scrolled, _rx) = app(&[lines(100), HIDDEN_AT_3_5.to_vec()].concat());
+        scrolled.mouse(ev(MouseKind::WheelUp, 40, 5));
+        let out = frame(&mut scrolled);
+        assert!(out.ends_with("\x1b[?25l\x1b[?2026l"), "{out:?}");
+        // 프롬프트를 열면 상태줄(맨 아래 줄)에 커서를 보이고, 칸 안으로는 옮기지 않는다.
+        let (mut prompting, _rx) = app(HIDDEN_AT_3_5);
+        prompting.on_input(b"\x01c");
+        let out = frame(&mut prompting);
+        assert!(out.contains(SHOW) && !out.contains(MOVE), "{out:?}");
     }
 
     #[test]
