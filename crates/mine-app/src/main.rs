@@ -3,26 +3,28 @@
 //! 창을 닫아도 앱은 Dock에 남고(macOS 관례), Dock 아이콘을 누르면 같은 뷰로 창을 다시 연다. ⌘Q는 앱만 끝내고
 //! 데몬과 세션은 남는다.
 
+mod actions;
+mod launcher;
 mod model;
 mod sidebar;
+mod tabs;
 mod theme;
 mod workspace;
 
 use std::path::{Path, PathBuf};
 
 use gpui::{
-    AnyView, App, AppContext, Application, Bounds, Global, KeyBinding, Menu, MenuItem,
-    WindowBounds, WindowOptions, actions, px, size,
+    AnyView, App, AppContext, Application, Bounds, Global, Menu, MenuItem, WindowBounds,
+    WindowOptions, px, size,
 };
 use gpui_component::{Root, TitleBar};
 use mine_core::link;
 use mine_core::paths::State;
 use mine_core::project;
 
+use actions::Quit;
 use model::Model;
 use workspace::{Problem, Workspace};
-
-actions!(mine, [Quit]);
 
 /// 창을 닫아도 남는 뿌리 뷰. Dock 아이콘으로 다시 연 창도 이 뷰를 그린다.
 struct MainView(AnyView);
@@ -45,7 +47,7 @@ fn main() {
         gpui_component::init(cx);
         theme::install(cx);
         cx.on_action(|_: &Quit, cx| cx.quit());
-        cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
+        cx.bind_keys(actions::bindings());
         cx.set_menus(vec![Menu {
             name: "mine".into(),
             items: vec![MenuItem::action("mine 끝내기", Quit)],
@@ -73,23 +75,29 @@ fn root_view(cx: &mut App) -> AnyView {
         exe_dir.as_deref(),
         std::env::var_os("PATH"),
     ) else {
-        let message = "mine 실행 파일을 찾지 못했다 · cargo install --path crates/mine-cli";
+        let message =
+            "mine 실행 파일을 찾지 못했어요 · cargo install --path crates/mine-cli로 설치해 주세요";
         return cx.new(|_| Problem(message.into())).into();
     };
-    let mut model = Model::new(current_project(&state));
+    let (current, home_fallback) = current_project(&state);
+    let mut model = Model::new(current);
+    model.home_fallback = home_fallback;
     model.registered = project::registered(&state).unwrap_or_default();
-    let link = link::start(state, mine, None);
-    cx.new(|cx| Workspace::new(model, link, cx)).into()
+    let link = link::start(state.clone(), mine, None);
+    cx.new(|cx| Workspace::new(model, state, link, cx)).into()
 }
 
-/// 앱을 띄운 폴더의 프로젝트. Dock에서 띄우면 폴더가 `/`라서 홈 폴더에서 찾는다.
-fn current_project(state: &State) -> PathBuf {
-    let start = std::env::current_dir()
-        .ok()
-        .filter(|dir| dir != Path::new("/"))
-        .or_else(std::env::home_dir)
-        .unwrap_or_else(|| PathBuf::from("/"));
-    project::project_root(&start, state).unwrap_or(start)
+/// 앱을 띄운 폴더의 프로젝트. Dock에서 띄우면 폴더가 `/`라서 홈 폴더에서 찾고, 그렇게 대신했는지를 함께 준다.
+fn current_project(state: &State) -> (PathBuf, bool) {
+    let (start, home_fallback) = match std::env::current_dir() {
+        Ok(dir) if dir != Path::new("/") => (dir, false),
+        _ => (
+            std::env::home_dir().unwrap_or_else(|| PathBuf::from("/")),
+            true,
+        ),
+    };
+    let root = project::project_root(&start, state).unwrap_or(start);
+    (root, home_fallback)
 }
 
 /// 1200×800 창을 화면 가운데에 연다. 제목줄은 목업 색으로 직접 그린다.
@@ -109,6 +117,6 @@ fn open_window(cx: &mut App) {
         cx.new(|cx| Root::new(view, window, cx))
     });
     if let Err(e) = opened {
-        eprintln!("창을 열지 못했다: {e:#}");
+        eprintln!("창을 열지 못했어요: {e:#}");
     }
 }

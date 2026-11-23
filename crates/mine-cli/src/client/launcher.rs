@@ -17,14 +17,19 @@ use crate::client::ui::{HEAD, MUTED, chip};
 /// 시작 화면이 열려 있을 때 상태줄 오른쪽 키 안내.
 pub const KEYS: &str = "↵ claude-a · b claude-b · x codex · s shell";
 
-/// 메뉴 줄: (선택, 키 표시, 이름). 앞의 넷은 이름이 `mine_core::launch::new_session`이 쓰는 종류 말이자 칩의 계정 이름이다.
-const ROWS: [(Choice, &str, &str); 5] = [
-    (Choice::ClaudeA, "↵", "claude-a"),
-    (Choice::ClaudeB, "b", "claude-b"),
-    (Choice::Codex, "x", "codex"),
-    (Choice::Shell, "s", "shell"),
-    (Choice::Typed, "n", "이름·모델 직접 입력"),
+/// 메뉴 줄: (선택, 키 표시). 줄 이름은 [`label`]이다.
+const ROWS: [(Choice, &str); 5] = [
+    (Choice::ClaudeA, "↵"),
+    (Choice::ClaudeB, "b"),
+    (Choice::Codex, "x"),
+    (Choice::Shell, "s"),
+    (Choice::Typed, "n"),
 ];
+
+/// 메뉴 줄 이름. 앞의 넷은 종류 말(`Choice::word`)이고, shell 말고는 그 말이 칩의 계정 이름이기도 하다.
+fn label(choice: Choice) -> &'static str {
+    choice.word().unwrap_or("이름·모델 직접 입력")
+}
 
 /// 맨 위 두 줄(프로젝트 머리와 빈 줄) 다음에 오는 본문: `새 세션`, 빈 줄, 메뉴 줄들, 빈 줄, 안내.
 /// 메뉴 줄은 위에서 네 번째 줄(0부터)에서 시작한다.
@@ -53,14 +58,15 @@ pub fn choice_of_key(bytes: &[u8]) -> Option<Choice> {
 fn body() -> Vec<Line<'static>> {
     let key = Style::new().add_modifier(Modifier::BOLD);
     let mut out = vec![Line::styled("새 세션", HEAD), Line::default()];
-    out.extend(ROWS.iter().map(|&(_, k, label)| {
+    out.extend(ROWS.iter().map(|&(choice, k)| {
+        let label = label(choice);
         let pad = LABEL_W.saturating_sub(Span::raw(label).width());
         let mut spans = vec![
             Span::styled(k, key),
             Span::raw(format!("  {label}{}", " ".repeat(pad))),
         ];
         // 칩은 목록과 같은 것이다. 계정이 없는 줄(shell, 직접 입력)에는 없다.
-        if let Some(chip) = chip(Some(label)) {
+        if let Some(chip) = chip(choice.word()) {
             spans.push(Span::raw("  "));
             spans.push(chip);
         }
@@ -144,7 +150,7 @@ mod tests {
             assert_eq!(k(ignored), None, "{ignored:?}");
         }
         // 줄마다 보이는 키가 그 줄을 고른다(Enter는 `↵`).
-        for (choice, key, _) in ROWS {
+        for (choice, key) in ROWS {
             let bytes: &[u8] = if key == "↵" { b"\r" } else { key.as_bytes() };
             assert_eq!(k(bytes), Some(choice), "{key}");
         }

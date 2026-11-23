@@ -1,12 +1,15 @@
-//! 앱 상태. GPUI 없이 데몬 연결의 일(`LinkEvent`)을 받아 상태를 바꾸고, 데몬에 보낼 메시지(`Effect`)를 돌려준다.
+//! 앱 상태. GPUI 없이 데몬 연결의 일(`LinkEvent`)과 사용자 동작을 받아 상태를 바꾸고, 데몬에 보낼 메시지(`Effect`)를
+//! 돌려준다.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
+use mine_core::launch::{self, Choice};
 use mine_core::link::LinkEvent;
 use mine_core::proto::{FromDaemon, ToDaemon};
-use mine_core::session::{SessionInfo, SessionState};
-use mine_core::view::{self, Group};
+use mine_core::session::{NewSession, SessionInfo, SessionState};
+use mine_core::view::{self, Group, STATES};
 
 use crate::theme;
 
@@ -15,6 +18,42 @@ use crate::theme;
 pub enum Effect {
     Send(ToDaemon),
 }
+
+/// ⌘W가 할 일. [`Model::close`]가 정한다.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Close {
+    /// 붙은 세션 위에 연 실행 화면을 닫았다.
+    Launcher,
+    /// 붙은 세션을 닫을지 묻는다. 값은 확인 창에 띄울 세션 이름이다. 답은 [`Model::confirm_close`]로 받는다.
+    Confirm(String),
+    /// 닫을 세션이 없다. 창을 닫는다(앱은 Dock에 남는다).
+    Window,
+    /// 확인 창이 이미 떠 있다.
+    Nothing,
+}
+
+/// `New`를 보내고 기다리는 세션. 목록에 (`project`, `name`)이 나타나면 붙는다.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Pending {
+    pub project: PathBuf,
+    pub name: String,
+    /// `New`를 보낸 때.
+    pub since: Instant,
+}
+
+/// `New`의 답을 이만큼 기다린다. 넘으면 버리고 [`START_FAILED`]를 띄운다.
+pub const PENDING_TIMEOUT: Duration = Duration::from_secs(5);
+/// 만든 세션이 목록에 나타나지 않았다(셸이 곧바로 끝났거나 답이 오지 않았다).
+const START_FAILED: &str = "세션을 시작하지 못했어요";
+/// 앞서 보낸 `New`의 답을 기다리는 동안 다시 고르면 띄운다.
+const CREATING: &str = "만드는 중이에요";
+
+/// 붙을 때 보내는 터미널 칸 크기(열, 행)의 처음 값. Task 4가 칸 크기로 바꾼다.
+pub const DEFAULT_GRID: (u16, u16) = (80, 24);
+
+/// 연결이 없을 때 실행 화면에서 고르면 띄우는 글. 연결 스레드는 연결 전에 보낸 메시지를 버린다.
+const NOT_CONNECTED: &str =
+    "데몬에 연결되지 않아 세션을 만들 수 없어요. 다시 연결되면 골라 주세요.";
 
 pub struct Model {
     pub sessions: Vec<SessionInfo>,
@@ -30,17 +69,26 @@ pub struct Model {
     pub offline: Option<String>,
     /// 앱을 띄운 프로젝트. 세션이 없어도 프로젝트 고르기에 있다.
     pub current_project: PathBuf,
+    /// `current_project`는 Dock에서 띄워(폴더가 `/`) 홈 폴더로 대신한 값이다. 홈은 프로젝트로 등록하지 않으니
+    /// 프로젝트 고르기에도 넣지 않는다.
+    pub home_fallback: bool,
     /// 등록된 프로젝트(`mine_core::project::registered`).
     pub registered: Vec<PathBuf>,
+    /// 붙은 세션 위에 실행 화면을 열었다(⌘N, 탭의 ＋, 새 작업). 붙은 세션이 없으면 이 값과 상관없이 열려 있다.
+    pub launcher: bool,
+    /// 실행 화면의 `n` 입력 상자가 열려 있다.
+    pub typing: bool,
+    /// `New`를 보내고 답을 기다리는 세션. 목록에 나타나면 붙는다.
+    pub pending: Option<Pending>,
+    /// 닫기 확인 창을 띄운 세션 id.
+    pub closing: Option<String>,
+    /// 데몬이 보낸 오류나 입력 오류. 가운데 아래에 띄우고 다음 동작에서 지운다.
+    pub message: Option<String>,
+    /// `Attach`에 실을 터미널 칸 크기(열, 행).
+    pub grid: (u16, u16),
+    /// 처음 받은 목록으로 붙을 세션을 정했다.
+    started: bool,
 }
-
-/// 묶음 상태 순서. `Model::toggled`의 값이 이 배열의 인덱스다.
-pub const STATES: [SessionState; 4] = [
-    SessionState::Approval,
-    SessionState::Working,
-    SessionState::Done,
-    SessionState::Idle,
-];
 
 impl Model {
     pub fn new(current_project: PathBuf) -> Self {
@@ -53,7 +101,15 @@ impl Model {
             connected: false,
             offline: None,
             current_project,
+            home_fallback: false,
             registered: Vec::new(),
+            launcher: false,
+            typing: false,
+            pending: None,
+            closing: None,
+            message: None,
+            grid: DEFAULT_GRID,
+            started: false,
         }
     }
 
@@ -77,14 +133,318 @@ impl Model {
             LinkEvent::Disconnected(reason) => {
                 self.connected = false;
                 self.offline = Some(reason);
+                // 보낸 `New`가 끊기기 전에 데몬에 닿았는지 알 수 없다. 답을 기다리지 않고 다시 고를 수 있게 한다.
+                // 닿았으면 다시 붙은 뒤 오는 목록에 그 세션이 보인다.
+                self.pending = None;
                 Vec::new()
             }
             LinkEvent::Msg(FromDaemon::Sessions { sessions }) => {
+                // 데몬은 목록이 바뀌었을 때만 알린다(publish). 바뀌지 않은 목록은 이 앱이 한 요청의 답이다.
+                let unchanged = sessions == self.sessions;
                 self.sessions = sessions;
+                self.on_sessions(unchanged)
+            }
+            LinkEvent::Msg(FromDaemon::Error { message }) => {
+                self.pending = None;
+                self.message = Some(message);
                 Vec::new()
             }
-            // 화면(Snapshot·Output)과 오류 알림은 세션을 붙이는 Task 3·4가 다룬다.
+            // 화면(Snapshot·Output)은 터미널 칸을 그리는 Task 4가 다룬다.
             LinkEvent::Msg(_) => Vec::new(),
+        }
+    }
+
+    /// 새 목록을 받았다. 기다리던 새 세션이 나타나면 붙는다. 처음 받은 목록이거나 붙은 세션이 사라졌으면 보이는 첫
+    /// 세션에 붙고, 없으면 실행 화면이 뜬다.
+    ///
+    /// 기다리던 세션 없이 바뀌지 않은 목록이 오면 그것이 `New`의 답이다. 셸이 곧바로 끝나면 데몬은 세션을 남기지 않고
+    /// 성공으로 답한다. 그 기다림을 버리고 알린다. 바뀐 목록은 만드는 사이 다른 세션 때문에 온 것일 수 있어 계속
+    /// 기다린다([`PENDING_TIMEOUT`]이 받쳐 준다).
+    fn on_sessions(&mut self, unchanged: bool) -> Vec<Effect> {
+        if let Some(p) = &self.pending {
+            let found = self
+                .sessions
+                .iter()
+                .find(|s| s.meta.project == p.project && s.meta.name == p.name);
+            if let Some(s) = found {
+                let id = s.meta.id.clone();
+                self.pending = None;
+                return self.attach(&id);
+            }
+            if unchanged {
+                self.fail_pending();
+            }
+        }
+        let gone = self
+            .attached
+            .as_ref()
+            .is_some_and(|id| !self.sessions.iter().any(|s| s.meta.id == *id));
+        if gone {
+            self.attached = None;
+        }
+        if !self.started || gone {
+            self.started = true;
+            return self.attach_first();
+        }
+        Vec::new()
+    }
+
+    /// 보이는 첫 세션에 붙는다. 보이는 줄이 없으면(대기 묶음은 처음에 접혀 있다) 접힌 묶음까지 본다.
+    fn attach_first(&mut self) -> Vec<Effect> {
+        let groups = self.visible_groups();
+        let first = view::order(&groups)
+            .first()
+            .copied()
+            .or_else(|| groups.iter().find_map(|g| g.rows.first().copied()));
+        match first {
+            Some(i) => {
+                let id = self.sessions[i].meta.id.clone();
+                self.attach(&id)
+            }
+            None => Vec::new(),
+        }
+    }
+
+    /// id로 찾은 세션.
+    pub fn session(&self, id: &str) -> Option<&SessionInfo> {
+        self.sessions.iter().find(|s| s.meta.id == id)
+    }
+
+    /// 실행 화면이 가운데를 덮고 있다. 붙은 세션이 없으면 늘 열려 있다.
+    pub fn launcher_open(&self) -> bool {
+        self.attached.is_none() || self.launcher
+    }
+
+    /// 실행 화면이 새 세션을 만들 프로젝트: 고른 프로젝트, 전체이면 붙은 세션의 프로젝트, 그것도 없으면 앱을 띄운
+    /// 프로젝트다.
+    pub fn project(&self) -> &Path {
+        let attached = self.attached.as_deref().and_then(|id| self.session(id));
+        self.filter
+            .as_deref()
+            .or(attached.map(|s| s.meta.project.as_path()))
+            .unwrap_or(&self.current_project)
+    }
+
+    /// 세션에 붙는다. 실행 화면과 입력 상자는 닫는다. 이미 붙은 세션이면 데몬에 다시 알리지 않는다.
+    pub fn attach(&mut self, id: &str) -> Vec<Effect> {
+        self.launcher = false;
+        self.typing = false;
+        self.message = None;
+        if self.attached.as_deref() == Some(id) {
+            return Vec::new();
+        }
+        self.attached = Some(id.to_string());
+        let (cols, rows) = self.grid;
+        vec![Effect::Send(ToDaemon::Attach {
+            id: id.to_string(),
+            cols,
+            rows,
+        })]
+    }
+
+    /// 보이는 순서(접힌 묶음은 뺀 목록 순서)로 `delta`만큼 옆 세션에 붙는다. 끝에서는 처음으로 돈다.
+    pub fn step_session(&mut self, delta: i32) -> Vec<Effect> {
+        let order = view::order(&self.visible_groups());
+        let Some(n) = i32::try_from(order.len()).ok().filter(|&n| n > 0) else {
+            return Vec::new();
+        };
+        let here = self
+            .attached
+            .as_ref()
+            .and_then(|id| order.iter().position(|&i| self.sessions[i].meta.id == *id));
+        let next = match here {
+            Some(at) => (at as i32 + delta).rem_euclid(n),
+            None if delta > 0 => 0,
+            None => n - 1,
+        };
+        let id = self.sessions[order[next as usize]].meta.id.clone();
+        self.attach(&id)
+    }
+
+    /// 프로젝트 고르기 순서(전체 포함)로 `delta`만큼 옆 프로젝트를 고른다. 끝에서는 처음으로 돈다.
+    pub fn step_project(&mut self, delta: i32) {
+        let items = self.projects();
+        let at = items
+            .iter()
+            .position(|p| p.root == self.filter)
+            .unwrap_or(0);
+        let next = (at as i32 + delta).rem_euclid(items.len() as i32) as usize;
+        self.set_filter(items[next].root.clone());
+    }
+
+    /// 프로젝트를 고른다. 붙은 세션이 그 프로젝트 것이 아니면 놓는다(실행 화면이 뜬다). 데몬에는 떨어지는 메시지가
+    /// 없어 보낼 것이 없다.
+    pub fn set_filter(&mut self, filter: Option<PathBuf>) {
+        self.filter = filter;
+        let shown = self
+            .attached
+            .as_deref()
+            .and_then(|id| self.session(id))
+            .is_some_and(|s| self.filter.as_ref().is_none_or(|p| s.meta.project == *p));
+        if !shown {
+            self.attached = None;
+        }
+    }
+
+    /// 탭: 고른 프로젝트(전체이면 모든 프로젝트)의 세션 인덱스, 이름순.
+    pub fn tabs(&self) -> Vec<usize> {
+        let mut tabs: Vec<usize> = (0..self.sessions.len())
+            .filter(|&i| {
+                let project = &self.sessions[i].meta.project;
+                self.filter.as_ref().is_none_or(|p| project == p)
+            })
+            .collect();
+        tabs.sort_by(|&a, &b| {
+            let (a_meta, b_meta) = (&self.sessions[a].meta, &self.sessions[b].meta);
+            (&a_meta.name, &a_meta.project, a).cmp(&(&b_meta.name, &b_meta.project, b))
+        });
+        tabs
+    }
+
+    /// ⌘1–⌘9: `i`번째(0부터) 탭에 붙는다.
+    pub fn select_tab(&mut self, i: usize) -> Vec<Effect> {
+        match self.tabs().get(i) {
+            Some(&s) => {
+                let id = self.sessions[s].meta.id.clone();
+                self.attach(&id)
+            }
+            None => Vec::new(),
+        }
+    }
+
+    /// 실행 화면의 줄을 고른다. 세션은 새 이름(`t<N>`)으로 바로 만들고, 붙는 것은 목록에 나타난 뒤다.
+    /// `Typed`는 입력 상자를 연다.
+    pub fn launch(&mut self, choice: Choice) -> Vec<Effect> {
+        self.message = None;
+        if choice == Choice::Typed {
+            self.typing = true;
+            return Vec::new();
+        }
+        // 앞서 보낸 `New`의 답을 기다리는 동안은 받지 않는다. 같은 이름으로 또 보내 서로 엉키지 않게 한다.
+        // 기다린 지 오래면(타이머가 아직 못 돌았어도) 버리고 새로 고른 것을 받는다.
+        if let Some(p) = &self.pending {
+            if Instant::now().duration_since(p.since) < PENDING_TIMEOUT {
+                self.message = Some(CREATING.into());
+                return Vec::new();
+            }
+            self.pending = None;
+        }
+        if !self.connected {
+            self.message = Some(NOT_CONNECTED.into());
+            return Vec::new();
+        }
+        let project = self.project().to_path_buf();
+        let name = launch::next_name(&self.sessions, &project);
+        match launch::new_session(choice, &name, &project) {
+            Some(spec) => self.create(spec),
+            None => Vec::new(),
+        }
+    }
+
+    /// 입력 상자의 글(`view::parse_new` 형식)로 세션을 만든다. 틀리면 상자를 열어 둔 채 사유를 띄운다.
+    pub fn submit_typed(&mut self, text: &str) -> Vec<Effect> {
+        if !self.connected {
+            self.message = Some(NOT_CONNECTED.into());
+            return Vec::new();
+        }
+        match view::parse_new(text, self.project()) {
+            Ok(spec) => {
+                self.typing = false;
+                self.message = None;
+                self.create(spec)
+            }
+            Err(e) => {
+                self.message = Some(format!("{e:#}"));
+                Vec::new()
+            }
+        }
+    }
+
+    fn create(&mut self, spec: NewSession) -> Vec<Effect> {
+        self.pending = Some(Pending {
+            project: spec.project.clone(),
+            name: spec.name.clone(),
+            since: Instant::now(),
+        });
+        vec![Effect::Send(ToDaemon::New { spec })]
+    }
+
+    /// ⌘N, 탭의 ＋, 새 작업: 실행 화면을 연다.
+    pub fn new_task(&mut self) {
+        self.launcher = true;
+        self.typing = false;
+        self.message = None;
+    }
+
+    /// Esc. 입력 상자가 열려 있으면 실행 화면으로 돌아가고, 붙은 세션 위에 연 실행 화면이면 닫는다.
+    /// 붙은 세션이 없으면 돌아갈 곳이 없어 실행 화면은 그대로다.
+    pub fn dismiss(&mut self) {
+        self.message = None;
+        if self.typing {
+            self.typing = false;
+        } else if self.attached.is_some() {
+            self.launcher = false;
+        }
+    }
+
+    /// ⌘W. 붙은 세션 위에 연 실행 화면이면 그것만 닫는다. 붙은 세션이 있으면 닫기 확인을 시작한다.
+    pub fn close(&mut self) -> Close {
+        if self.closing.is_some() {
+            return Close::Nothing;
+        }
+        let Some(id) = self.attached.clone() else {
+            return Close::Window;
+        };
+        if self.launcher {
+            self.launcher = false;
+            self.typing = false;
+            return Close::Launcher;
+        }
+        let name = self
+            .session(&id)
+            .map_or(id.clone(), |s| s.meta.name.clone());
+        self.closing = Some(id);
+        Close::Confirm(name)
+    }
+
+    /// 기다린 지 [`PENDING_TIMEOUT`]이 넘은 `New`를 버리고 [`START_FAILED`]를 띄운다. 버렸으면 `true`다.
+    pub fn expire_pending(&mut self, now: Instant) -> bool {
+        let expired = self
+            .pending
+            .as_ref()
+            .is_some_and(|p| now.duration_since(p.since) >= PENDING_TIMEOUT);
+        if expired {
+            self.fail_pending();
+        }
+        expired
+    }
+
+    fn fail_pending(&mut self) {
+        self.pending = None;
+        self.message = Some(START_FAILED.into());
+    }
+
+    /// 닫기 확인 창의 답. `yes`이면 확인을 물은 세션을 `Kill`한다. 목록에서 빠지면 다른 세션에 붙는다(`on_sessions`).
+    pub fn confirm_close(&mut self, yes: bool) -> Vec<Effect> {
+        match self.closing.take() {
+            Some(id) if yes => vec![Effect::Send(ToDaemon::Kill { id })],
+            _ => Vec::new(),
+        }
+    }
+
+    /// "＋ 프로젝트 추가"로 `root`를 등록했다. `registered`는 등록한 뒤 다시 읽은 목록이다. 거기 있으면 그 프로젝트를
+    /// 고르고, 없으면(홈 폴더와 `/`는 등록하지 않는다) 그 사유를 띄운다.
+    pub fn project_added(&mut self, root: PathBuf, registered: Vec<PathBuf>) {
+        let listed = registered.contains(&root);
+        self.registered = registered;
+        if listed {
+            self.message = None;
+            self.set_filter(Some(root));
+        } else {
+            self.message = Some(format!(
+                "홈 폴더와 /는 프로젝트로 추가하지 않아요: {}",
+                root.display()
+            ));
         }
     }
 
@@ -106,12 +466,9 @@ impl Model {
         )
     }
 
-    /// `visible_groups`의 `i`번째 묶음을 접거나 편다.
-    pub fn toggle_group(&mut self, i: usize) {
-        let Some(state) = self.visible_groups().into_iter().nth(i).map(|g| g.state) else {
-            return;
-        };
-        if let Some(slot) = STATES.iter().position(|s| *s == state)
+    /// `state` 묶음을 접거나 편다. 그린 뒤 목록이 바뀌어 묶음 자리가 밀려도 누른 묶음이 바뀐다.
+    pub fn toggle_group(&mut self, state: &SessionState) {
+        if let Some(slot) = STATES.iter().position(|s| s == state)
             && !self.toggled.remove(&slot)
         {
             self.toggled.insert(slot);
@@ -119,10 +476,13 @@ impl Model {
     }
 
     /// 프로젝트 고르기의 줄. 첫 줄은 전체이고, 그 뒤에 등록된 프로젝트·세션이 있는 프로젝트·앱을 띄운 프로젝트를
-    /// 폴더 이름순으로 둔다. 승인 대기 세션이 있는 프로젝트(전체는 어느 하나라도)에 `approval`이 켜진다.
+    /// 폴더 이름순으로 둔다. 앱을 띄운 프로젝트가 홈으로 대신한 값이면(`home_fallback`) 넣지 않는다.
+    /// 승인 대기 세션이 있는 프로젝트(전체는 어느 하나라도)에 `approval`이 켜진다.
     pub fn projects(&self) -> Vec<ProjectItem> {
         let mut roots: BTreeMap<&Path, bool> = BTreeMap::new();
-        roots.insert(&self.current_project, false);
+        if !self.home_fallback {
+            roots.insert(&self.current_project, false);
+        }
         for root in &self.registered {
             roots.entry(root).or_insert(false);
         }
@@ -206,9 +566,43 @@ mod tests {
         }
     }
 
-    fn listed(m: &mut Model, sessions: Vec<SessionInfo>) {
-        let effects = m.on_link(LinkEvent::Msg(FromDaemon::Sessions { sessions }));
-        assert!(effects.is_empty());
+    /// 데몬이 목록을 보냈다. 모델이 시킨 일을 돌려준다.
+    fn listed(m: &mut Model, sessions: Vec<SessionInfo>) -> Vec<Effect> {
+        m.on_link(LinkEvent::Msg(FromDaemon::Sessions { sessions }))
+    }
+
+    /// 붙은 모델. 첫 목록은 비어 있어 아무 세션에도 저절로 붙지 않는다.
+    fn connected(project: &str) -> Model {
+        let mut m = Model::new(PathBuf::from(project));
+        m.on_link(LinkEvent::Connected);
+        assert!(listed(&mut m, Vec::new()).is_empty());
+        m
+    }
+
+    fn attach_msg(id: &str) -> Effect {
+        Effect::Send(ToDaemon::Attach {
+            id: id.into(),
+            cols: DEFAULT_GRID.0,
+            rows: DEFAULT_GRID.1,
+        })
+    }
+
+    fn new_msg(project: &str, name: &str, kind: Kind, account: Option<&str>) -> Effect {
+        Effect::Send(ToDaemon::New {
+            spec: NewSession {
+                project: PathBuf::from(project),
+                name: name.into(),
+                kind,
+                account: account.map(str::to_string),
+                model: None,
+            },
+        })
+    }
+
+    fn names(m: &Model, rows: &[usize]) -> Vec<String> {
+        rows.iter()
+            .map(|&i| m.sessions[i].meta.name.clone())
+            .collect()
     }
 
     #[test]
@@ -230,8 +624,7 @@ mod tests {
 
     #[test]
     fn sessions_group_by_state() {
-        let mut m = Model::new(PathBuf::from("/p/mine"));
-        m.on_link(LinkEvent::Connected);
+        let mut m = connected("/p/mine");
         listed(
             &mut m,
             vec![
@@ -249,9 +642,9 @@ mod tests {
         let collapsed: Vec<_> = g.iter().map(|g| g.collapsed).collect();
         assert_eq!(collapsed, [false, false, false, true]);
         // 머리를 누르면 대기 묶음이 펼쳐지고, 다시 누르면 접힌다.
-        m.toggle_group(3);
+        m.toggle_group(&SessionState::Idle);
         assert!(!m.visible_groups()[3].collapsed);
-        m.toggle_group(3);
+        m.toggle_group(&SessionState::Idle);
         assert!(m.visible_groups()[3].collapsed);
         // 프로젝트를 고르면 그 프로젝트의 세션만 묶는다.
         m.filter = Some(PathBuf::from("/p/kyoto"));
@@ -261,9 +654,38 @@ mod tests {
     }
 
     #[test]
+    fn group_toggle_follows_the_clicked_state_not_its_position() {
+        let mut m = connected("/p");
+        listed(
+            &mut m,
+            vec![
+                s("/p", "work", SessionState::Working),
+                s("/p", "idle", SessionState::Idle),
+            ],
+        );
+        // 그린 화면에서 두 번째 머리는 대기 묶음이다.
+        let clicked = m.visible_groups()[1].state.clone();
+        assert_eq!(clicked, SessionState::Idle);
+        // 누르기 전에 새 목록이 와서 승인 대기 묶음이 앞에 끼었다. 두 번째 자리는 이제 작업 중이다.
+        listed(
+            &mut m,
+            vec![
+                s("/p", "ask", SessionState::Approval),
+                s("/p", "work", SessionState::Working),
+                s("/p", "idle", SessionState::Idle),
+            ],
+        );
+        m.toggle_group(&clicked);
+        // 누른 대기 묶음만 바뀐다(STATES 인덱스 3).
+        assert_eq!(m.toggled, HashSet::from([3]));
+        let g = m.visible_groups();
+        assert_eq!(g[2].state, SessionState::Idle);
+        assert!(!g[2].collapsed);
+    }
+
+    #[test]
     fn disconnect_marks_offline() {
-        let mut m = Model::new(PathBuf::from("/p/mine"));
-        m.on_link(LinkEvent::Connected);
+        let mut m = connected("/p/mine");
         listed(&mut m, vec![s("/p/mine", "a", SessionState::Working)]);
         assert!(m.on_link(LinkEvent::Disconnected("끊김".into())).is_empty());
         assert!(!m.connected);
@@ -303,6 +725,317 @@ mod tests {
         );
         let approval: Vec<_> = items.iter().map(|p| p.approval).collect();
         assert_eq!(approval, [true, true, false, false]);
+    }
+
+    #[test]
+    fn home_fallback_is_not_listed_as_a_project() {
+        let mut m = Model::new(PathBuf::from("/Users/me"));
+        m.home_fallback = true;
+        let roots = |m: &Model| -> Vec<_> { m.projects().into_iter().map(|p| p.root).collect() };
+        assert_eq!(roots(&m), [None]);
+        m.registered = vec![PathBuf::from("/p/mine")];
+        assert_eq!(roots(&m), [None, Some(PathBuf::from("/p/mine"))]);
+        // 실행 화면은 그래도 만들 곳이 있다.
+        assert_eq!(m.project(), Path::new("/Users/me"));
+        // 다른 경로로 띄운 앱의 프로젝트는 늘 있다.
+        m.home_fallback = false;
+        assert_eq!(roots(&m).len(), 3);
+    }
+
+    #[test]
+    fn launch_creates_t_n_and_attaches_when_listed() {
+        let mut m = connected("/p");
+        assert_eq!(
+            m.launch(Choice::ClaudeA),
+            [new_msg("/p", "t1", Kind::Claude, Some("claude-a"))]
+        );
+        // 답을 기다리는 동안 다른 줄은 받지 않는다. 같은 이름으로 또 보내 엉키지 않게 한다.
+        assert!(m.launch(Choice::Shell).is_empty());
+        assert!(m.launcher_open());
+        // 만든 세션이 목록에 나타나면 붙고 실행 화면은 닫힌다.
+        assert_eq!(
+            listed(&mut m, vec![s("/p", "t1", SessionState::Idle)]),
+            [attach_msg("k-t1")]
+        );
+        assert_eq!(m.attached.as_deref(), Some("k-t1"));
+        assert!(!m.launcher_open() && m.pending.is_none());
+        // 다음 이름은 t2다. 데몬이 거절하면 사유를 띄우고 다시 고를 수 있다.
+        m.new_task();
+        assert_eq!(
+            m.launch(Choice::Codex),
+            [new_msg("/p", "t2", Kind::Codex, Some("codex"))]
+        );
+        m.on_link(LinkEvent::Msg(FromDaemon::Error {
+            message: "안 된다".into(),
+        }));
+        assert_eq!(m.message.as_deref(), Some("안 된다"));
+        assert_eq!(
+            m.launch(Choice::ClaudeB),
+            [new_msg("/p", "t2", Kind::Claude, Some("claude-b"))]
+        );
+        assert_eq!(m.message, None);
+    }
+
+    #[test]
+    fn launch_needs_the_daemon_and_a_lost_new_does_not_block() {
+        // 연결 전에는 보낸 메시지를 연결 스레드가 버린다. 만들지 않고 사유를 띄운다.
+        let mut m = Model::new(PathBuf::from("/p"));
+        assert!(m.launch(Choice::Shell).is_empty());
+        assert!(m.submit_typed("shell dev").is_empty());
+        assert!(m.pending.is_none());
+        assert!(m.message.as_deref().unwrap().contains("데몬"));
+        // `New`를 보낸 뒤 끊기면 답이 오지 않을 수 있다. 기다림을 풀어 다시 고를 수 있게 한다.
+        m.on_link(LinkEvent::Connected);
+        assert_eq!(m.launch(Choice::Shell).len(), 1);
+        m.on_link(LinkEvent::Disconnected("끊김".into()));
+        assert!(m.pending.is_none());
+        m.on_link(LinkEvent::Connected);
+        assert_eq!(
+            m.launch(Choice::Shell),
+            [new_msg("/p", "t1", Kind::Shell, None)]
+        );
+    }
+
+    #[test]
+    fn a_new_acknowledged_without_a_session_frees_the_launcher() {
+        let mut m = connected("/p");
+        assert_eq!(
+            m.launch(Choice::Shell),
+            [new_msg("/p", "t1", Kind::Shell, None)]
+        );
+        // 답을 기다리는 동안 고르면 만드는 중이라고 알린다.
+        assert!(m.launch(Choice::Codex).is_empty());
+        assert_eq!(m.message.as_deref(), Some("만드는 중이에요"));
+        // 셸이 곧바로 끝나면 데몬은 세션 없이 답한다. 목록이 바뀌지 않아 데몬은 알리지 않고 답만 온다.
+        assert!(listed(&mut m, Vec::new()).is_empty());
+        assert!(m.pending.is_none());
+        assert_eq!(m.message.as_deref(), Some("세션을 시작하지 못했어요"));
+        // 실행 화면이 다시 동작한다.
+        assert!(m.launcher_open());
+        assert_eq!(
+            m.launch(Choice::Shell),
+            [new_msg("/p", "t1", Kind::Shell, None)]
+        );
+        assert_eq!(m.message, None);
+    }
+
+    #[test]
+    fn an_unrelated_list_keeps_waiting_until_the_timeout() {
+        let mut m = connected("/p");
+        m.launch(Choice::Shell);
+        let since = m.pending.as_ref().unwrap().since;
+        // 만드는 사이 다른 세션이 바뀌어 데몬이 알린 목록은 답이 아니다. 계속 기다린다.
+        assert!(listed(&mut m, vec![s("/q", "x", SessionState::Working)]).is_empty());
+        assert!(m.pending.is_some() && m.message.is_none());
+        assert!(!m.expire_pending(since + Duration::from_secs(4)));
+        assert!(m.pending.is_some());
+        // 5초가 넘으면 버리고 알린다.
+        assert!(m.expire_pending(since + PENDING_TIMEOUT));
+        assert!(m.pending.is_none());
+        assert_eq!(m.message.as_deref(), Some("세션을 시작하지 못했어요"));
+        assert!(!m.expire_pending(since + PENDING_TIMEOUT));
+        assert_eq!(m.launch(Choice::Shell).len(), 1);
+    }
+
+    #[test]
+    fn typed_choice_parses_kind_name_and_model() {
+        let mut m = connected("/p");
+        assert!(m.launch(Choice::Typed).is_empty());
+        assert!(m.typing && m.pending.is_none());
+        // 틀린 입력은 상자를 열어 둔 채 사유를 띄운다.
+        assert!(m.submit_typed("gpt x").is_empty());
+        assert!(m.typing);
+        assert!(m.message.as_deref().unwrap().contains("알 수 없는 종류"));
+        let Effect::Send(ToDaemon::New { spec }) = &m.submit_typed("claude-b mine opus")[0] else {
+            panic!("New가 아니다");
+        };
+        assert_eq!(
+            (
+                spec.name.as_str(),
+                spec.account.as_deref(),
+                spec.model.as_deref()
+            ),
+            ("mine", Some("claude-b"), Some("opus"))
+        );
+        assert!(!m.typing && m.message.is_none());
+        let p = m.pending.as_ref().unwrap();
+        assert_eq!(
+            (p.project.as_path(), p.name.as_str()),
+            (Path::new("/p"), "mine")
+        );
+    }
+
+    #[test]
+    fn launch_goes_to_the_selected_or_attached_project() {
+        let mut m = connected("/p/mine");
+        listed(&mut m, vec![s("/p/kyoto", "t1", SessionState::Idle)]);
+        // 전체에서 아무 세션에도 붙지 않았으면 앱을 띄운 프로젝트다.
+        assert_eq!(m.project(), Path::new("/p/mine"));
+        // 전체에서 붙은 세션이 있으면 그 세션의 프로젝트다.
+        m.attach("k-t1");
+        m.new_task();
+        assert_eq!(m.project(), Path::new("/p/kyoto"));
+        assert_eq!(
+            m.launch(Choice::Shell),
+            [new_msg("/p/kyoto", "t2", Kind::Shell, None)]
+        );
+        // 프로젝트를 고르면 그 프로젝트다.
+        m.filter = Some(PathBuf::from("/p/zed"));
+        assert_eq!(m.project(), Path::new("/p/zed"));
+    }
+
+    #[test]
+    fn tabs_follow_selected_project() {
+        let mut m = connected("/p/mine");
+        listed(
+            &mut m,
+            vec![
+                s("/p/mine", "zeta", SessionState::Working),
+                s("/p/kyoto", "kz", SessionState::Idle),
+                s("/p/mine", "alpha", SessionState::Approval),
+                s("/p/mine", "t2", SessionState::Ended),
+            ],
+        );
+        m.filter = Some(PathBuf::from("/p/mine"));
+        assert_eq!(names(&m, &m.tabs()), ["alpha", "t2", "zeta"]);
+        m.filter = Some(PathBuf::from("/p/kyoto"));
+        assert_eq!(names(&m, &m.tabs()), ["kz"]);
+        m.filter = None;
+        assert_eq!(names(&m, &m.tabs()), ["alpha", "kz", "t2", "zeta"]);
+        // ⌘2는 두 번째 탭에 붙고, 없는 탭은 아무것도 하지 않는다.
+        m.filter = Some(PathBuf::from("/p/mine"));
+        assert_eq!(m.select_tab(1), [attach_msg("k-t2")]);
+        assert!(m.select_tab(3).is_empty());
+        assert_eq!(m.attached.as_deref(), Some("k-t2"));
+        // 이미 붙은 탭을 다시 고르면 데몬에 다시 알리지 않는다.
+        assert!(m.select_tab(1).is_empty());
+    }
+
+    #[test]
+    fn step_session_wraps() {
+        let mut m = Model::new(PathBuf::from("/p"));
+        m.on_link(LinkEvent::Connected);
+        // 처음 받은 목록이면 보이는 첫 세션에 붙는다(승인 대기가 먼저다).
+        assert_eq!(
+            listed(
+                &mut m,
+                vec![
+                    s("/p", "a", SessionState::Working),
+                    s("/p", "b", SessionState::Working),
+                    s("/p", "c", SessionState::Approval),
+                    s("/p", "d", SessionState::Idle),
+                ],
+            ),
+            [attach_msg("k-c")]
+        );
+        // 보이는 순서는 c, a, b다. 접힌 대기 묶음의 d는 건너뛴다.
+        let mut visit = |delta| {
+            m.step_session(delta);
+            m.attached.clone().unwrap()
+        };
+        assert_eq!(visit(1), "k-a");
+        assert_eq!(visit(1), "k-b");
+        assert_eq!(visit(1), "k-c");
+        assert_eq!(visit(-1), "k-b");
+        assert_eq!(m.step_session(-1), [attach_msg("k-a")]);
+        // 붙은 세션이 없으면 다음은 처음, 이전은 끝이다.
+        m.attached = None;
+        assert_eq!(m.step_session(1), [attach_msg("k-c")]);
+        m.attached = None;
+        assert_eq!(m.step_session(-1), [attach_msg("k-b")]);
+        // 세션이 하나도 없으면 아무것도 하지 않는다.
+        m.set_filter(Some(PathBuf::from("/q")));
+        assert!(m.step_session(1).is_empty());
+    }
+
+    #[test]
+    fn step_project_cycles_through_the_picker() {
+        let mut m = connected("/p/mine");
+        listed(&mut m, vec![s("/p/kyoto", "t1", SessionState::Idle)]);
+        m.attach("k-t1");
+        // 프로젝트 고르기 순서는 전체, kyoto, mine이다.
+        m.step_project(1);
+        assert_eq!(m.filter, Some(PathBuf::from("/p/kyoto")));
+        assert_eq!(m.attached.as_deref(), Some("k-t1"));
+        // 붙은 세션이 고른 프로젝트 것이 아니면 놓고 실행 화면을 띄운다.
+        m.step_project(1);
+        assert_eq!(m.filter, Some(PathBuf::from("/p/mine")));
+        assert!(m.attached.is_none() && m.launcher_open());
+        m.step_project(1);
+        assert_eq!(m.filter, None);
+        m.step_project(-1);
+        assert_eq!(m.filter, Some(PathBuf::from("/p/mine")));
+    }
+
+    #[test]
+    fn close_requires_confirmation() {
+        let mut m = connected("/p");
+        // 닫을 세션이 없으면 창을 닫는다.
+        assert_eq!(m.close(), Close::Window);
+        listed(&mut m, vec![s("/p", "t1", SessionState::Idle)]);
+        m.attach("k-t1");
+        // 확인 창의 답이 오기 전에는 아무것도 보내지 않고, 창이 떠 있는 동안 ⌘W는 다시 묻지 않는다.
+        assert_eq!(m.close(), Close::Confirm("t1".into()));
+        assert_eq!(m.close(), Close::Nothing);
+        assert!(m.confirm_close(false).is_empty());
+        assert_eq!(m.attached.as_deref(), Some("k-t1"));
+        assert_eq!(m.close(), Close::Confirm("t1".into()));
+        assert_eq!(
+            m.confirm_close(true),
+            [Effect::Send(ToDaemon::Kill { id: "k-t1".into() })]
+        );
+        assert!(m.closing.is_none());
+        // 답이 두 번 와도 한 번만 닫는다.
+        assert!(m.confirm_close(true).is_empty());
+        // 붙은 세션 위에 연 실행 화면은 ⌘W가 실행 화면만 닫는다.
+        m.new_task();
+        assert_eq!(m.close(), Close::Launcher);
+        assert!(!m.launcher_open() && m.closing.is_none());
+        // 닫힌 세션이 목록에서 빠지면 남은 세션이 없으니 실행 화면이 뜬다.
+        assert!(listed(&mut m, Vec::new()).is_empty());
+        assert!(m.attached.is_none() && m.launcher_open());
+    }
+
+    #[test]
+    fn no_session_shows_launcher() {
+        let mut m = Model::new(PathBuf::from("/p"));
+        assert!(m.launcher_open());
+        m.on_link(LinkEvent::Connected);
+        assert!(listed(&mut m, Vec::new()).is_empty());
+        assert!(m.launcher_open() && m.attached.is_none());
+        // 처음 목록 뒤에 나타난 세션에는 저절로 붙지 않는다.
+        assert!(listed(&mut m, vec![s("/p", "t1", SessionState::Idle)]).is_empty());
+        assert!(m.launcher_open());
+        // Esc는 붙은 세션이 없으면 돌아갈 곳이 없어 아무것도 하지 않는다.
+        m.dismiss();
+        assert!(m.launcher_open());
+        m.attach("k-t1");
+        assert!(!m.launcher_open());
+        // ⌘N으로 세션 위에 연 실행 화면은 Esc로 닫는다. 입력 상자가 열려 있으면 먼저 실행 화면으로 돌아간다.
+        m.new_task();
+        assert!(m.launcher_open());
+        m.launch(Choice::Typed);
+        m.dismiss();
+        assert!(!m.typing && m.launcher_open());
+        m.dismiss();
+        assert!(!m.launcher_open());
+        // 붙은 세션이 사라지고 남은 세션도 없으면 실행 화면이 다시 뜬다.
+        assert!(listed(&mut m, Vec::new()).is_empty());
+        assert!(m.attached.is_none() && m.launcher_open());
+    }
+
+    #[test]
+    fn added_project_is_selected_and_home_is_refused() {
+        let mut m = connected("/p/mine");
+        let kyoto = PathBuf::from("/p/kyoto");
+        m.project_added(kyoto.clone(), vec![kyoto.clone()]);
+        assert_eq!(m.filter, Some(kyoto.clone()));
+        assert_eq!(m.registered, std::slice::from_ref(&kyoto));
+        assert!(m.message.is_none());
+        // 등록 목록에 없으면(홈 폴더) 고르지 않고 알린다.
+        m.project_added(PathBuf::from("/Users/me"), vec![kyoto.clone()]);
+        assert_eq!(m.filter, Some(kyoto));
+        assert!(m.message.as_deref().unwrap().contains("홈 폴더"));
     }
 
     #[test]

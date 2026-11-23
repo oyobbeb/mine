@@ -6,7 +6,8 @@ use std::path::Path;
 use crate::session::{NewSession, SessionInfo};
 use crate::view;
 
-/// 시작 화면에서 고를 수 있는 것. `Typed`만 세션을 바로 만들지 않고 상태줄 입력(`Prompt::New`)을 연다.
+/// 시작 화면에서 고를 수 있는 것. `Typed`만 세션을 바로 만들지 않고, 종류·이름·모델을 직접 입력받는다
+/// ([`view::parse_new`] 형식).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Choice {
     ClaudeA,
@@ -14,6 +15,20 @@ pub enum Choice {
     Codex,
     Shell,
     Typed,
+}
+
+impl Choice {
+    /// 종류 말: [`view::parse_new`]의 첫 낱말이다. shell 말고는 세션의 계정 이름(칩)과 같다. 직접 입력(`Typed`)은
+    /// `None`이다.
+    pub const fn word(self) -> Option<&'static str> {
+        match self {
+            Choice::ClaudeA => Some("claude-a"),
+            Choice::ClaudeB => Some("claude-b"),
+            Choice::Codex => Some("codex"),
+            Choice::Shell => Some("shell"),
+            Choice::Typed => None,
+        }
+    }
 }
 
 /// `project`의 세션이 쓰지 않은 가장 작은 `t<N>`(N은 1부터). 끝난 세션의 이름도 쓴 것으로 센다.
@@ -35,14 +50,7 @@ pub fn next_name(sessions: &[SessionInfo], project: &Path) -> String {
 
 /// 고른 줄이 만들 새 세션 명세. `Typed`는 명세가 아니라 입력을 여니 `None`이다.
 pub fn new_session(choice: Choice, name: &str, project: &Path) -> Option<NewSession> {
-    // `view::parse_new`의 종류 말이다. 시작 화면 메뉴 줄의 이름과 같다.
-    let word = match choice {
-        Choice::ClaudeA => "claude-a",
-        Choice::ClaudeB => "claude-b",
-        Choice::Codex => "codex",
-        Choice::Shell => "shell",
-        Choice::Typed => return None,
-    };
+    let word = choice.word()?;
     view::parse_new(&format!("{word} {name}"), project).ok()
 }
 
@@ -112,6 +120,31 @@ mod tests {
             names("/p", &[("/p", "dev", Idle), ("/p", "t01", Idle)]),
             "t1"
         );
+    }
+
+    #[test]
+    fn words_are_the_parse_new_kinds() {
+        use Choice::*;
+        let words: Vec<_> = [ClaudeA, ClaudeB, Codex, Shell, Typed]
+            .into_iter()
+            .map(Choice::word)
+            .collect();
+        assert_eq!(
+            words,
+            [
+                Some("claude-a"),
+                Some("claude-b"),
+                Some("codex"),
+                Some("shell"),
+                None
+            ]
+        );
+        // 넷 모두 `parse_new`가 받는 말이고, 계정은 shell만 없다.
+        for c in [ClaudeA, ClaudeB, Codex, Shell] {
+            let word = c.word().unwrap();
+            let spec = view::parse_new(&format!("{word} x"), Path::new("/p")).unwrap();
+            assert_eq!(spec.account.as_deref(), (c != Shell).then_some(word));
+        }
     }
 
     #[test]

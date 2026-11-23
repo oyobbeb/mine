@@ -81,15 +81,17 @@ fn color(root: &Path) -> usize {
     u64::from_str_radix(&key[..8], 16).map_or(0, |n| (n % PROJECT_COLORS.len() as u64) as usize)
 }
 
+/// 목록 묶음의 상태 순서. [`Group::state`]는 늘 이 넷 중 하나다(Ended는 Done 묶음에 든다).
+pub const STATES: [SessionState; 4] = [
+    SessionState::Approval,
+    SessionState::Working,
+    SessionState::Done,
+    SessionState::Idle,
+];
+
 /// 상태별 묶음. Approval, Working, Done(Ended 포함), Idle 순서이고 빈 묶음은 뺀다.
 /// 묶음 안은 이름순이다. Idle만 처음에 접혀 있다. `filter`가 있으면 그 프로젝트 세션만 남긴다.
 pub fn groups(sessions: &[SessionInfo], filter: Option<&Path>) -> Vec<Group> {
-    const STATES: [SessionState; 4] = [
-        SessionState::Approval,
-        SessionState::Working,
-        SessionState::Done,
-        SessionState::Idle,
-    ];
     let mut rows: [Vec<usize>; 4] = Default::default();
     for (i, s) in sessions.iter().enumerate() {
         if filter.is_some_and(|p| s.meta.project != p) {

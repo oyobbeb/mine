@@ -104,6 +104,10 @@ pub fn install(cx: &mut App) {
     t.scrollbar = hsla(LIST_BG);
     t.scrollbar_thumb = hsla(SELECTED_BG);
     t.scrollbar_thumb_hover = hsla(BORDER);
+    // 입력 상자(실행 화면의 `n`): 테두리는 경계색, 포커스 테두리는 흐린 글색, 커서는 글색이다.
+    t.input = hsla(BORDER);
+    t.ring = hsla(MUTED);
+    t.caret = hsla(TEXT);
 }
 
 #[cfg(test)]

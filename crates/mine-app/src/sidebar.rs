@@ -1,4 +1,5 @@
-//! 왼쪽 목록: 새 작업, 프로젝트 고르기, 상태별 세션 묶음, 프로젝트 추가. 상태는 모두 `Model`에 있고 여기서는 그리기만 한다.
+//! 왼쪽 목록: 새 작업, 프로젝트 고르기, 상태별 세션 묶음, 프로젝트 추가. 상태는 모두 `Model`에 있고 여기서는 그리고
+//! 누름을 `Workspace`에 잇기만 한다.
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
@@ -27,14 +28,18 @@ pub fn render(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
                 .pt_3()
                 .text_size(px(12.))
                 .text_color(rgb(FAINT))
-                .child("세션 없음")
+                .child("세션이 없어요")
                 .into_any_element(),
         );
     }
     for (gi, g) in groups.iter().enumerate() {
         list.push(group_head(gi, g, cx).into_any_element());
         if !g.collapsed {
-            list.extend(g.rows.iter().map(|&i| session_row(m, i).into_any_element()));
+            list.extend(
+                g.rows
+                    .iter()
+                    .map(|&i| session_row(m, i, cx).into_any_element()),
+            );
         }
     }
     v_flex()
@@ -49,7 +54,7 @@ pub fn render(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
         .when_some(m.offline.as_deref(), |this, reason| {
             this.child(offline_banner(reason))
         })
-        .child(new_task())
+        .child(new_task(cx))
         .child(project_picker(m, ws.picker_open, cx))
         .child(
             v_flex()
@@ -58,7 +63,7 @@ pub fn render(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
                 .min_h_0()
                 .child(div().pb_2().children(list).scrollable(Axis::Vertical)),
         )
-        .child(add_project())
+        .child(add_project(cx))
 }
 
 /// 연결이 끊긴 동안 목록 위에 두는 띠. 끊긴 사유(버전이 다르면 데몬을 다시 띄우는 방법)를 아래에 작게 적는다.
@@ -74,7 +79,7 @@ fn offline_banner(reason: &str) -> impl IntoElement {
             div()
                 .text_size(px(12.))
                 .text_color(rgb(WAITING))
-                .child("데몬 연결이 끊겼다 · 다시 연결 중"),
+                .child("데몬 연결이 끊겼어요 · 다시 연결하는 중이에요"),
         )
         .child(
             div()
@@ -84,17 +89,21 @@ fn offline_banner(reason: &str) -> impl IntoElement {
         )
 }
 
-/// "＋ 새 작업". 누르면 실행 화면을 여는 동작은 Task 3이 붙인다.
-fn new_task() -> impl IntoElement {
+/// "＋ 새 작업". 누르면 실행 화면을 연다(⌘N과 같다).
+fn new_task(cx: &mut Context<Workspace>) -> impl IntoElement {
     h_flex()
+        .id("new-task")
         .mx_2()
         .mt_2()
         .px_2()
         .h(px(30.))
         .rounded(px(6.))
         .text_size(px(13.))
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(SELECTED_BG)))
         .child(div().flex_1().text_color(rgb(TITLE)).child("＋ 새 작업"))
         .child(div().text_size(px(12.)).text_color(rgb(FAINT)).child("⌘N"))
+        .on_click(cx.listener(|ws, _, window, cx| ws.new_task(window, cx)))
 }
 
 /// 프로젝트 고르기. 누르면 아래로 펼쳐 "전체"와 프로젝트들을 보이고, 고르면 접는다.
@@ -200,10 +209,15 @@ fn group_head(gi: usize, g: &Group, cx: &mut Context<Workspace>) -> impl IntoEle
                 .child(model::group_label(&g.state)),
         )
         .child(div().text_color(rgb(FAINT)).child(g.rows.len().to_string()))
-        .on_click(cx.listener(move |ws, _, _, cx| ws.toggle_group(gi, cx)))
+        .on_click({
+            // 자리가 아니라 상태를 쥔다. 그린 뒤 새 목록이 와 묶음이 밀려도 누른 묶음을 바꾼다.
+            let state = g.state.clone();
+            cx.listener(move |ws, _, _, cx| ws.toggle_group(&state, cx))
+        })
 }
 
-fn state_color(state: &SessionState) -> u32 {
+/// 상태 기호의 색. 탭도 같은 색을 쓴다.
+pub fn state_color(state: &SessionState) -> u32 {
     match state {
         SessionState::Approval => APPROVAL,
         SessionState::Working => WORKING,
@@ -212,9 +226,11 @@ fn state_color(state: &SessionState) -> u32 {
     }
 }
 
-/// 세션 줄. 첫 줄은 이름과 칩, 둘째 줄은 `프로젝트 · 대기 문구 또는 상태`다.
-fn session_row(m: &Model, i: usize) -> impl IntoElement {
+/// 세션 줄. 첫 줄은 이름과 칩, 둘째 줄은 `프로젝트 · 대기 문구 또는 상태`다. 누르면 그 세션에 붙는다.
+fn session_row(m: &Model, i: usize, cx: &mut Context<Workspace>) -> impl IntoElement {
     let s: &SessionInfo = &m.sessions[i];
+    // 자리가 아니라 id를 쥔다. 그린 뒤 새 목록이 와 줄이 밀려도 누른 세션에 붙는다.
+    let id = s.meta.id.clone();
     let selected = m.attached.as_ref() == Some(&s.meta.id);
     let (status, waiting) = model::status_text(s);
     v_flex()
@@ -224,7 +240,10 @@ fn session_row(m: &Model, i: usize) -> impl IntoElement {
         .py_1p5()
         .gap_0p5()
         .rounded(px(6.))
+        .cursor_pointer()
         .when(selected, |this| this.bg(rgb(SELECTED_BG)))
+        .hover(|s| s.bg(rgb(SELECTED_BG)))
+        .on_click(cx.listener(move |ws, _, window, cx| ws.attach(&id, window, cx)))
         .child(
             h_flex()
                 .gap_2()
@@ -276,9 +295,10 @@ pub fn account_chip(account: Option<&str>) -> Option<impl IntoElement + use<>> {
     )
 }
 
-/// "＋ 프로젝트 추가". 폴더를 골라 등록하는 동작은 Task 3이 붙인다.
-fn add_project() -> impl IntoElement {
+/// "＋ 프로젝트 추가". 누르면 폴더를 골라 프로젝트로 등록한다.
+fn add_project(cx: &mut Context<Workspace>) -> impl IntoElement {
     h_flex()
+        .id("add-project")
         .flex_shrink_0()
         .px_3()
         .h(px(36.))
@@ -286,5 +306,8 @@ fn add_project() -> impl IntoElement {
         .border_color(rgb(BORDER))
         .text_size(px(12.))
         .text_color(rgb(FAINT))
+        .cursor_pointer()
+        .hover(|s| s.text_color(rgb(TEXT)))
         .child("＋ 프로젝트 추가")
+        .on_click(cx.listener(|ws, _, _, cx| ws.add_project(cx)))
 }
