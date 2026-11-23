@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use mine::proto::{HoldIn, HoldOut, read_msg, write_msg};
+use mine_core::proto::{HoldIn, HoldOut, read_msg, write_msg};
 
 /// 소켓 읽기와 출력 찾기가 기다리는 최대 시간.
 const READ_WAIT: Duration = Duration::from_secs(3);

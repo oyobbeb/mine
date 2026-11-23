@@ -4,6 +4,8 @@
 //! 바깥 터미널은 붙은 세션이 켠 키 인코딩(kitty 키보드, modifyOtherKeys)으로 키를 보낸다. 그래서 `⌃a`와
 //! 그 뒤 명령 키는 0x01·글자 바이트로도, `CSI 97;5u`·`CSI 27;5;97~` 같은 인코딩된 키로도 온다.
 
+use mine_core::select::{MouseEv, MouseKind};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cmd {
     NextSession,
@@ -16,24 +18,6 @@ pub enum Cmd {
     ToggleList,
     CopyMode,
     Detach,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MouseKind {
-    Down,
-    Up,
-    Drag,
-    WheelUp,
-    WheelDown,
-}
-
-/// 마우스 이벤트. 좌표는 0부터 센다.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MouseEv {
-    pub kind: MouseKind,
-    pub button: u8,
-    pub col: u16,
-    pub row: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

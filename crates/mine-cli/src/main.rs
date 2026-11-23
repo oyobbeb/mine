@@ -2,10 +2,14 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use mine::conn::Conn;
-use mine::proto::{FromDaemon, ToDaemon};
-use mine::session::{Kind, NewSession, SessionInfo, SessionState, session_id};
-use mine::{client, daemon, hold, hooks, paths, project};
+use mine_core::conn::Conn;
+use mine_core::proto::{FromDaemon, ToDaemon};
+use mine_core::session::{Kind, NewSession, SessionInfo, SessionState, session_id};
+use mine_core::{hooks, paths, project};
+
+mod client;
+mod daemon;
+mod hold;
 
 #[derive(Parser)]
 #[command(name = "mine", version, about = "AI 코딩 에이전트 세션 멀티플렉서")]

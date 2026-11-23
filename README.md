@@ -23,7 +23,7 @@ flowchart LR
 Rust 1.89 이상이 필요합니다. 세션 종류에 맞는 CLI(`claude`, `codex`)는 따로 설치하고 로그인해 두세요. 저장소 루트에서 실행합니다.
 
 ```sh
-cargo install --path .
+cargo install --path crates/mine-cli
 ```
 
 `~/.cargo/bin`이 PATH에 있어야 합니다. 새 셸에서 `command -v mine`으로 확인하세요. 예전에 Python 프로토타입을 쓰려고 `~/.local/bin/mine` 링크를 만들었다면 지우세요. 그 링크는 이제 없는 스크립트를 가리켜 `mine`이 실행되지 않습니다.
@@ -39,7 +39,7 @@ rm ~/.local/bin/mine
 새 버전을 설치해도 이미 떠 있는 데몬은 옛 코드로 계속 돈다. 설치한 뒤 데몬을 한 번 끝내면 다음 `mine`이 새 데몬을 띄운다. 저장소 루트에서 실행한다.
 
 ```sh
-cargo install --path .
+cargo install --path crates/mine-cli
 kill "$(cat ~/.mine/daemon.pid)"    # MINE_STATE_DIR를 쓰면 kill "$(cat "$MINE_STATE_DIR/daemon.pid")"
 mine
 ```
@@ -149,7 +149,7 @@ claude-a는 지금의 `~/.claude`를 그대로 쓴다. 설계 5.9의 `config.tom
 - 5단계: 원격 호스트
 - 6단계: 마스터 세션
 - 7단계: 브라우저 칸
-- 8단계: 설치 한 줄로 PATH에 넣는 배포(Homebrew). 그 전까지는 `cargo install --path .`를 쓴다.
+- 8단계: 설치 한 줄로 PATH에 넣는 배포(Homebrew). 그 전까지는 `cargo install --path crates/mine-cli`를 쓴다.
 
 **알려진 한계(설계 5.12).** 안쪽 앱이 켠 키보드 모드(modifyOtherKeys, kitty 키보드, DECCKM)는 바깥 터미널로 넘긴다. kitty 키보드의 키 뗌·반복 보고(플래그 2)만은 넘기지 않는다. Shift+Enter와 한글 조합 위치는 tmux로만 확인했고, Ghostty에서의 확인이 남았다. kitty 이미지 깜박임, 입력 지연 체감, Ghostty에서의 Codex 색도 아직 Ghostty에서 확인하지 못했다.
 
@@ -159,7 +159,7 @@ claude-a는 지금의 `~/.claude`를 그대로 쓴다. 설계 5.9의 `config.tom
 
 1. 작업 시작 시 GitButler의 `but status -fv`로 현재 브랜치와 다른 작업자의 변경을 확인한다. 새 작업은 최신 `dev` 위에서 시작하고, 서로 의존하는 커밋은 의존 순서대로 쌓는다.
 2. 한 커밋은 독립적으로 설명하고 되돌릴 수 있는 동작 하나를 담는다. 그 동작에 필요한 테스트와 호환 처리를 함께 넣는다. 저장 형식을 바꾸면 기존 작업 기록을 읽는지와 이전 버전으로 복귀했을 때 데이터에 미치는 영향도 확인한다.
-3. 각 커밋의 파일 상태에서 `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test`를 실행한다. 동작을 바꿨다면 영향을 받는 CLI 진입점도 검증한다. 나중 커밋에 들어갈 미커밋 변경이 있다면 임시 worktree에서 해당 커밋만 검증한다. 중간 커밋이 깨지면 공개 전에 원인이 속한 커밋을 고치고 이후 커밋까지 재검증한다.
+3. 각 커밋의 파일 상태에서 `cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace`를 실행한다. 동작을 바꿨다면 영향을 받는 CLI 진입점도 검증한다. 나중 커밋에 들어갈 미커밋 변경이 있다면 임시 worktree에서 해당 커밋만 검증한다. 중간 커밋이 깨지면 공개 전에 원인이 속한 커밋을 고치고 이후 커밋까지 재검증한다.
 4. 병행 작업은 공개 전 최신 `dev` 위로 rebase하고 테스트한 뒤 fast-forward로 반영한다. 릴리스할 때는 검증한 `dev`까지 `main`을 fast-forward한다. 분기 때문에 fast-forward가 불가능하면 먼저 차이를 검토한다. 이미 공유된 브랜치의 강제 푸시나 이력 재작성은 소유자와 합의한다.
 5. 공유 후 롤백은 동작을 취소하는 새 커밋으로 기록한다. 의존하는 변경을 함께 되돌릴 때는 최신 커밋부터 역순으로 처리하고 같은 테스트를 실행한다. 코드 롤백과 작업 기록·외부 시스템의 복구는 별도로 확인한다.
 

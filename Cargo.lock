@@ -893,7 +893,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "mine"
+name = "mine-cli"
 version = "0.1.0"
 dependencies = [
  "alacritty_terminal",
@@ -901,8 +901,22 @@ dependencies = [
  "base64 0.23.1",
  "clap",
  "libc",
+ "mine-core",
  "portable-pty",
  "ratatui",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "mine-core"
+version = "0.1.0"
+dependencies = [
+ "alacritty_terminal",
+ "anyhow",
+ "base64 0.23.1",
+ "libc",
  "serde",
  "serde_json",
  "sha2 0.11.1",

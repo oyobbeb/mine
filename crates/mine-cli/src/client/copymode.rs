@@ -8,8 +8,9 @@ use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::{Cell, Flags};
 
 use super::input::HANGUL_HINT;
-use super::select::Selection;
-use crate::screen::Screen;
+use mine_core::screen::Screen;
+use mine_core::search::find;
+use mine_core::select::Selection;
 
 /// 키 하나를 먹은 결과.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -51,29 +52,6 @@ pub struct CopyMode {
     /// 줄 바꿈으로 다음 줄에 이어지는 줄의, 줄 수에서 잘려 나간 오른쪽 공백 수. 이어지지 않는 줄은 `None`이다.
     /// 복사할 때 이런 줄은 공백을 되살려 `\n` 없이 다음 줄에 붙인다.
     wraps: Vec<Option<usize>>,
-}
-
-/// 두 글자가 대소문자를 빼면 같은가. 소문자가 여러 글자로 풀리는 글자(`İ`)도 글자 단위로 견준다.
-fn same(a: char, b: char) -> bool {
-    a == b || a.to_lowercase().eq(b.to_lowercase())
-}
-
-/// `query`가 시작하는 곳을 (줄, 글자 위치)로 모두 모은다. 대소문자는 가리지 않고, 겹쳐도 센다.
-pub fn find(lines: &[String], query: &str) -> Vec<(usize, usize)> {
-    let query: Vec<char> = query.chars().collect();
-    if query.is_empty() {
-        return Vec::new();
-    }
-    let mut hits = Vec::new();
-    for (i, line) in lines.iter().enumerate() {
-        let chars: Vec<char> = line.chars().collect();
-        for (at, window) in chars.windows(query.len()).enumerate() {
-            if query.iter().zip(window).all(|(&q, &c)| same(q, c)) {
-                hits.push((i, at));
-            }
-        }
-    }
-    hits
 }
 
 /// 이 줄의 글자 수.
@@ -393,7 +371,7 @@ pub fn freeze(screen: &Screen) -> (Vec<String>, CopyMode) {
 }
 
 /// `lines`(`history_text`)의 줄마다, 자동 줄 바꿈으로 다음 줄에 이어졌으면 `history_text`가 뗀 오른쪽 공백 수를 돌려준다.
-/// 이어졌는지는 `select::selected_text`와 같게 줄 끝 칸의 `WRAPLINE`으로 본다.
+/// 이어졌는지는 `mine_core::select::selected_text`와 같게 줄 끝 칸의 `WRAPLINE`으로 본다.
 fn wrap_pads(screen: &Screen, lines: &[String]) -> Vec<Option<usize>> {
     let grid = screen.term().grid();
     let cols = grid.columns();
@@ -528,25 +506,6 @@ mod tests {
 
     fn at(c: &CopyMode) -> (usize, usize) {
         (c.line, c.col)
-    }
-
-    #[test]
-    fn find_is_case_insensitive() {
-        assert_eq!(
-            find(&l(&["Error a", "ok", "x error"]), "error"),
-            vec![(0, 0), (2, 2)]
-        );
-    }
-
-    #[test]
-    fn find_reports_every_match_by_char_index() {
-        // 한 줄에 여럿(겹쳐도), 한글, 소문자로 바꾸면 바이트 길이가 달라지는 `İ`(2바이트 → 3바이트)가 앞에 있어도 글자 위치다.
-        assert_eq!(find(&l(&["abab", "aaa"]), "ab"), vec![(0, 0), (0, 2)]);
-        assert_eq!(find(&l(&["aaa"]), "aa"), vec![(0, 0), (0, 1)]);
-        assert_eq!(find(&l(&["가나다 나", "İ Ab"]), "나"), vec![(0, 1), (0, 4)]);
-        assert_eq!(find(&l(&["İ Ab"]), "ab"), vec![(0, 2)]);
-        assert_eq!(find(&l(&["abc"]), ""), vec![]);
-        assert_eq!(find(&l(&["ab"]), "abc"), vec![]);
     }
 
     #[test]

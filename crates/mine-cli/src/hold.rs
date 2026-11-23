@@ -34,7 +34,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 
-use crate::proto::{HOLD_VERSION, HoldIn, HoldOut, read_msg, write_msg};
+use mine_core::proto::{HOLD_VERSION, HoldIn, HoldOut, read_msg, write_msg};
 
 /// 재연결한 데몬에 되돌려 줄 최근 출력의 최대 바이트 수.
 pub const RING_CAP: usize = 2 * 1024 * 1024;

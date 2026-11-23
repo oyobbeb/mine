@@ -14,10 +14,11 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::client::launcher::{self, Choice};
-use crate::client::view::{self, Group, NEW_USAGE, PROJECT_COLORS, RailItem};
-use crate::screen::Screen;
-use crate::session::{SessionInfo, SessionState};
+use crate::client::launcher;
+use mine_core::launch::Choice;
+use mine_core::screen::Screen;
+use mine_core::session::{SessionInfo, SessionState};
+use mine_core::view::{self, Group, NEW_USAGE, PROJECT_COLORS, RailItem};
 
 /// 화면에 그릴 클라이언트 상태.
 pub struct Model {
@@ -651,7 +652,7 @@ fn draw_status(f: &mut Frame, area: Rect, m: &Model) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::{Kind, Meta, Restore, SessionState::*};
+    use mine_core::session::{Kind, Meta, Restore, SessionState::*};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::{Buffer, Cell};

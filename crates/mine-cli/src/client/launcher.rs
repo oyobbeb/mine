@@ -1,7 +1,7 @@
 //! 시작 화면(런처). 붙은 세션이 없거나 `⌃a c`를 눌렀을 때 터미널 칸 가운데에 그리는, 키 하나로 세션을 시작하는 메뉴.
-//! 키 해석·새 이름 정하기·줄 위치 판정 같은 순수 함수와 그리기만 맡고, 상태와 `New` 전송은 `App`이 한다.
+//! 키 해석·줄 위치 판정 같은 순수 함수와 그리기만 맡고, 상태와 `New` 전송은 `App`이 한다.
+//! 새 이름 정하기와 고른 줄의 세션 명세는 `mine_core::launch`에 있다.
 
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use ratatui::buffer::Buffer;
@@ -9,24 +9,15 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
+use mine_core::launch::{Choice, tilde};
+use mine_core::view::folder_name;
+
 use crate::client::ui::{HEAD, MUTED, chip};
-use crate::client::view::{self, folder_name};
-use crate::session::{NewSession, SessionInfo};
 
 /// 시작 화면이 열려 있을 때 상태줄 오른쪽 키 안내.
 pub const KEYS: &str = "↵ claude-a · b claude-b · x codex · s shell";
 
-/// 시작 화면에서 고를 수 있는 것. `Typed`만 세션을 바로 만들지 않고 상태줄 입력(`Prompt::New`)을 연다.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Choice {
-    ClaudeA,
-    ClaudeB,
-    Codex,
-    Shell,
-    Typed,
-}
-
-/// 메뉴 줄: (선택, 키 표시, 이름). 앞의 넷은 이름이 `view::parse_new`의 종류 말이자 칩의 계정 이름이다.
+/// 메뉴 줄: (선택, 키 표시, 이름). 앞의 넷은 이름이 `mine_core::launch::new_session`이 쓰는 종류 말이자 칩의 계정 이름이다.
 const ROWS: [(Choice, &str, &str); 5] = [
     (Choice::ClaudeA, "↵", "claude-a"),
     (Choice::ClaudeB, "b", "claude-b"),
@@ -56,44 +47,6 @@ pub fn choice_of_key(bytes: &[u8]) -> Option<Choice> {
         b"n" => Choice::Typed,
         _ => return None,
     })
-}
-
-/// `project`의 세션이 쓰지 않은 가장 작은 `t<N>`(N은 1부터). 끝난 세션의 이름도 쓴 것으로 센다.
-pub fn next_name(sessions: &[SessionInfo], project: &Path) -> String {
-    let used: HashSet<&str> = sessions
-        .iter()
-        .filter(|s| s.meta.project == project)
-        .map(|s| s.meta.name.as_str())
-        .collect();
-    let mut n = 1;
-    loop {
-        let name = format!("t{n}");
-        if !used.contains(name.as_str()) {
-            return name;
-        }
-        n += 1;
-    }
-}
-
-/// 고른 줄이 만들 새 세션 명세. `Typed`는 명세가 아니라 입력을 여니 `None`이다.
-pub fn new_session(choice: Choice, name: &str, project: &Path) -> Option<NewSession> {
-    let (_, _, word) = ROWS.iter().find(|(c, ..)| *c == choice)?;
-    if choice == Choice::Typed {
-        return None;
-    }
-    view::parse_new(&format!("{word} {name}"), project).ok()
-}
-
-/// 홈 아래 경로의 홈 부분을 `~`로 줄인다. 홈이 `/`나 빈 값이면 줄이지 않는다.
-pub fn tilde(path: &Path, home: Option<&Path>) -> String {
-    let rest = home
-        .filter(|h| h.parent().is_some())
-        .and_then(|h| path.strip_prefix(h).ok());
-    match rest {
-        Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
-        Some(rest) => format!("~/{}", rest.display()),
-        None => path.display().to_string(),
-    }
 }
 
 /// 메뉴 본문 줄들. 프로젝트와 무관하다.
@@ -163,57 +116,7 @@ pub fn draw(buf: &mut Buffer, term: Rect, project: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::{Kind, Meta, Restore, SessionState};
     use ratatui::style::Color;
-
-    fn session(project: &str, name: &str, state: SessionState) -> SessionInfo {
-        SessionInfo {
-            meta: Meta {
-                id: format!("{project}-{name}"),
-                project: PathBuf::from(project),
-                name: name.into(),
-                kind: Kind::Shell,
-                account: None,
-                model: None,
-                restore: Restore::None,
-                created_ms: 0,
-                resume_id: None,
-                closed: false,
-            },
-            state,
-            waiting: None,
-            alive: true,
-        }
-    }
-
-    fn names(project: &str, sessions: &[(&str, &str, SessionState)]) -> String {
-        let list: Vec<_> = sessions
-            .iter()
-            .map(|(p, n, st)| session(p, n, st.clone()))
-            .collect();
-        next_name(&list, Path::new(project))
-    }
-
-    #[test]
-    fn next_name_is_the_lowest_unused_t_number_in_the_project() {
-        use SessionState::*;
-        assert_eq!(names("/p", &[]), "t1");
-        assert_eq!(names("/p", &[("/p", "t1", Idle)]), "t2");
-        // 빈 자리를 채운다.
-        assert_eq!(names("/p", &[("/p", "t1", Idle), ("/p", "t3", Idle)]), "t2");
-        // 끝난 세션의 이름도 쓴 것으로 센다.
-        assert_eq!(
-            names("/p", &[("/p", "t1", Ended), ("/p", "t2", Done)]),
-            "t3"
-        );
-        // 다른 프로젝트의 세션은 세지 않는다.
-        assert_eq!(names("/p", &[("/q", "t1", Idle), ("/q", "t2", Idle)]), "t1");
-        // `t<N>` 꼴이 아닌 이름과 앞에 0이 붙은 이름은 `t1`을 막지 않는다.
-        assert_eq!(
-            names("/p", &[("/p", "dev", Idle), ("/p", "t01", Idle)]),
-            "t1"
-        );
-    }
 
     #[test]
     fn keys_choose_one_row_and_everything_else_is_ignored() {
@@ -245,50 +148,6 @@ mod tests {
             let bytes: &[u8] = if key == "↵" { b"\r" } else { key.as_bytes() };
             assert_eq!(k(bytes), Some(choice), "{key}");
         }
-    }
-
-    #[test]
-    fn choices_become_new_session_specs() {
-        let spec = |c, name| new_session(c, name, Path::new("/p"));
-        let got = |c| {
-            let s = spec(c, "t4").unwrap();
-            (s.kind, s.account, s.name, s.model, s.project)
-        };
-        let p = PathBuf::from("/p");
-        assert_eq!(
-            got(Choice::ClaudeA),
-            (
-                Kind::Claude,
-                Some("claude-a".into()),
-                "t4".into(),
-                None,
-                p.clone()
-            )
-        );
-        assert_eq!(got(Choice::ClaudeB).1.as_deref(), Some("claude-b"));
-        assert_eq!(
-            (got(Choice::Codex).0, got(Choice::Codex).1.as_deref()),
-            (Kind::Codex, Some("codex"))
-        );
-        assert_eq!(
-            (got(Choice::Shell).0, got(Choice::Shell).1),
-            (Kind::Shell, None)
-        );
-        assert!(spec(Choice::Typed, "t4").is_none());
-    }
-
-    #[test]
-    fn tilde_abbreviates_only_paths_under_home() {
-        let home = Some(Path::new("/Users/me"));
-        let t = |p: &str, h| tilde(Path::new(p), h);
-        assert_eq!(t("/Users/me/dev/mine", home), "~/dev/mine");
-        assert_eq!(t("/Users/me", home), "~");
-        assert_eq!(t("/Users/me2/dev", home), "/Users/me2/dev");
-        assert_eq!(t("/srv/app", home), "/srv/app");
-        assert_eq!(t("/Users/me/dev", None), "/Users/me/dev");
-        // 홈이 `/`나 빈 값이면 모든 경로를 `~`로 줄이지 않는다.
-        assert_eq!(t("/srv/app", Some(Path::new("/"))), "/srv/app");
-        assert_eq!(t("/srv/app", Some(Path::new(""))), "/srv/app");
     }
 
     /// 터미널 칸. 위치가 (34, 0)이 아니어도 가운데에 와야 한다.

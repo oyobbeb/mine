@@ -9,7 +9,6 @@ pub mod launcher;
 pub mod select;
 mod tty;
 pub mod ui;
-pub mod view;
 
 use std::io::{self, BufWriter, Write};
 use std::path::PathBuf;
@@ -28,14 +27,19 @@ use ratatui::text::Span;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::conn::Conn;
-use crate::paths::State;
-use crate::proto::{FromDaemon, ToDaemon};
-use crate::screen::Screen;
-use crate::session::{NewSession, SessionInfo};
 use copymode::{CopyMode, CopyOut};
-use input::{Action, Cmd, InputParser, MouseEv, MouseKind};
-use launcher::Choice;
+use input::{Action, Cmd, InputParser};
+use mine_core::conn::Conn;
+use mine_core::keys::KeyModes;
+use mine_core::launch::{self, Choice};
+use mine_core::paths::State;
+use mine_core::proto::{FromDaemon, ToDaemon};
+use mine_core::screen::Screen;
+use mine_core::select::{
+    MouseEv, MouseKind, encode_sgr, selected_text, session_takes, wants_mouse,
+};
+use mine_core::session::{NewSession, SessionInfo};
+use mine_core::view;
 use select::Select;
 use ui::{Hit, LinkRun, Model, Prompt};
 
@@ -116,32 +120,6 @@ pub async fn run(state: State, project: PathBuf) -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// 바깥 터미널(Ghostty)에 건 키 인코딩 모드. 붙은 세션이 켠 모드를 따라 걸어, 키가 세션이 바란 인코딩으로 온다.
-/// 그래야 Claude Code의 Shift+Enter가 CR이 아닌 인코딩된 키로 간다.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-struct KeyModes {
-    /// DECCKM(`CSI ? 1 h`): 화살표를 `ESC O A`로 보낸다.
-    app_cursor: bool,
-    /// DECKPAM(`ESC =`): 숫자판을 응용 모드로 보낸다.
-    app_keypad: bool,
-    /// xterm modifyOtherKeys 단계(0~2).
-    modify_other_keys: u8,
-    /// kitty 키보드 플래그.
-    kitty: u8,
-}
-
-impl KeyModes {
-    fn of(screen: &Screen) -> KeyModes {
-        let mode = screen.mode();
-        KeyModes {
-            app_cursor: mode.contains(TermMode::APP_CURSOR),
-            app_keypad: mode.contains(TermMode::APP_KEYPAD),
-            modify_other_keys: screen.modify_other_keys(),
-            kitty: screen.kitty_flags(),
-        }
-    }
 }
 
 /// 바깥에 거는 kitty 플래그.
@@ -626,14 +604,14 @@ impl App {
         let Some(screen) = &mut self.screen else {
             return;
         };
-        if select::wants_mouse(screen) {
-            if select::session_takes(screen, &ev) {
+        if wants_mouse(screen) {
+            if session_takes(screen, &ev) {
                 match ev.kind {
                     MouseKind::Down => self.held = true,
                     MouseKind::Up => self.held = false,
                     _ => {}
                 }
-                self.forward(select::encode_sgr(&ev, at.0, at.1));
+                self.forward(encode_sgr(&ev, at.0, at.1));
             }
             return;
         }
@@ -665,7 +643,7 @@ impl App {
                 let sel = self.select.up(at);
                 let text = sel
                     .zip(self.screen.as_ref())
-                    .map(|(sel, screen)| select::selected_text(screen, &sel));
+                    .map(|(sel, screen)| selected_text(screen, &sel));
                 if let Some((osc, message)) = text.as_deref().and_then(select::copy) {
                     self.clipboard.extend(osc);
                     self.say(&message);
@@ -880,8 +858,8 @@ impl App {
             return;
         }
         let project = self.m.project().to_path_buf();
-        let name = launcher::next_name(&self.m.sessions, &project);
-        if let Some(spec) = launcher::new_session(choice, &name, &project) {
+        let name = launch::next_name(&self.m.sessions, &project);
+        if let Some(spec) = launch::new_session(choice, &name, &project) {
             self.create(spec);
         }
     }
@@ -1059,7 +1037,7 @@ mod tests {
     use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
     use super::*;
-    use crate::session::Kind;
+    use mine_core::session::Kind;
 
     /// 바깥 터미널 120x40, 목록이 열려 터미널 칸은 (34, 0)에서 86x39다. 세션 `s1`에 붙어 있고 화면에 `feed`를 먹였다.
     fn app(feed: &[u8]) -> (App, UnboundedReceiver<ToDaemon>) {
@@ -1939,7 +1917,7 @@ mod tests {
     }
 
     fn shell(name: &str) -> SessionInfo {
-        use crate::session::{Kind, Meta, Restore, SessionState};
+        use mine_core::session::{Kind, Meta, Restore, SessionState};
         SessionInfo {
             meta: Meta {
                 id: format!("p-{name}"),
@@ -1980,7 +1958,7 @@ mod tests {
 
     /// 시작 화면이 `/p`에 만들라고 보내는 `New`.
     fn new_session(kind: Kind, account: Option<&str>, name: &str) -> ToDaemon {
-        use crate::session::NewSession;
+        use mine_core::session::NewSession;
         ToDaemon::New {
             spec: NewSession {
                 project: PathBuf::from("/p"),

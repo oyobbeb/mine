@@ -32,14 +32,14 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::AbortHandle;
 use tokio::time::timeout;
 
-use crate::conn::restart_hint;
 use crate::hold;
-use crate::hooks::{self, Event, EventKind, now_ms};
-use crate::paths::{State, check_sock_path, ensure_dir};
-use crate::project::{self, project_key};
-use crate::proto::{FromDaemon, HOLD_VERSION, HoldIn, HoldOut, ToDaemon, VERSION, recv, send};
-use crate::screen::Screen;
-use crate::session::{
+use mine_core::conn::restart_hint;
+use mine_core::hooks::{self, Event, EventKind, now_ms};
+use mine_core::paths::{State, check_sock_path, ensure_dir};
+use mine_core::project::{self, project_key};
+use mine_core::proto::{FromDaemon, HOLD_VERSION, HoldIn, HoldOut, ToDaemon, VERSION, recv, send};
+use mine_core::screen::Screen;
+use mine_core::session::{
     self, Kind, Meta, NewSession, Restore, SessionInfo, SessionState, session_id, validate_name,
 };
 

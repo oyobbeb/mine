@@ -12,10 +12,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-use mine::paths::State;
-use mine::project::project_key;
-use mine::proto::{FromDaemon, HoldIn, HoldOut, ToDaemon, VERSION, read_msg, write_msg};
-use mine::session::{Kind, Meta, Restore, SessionState, session_id};
+use mine_core::paths::State;
+use mine_core::project::project_key;
+use mine_core::proto::{FromDaemon, HoldIn, HoldOut, ToDaemon, VERSION, read_msg, write_msg};
+use mine_core::session::{Kind, Meta, Restore, SessionState, session_id};
 
 /// 소켓 읽기와 조건 기다리기의 최대 시간. 테스트를 여럿 함께 돌려 느려져도 넉넉하게 잡는다.
 const WAIT: Duration = Duration::from_secs(10);

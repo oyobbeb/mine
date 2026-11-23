@@ -1,0 +1,24 @@
+[package]
+name = "mine-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "mine"
+path = "src/main.rs"
+
+[dependencies]
+alacritty_terminal.workspace = true
+anyhow.workspace = true
+base64.workspace = true
+clap.workspace = true
+libc.workspace = true
+mine-core = { path = "../mine-core" }
+portable-pty.workspace = true
+ratatui.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile.workspace = true
