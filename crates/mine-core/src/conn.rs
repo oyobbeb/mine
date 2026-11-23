@@ -47,7 +47,7 @@ impl Conn {
         let stream = match UnixStream::connect(&sock) {
             Ok(stream) => stream,
             Err(_) => {
-                spawn_daemon(state)?;
+                spawn_daemon(state, &current_exe()?, None)?;
                 wait_connect(&sock)?
             }
         };
@@ -56,44 +56,7 @@ impl Conn {
 
     /// [`Conn::connect_or_spawn`]의 비동기 판. 데몬을 띄우고 기다리는 방법은 같다.
     pub async fn connect_or_spawn_async(state: &State) -> Result<AsyncConn> {
-        let sock = state.daemon_sock();
-        check_sock_path(&sock)?;
-        let stream = match tokio::net::UnixStream::connect(&sock).await {
-            Ok(stream) => stream,
-            Err(_) => {
-                spawn_daemon(state)?;
-                let stream = tokio::task::spawn_blocking(move || wait_connect(&sock)).await??;
-                stream.set_nonblocking(true)?;
-                tokio::net::UnixStream::from_std(stream)?
-            }
-        };
-        let (read, mut write) = stream.into_split();
-        let mut reader = tokio::io::BufReader::new(read);
-        send(&mut write, &ToDaemon::Hello { version: VERSION }).await?;
-        let hello = tokio::time::timeout(REPLY_WAIT, recv(&mut reader))
-            .await
-            .map_err(|_| no_reply())?
-            .context("데몬 응답을 읽지 못했다")?;
-        check_hello(hello, state)?;
-        let (tx, mut outgoing) = mpsc::unbounded_channel::<ToDaemon>();
-        tokio::spawn(async move {
-            while let Some(msg) = outgoing.recv().await {
-                if send(&mut write, &msg).await.is_err() {
-                    break;
-                }
-            }
-        });
-        // ponytail: 받는 쪽은 무한 큐다. 클라이언트도 데몬과 같은 양의 출력을 화면에 먹이므로 따라간다고 보고,
-        // 처지면 데몬이 이 연결을 끊기 전에 클라이언트 메모리가 는다. 문제가 되면 바이트로 센 상한을 둔다.
-        let (incoming, rx) = mpsc::unbounded_channel::<FromDaemon>();
-        tokio::spawn(async move {
-            while let Ok(Some(msg)) = recv(&mut reader).await {
-                if incoming.send(msg).is_err() {
-                    break;
-                }
-            }
-        });
-        Ok(AsyncConn { tx, rx })
+        connect_or_spawn_async_with(state, &current_exe()?, None).await
     }
 
     /// `Hello`를 주고받고 버전을 확인한다.
@@ -138,6 +101,59 @@ impl Conn {
     }
 }
 
+/// [`Conn::connect_or_spawn_async`]에서 띄울 데몬을 고르는 판. 데몬이 없으면 `daemon_exe daemon`을 띄운다.
+///
+/// 데스크톱 앱은 자기 실행 파일(`mine-app`)에 `daemon` 하위 명령이 없어서 `mine`의 경로를 넘긴다.
+/// `spawn_env`가 있으면 데몬은 이 프로세스의 환경을 물려받지 않고 그 환경과 `MINE_STATE_DIR`만 받는다.
+pub async fn connect_or_spawn_async_with(
+    state: &State,
+    daemon_exe: &Path,
+    spawn_env: Option<&[(String, String)]>,
+) -> Result<AsyncConn> {
+    let sock = state.daemon_sock();
+    check_sock_path(&sock)?;
+    let stream = match tokio::net::UnixStream::connect(&sock).await {
+        Ok(stream) => stream,
+        Err(_) => {
+            spawn_daemon(state, daemon_exe, spawn_env)?;
+            let stream = tokio::task::spawn_blocking(move || wait_connect(&sock)).await??;
+            stream.set_nonblocking(true)?;
+            tokio::net::UnixStream::from_std(stream)?
+        }
+    };
+    let (read, mut write) = stream.into_split();
+    let mut reader = tokio::io::BufReader::new(read);
+    send(&mut write, &ToDaemon::Hello { version: VERSION }).await?;
+    let hello = tokio::time::timeout(REPLY_WAIT, recv(&mut reader))
+        .await
+        .map_err(|_| no_reply())?
+        .context("데몬 응답을 읽지 못했다")?;
+    check_hello(hello, state)?;
+    let (tx, mut outgoing) = mpsc::unbounded_channel::<ToDaemon>();
+    tokio::spawn(async move {
+        while let Some(msg) = outgoing.recv().await {
+            if send(&mut write, &msg).await.is_err() {
+                break;
+            }
+        }
+    });
+    // ponytail: 받는 쪽은 무한 큐다. 클라이언트도 데몬과 같은 양의 출력을 화면에 먹이므로 따라간다고 보고,
+    // 처지면 데몬이 이 연결을 끊기 전에 클라이언트 메모리가 는다. 문제가 되면 바이트로 센 상한을 둔다.
+    let (incoming, rx) = mpsc::unbounded_channel::<FromDaemon>();
+    tokio::spawn(async move {
+        while let Ok(Some(msg)) = recv(&mut reader).await {
+            if incoming.send(msg).is_err() {
+                break;
+            }
+        }
+    });
+    Ok(AsyncConn { tx, rx })
+}
+
+fn current_exe() -> Result<std::path::PathBuf> {
+    std::env::current_exe().context("실행 파일 경로를 알 수 없다")
+}
+
 fn no_reply() -> anyhow::Error {
     anyhow::anyhow!("데몬이 {}초 안에 답하지 않았다", REPLY_WAIT.as_secs())
 }
@@ -167,11 +183,12 @@ fn check_hello(msg: Option<FromDaemon>, state: &State) -> Result<()> {
     }
 }
 
-/// 데몬을 새 세션 리더로 띄운다. 표준 출력과 오류는 `logs/daemon.log`에 붙인다.
+/// `exe daemon`을 새 세션 리더로 띄운다. 표준 출력과 오류는 `logs/daemon.log`에 붙인다.
+/// `env`가 있으면 이 프로세스의 환경 대신 그 환경을 준다. `MINE_STATE_DIR`는 어느 쪽이든 `state`다.
 ///
 /// 오래 도는 클라이언트 화면이 끝난 데몬을 좀비로 남기지 않게 스레드 하나가 기다려 거둔다. 이 프로세스가
 /// 먼저 끝나면 데몬은 계속 돌고 init이 거둔다.
-fn spawn_daemon(state: &State) -> Result<()> {
+fn spawn_daemon(state: &State, exe: &Path, env: Option<&[(String, String)]>) -> Result<()> {
     ensure_dir(&state.root)?;
     ensure_dir(&state.log_dir())?;
     let log_path = state.log_dir().join("daemon.log");
@@ -180,8 +197,10 @@ fn spawn_daemon(state: &State) -> Result<()> {
         .append(true)
         .open(&log_path)
         .with_context(|| format!("로그 파일을 열 수 없다: {}", log_path.display()))?;
-    let exe = std::env::current_exe().context("실행 파일 경로를 알 수 없다")?;
     let mut cmd = Command::new(exe);
+    if let Some(env) = env {
+        cmd.env_clear().envs(env.iter().map(|(k, v)| (k, v)));
+    }
     cmd.arg("daemon")
         .env("MINE_STATE_DIR", &state.root)
         // 데몬이 명령을 실행한 폴더를 붙잡고 있지 않게 한다.
@@ -198,7 +217,9 @@ fn spawn_daemon(state: &State) -> Result<()> {
             Ok(())
         });
     }
-    let mut child = cmd.spawn().context("데몬을 띄우지 못했다")?;
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("데몬을 띄우지 못했다: {}", exe.display()))?;
     std::thread::spawn(move || child.wait());
     Ok(())
 }

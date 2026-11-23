@@ -5,6 +5,7 @@ pub mod conn;
 pub mod hooks;
 pub mod keys;
 pub mod launch;
+pub mod link;
 pub mod paths;
 pub mod project;
 pub mod proto;
