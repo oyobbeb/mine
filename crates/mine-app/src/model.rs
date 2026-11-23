@@ -5,8 +5,10 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use mine_core::accounts::Labels;
 use mine_core::launch::{self, Choice};
 use mine_core::link::LinkEvent;
+use mine_core::paths::State;
 use mine_core::proto::{FromDaemon, ToDaemon};
 use mine_core::session::{NewSession, SessionInfo, SessionState};
 use mine_core::view::{self, Group, STATES};
@@ -55,6 +57,17 @@ pub const DEFAULT_GRID: (u16, u16) = (80, 24);
 const NOT_CONNECTED: &str =
     "데몬에 연결되지 않아 세션을 만들 수 없어요. 다시 연결되면 골라 주세요.";
 
+/// 별칭 설정(`config.toml` 내용)으로 만든 이름들. 화면 문자열 테스트가 쓴다. 홈이 없으니 자동 이름은 codex뿐이다.
+#[cfg(test)]
+pub(crate) fn labels_from(config: &str) -> Labels {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("config.toml"), config).unwrap();
+    let state = State {
+        root: dir.path().to_path_buf(),
+    };
+    Labels::load(&state, None)
+}
+
 pub struct Model {
     pub sessions: Vec<SessionInfo>,
     /// 고른 프로젝트. `None`이면 전체다.
@@ -88,6 +101,8 @@ pub struct Model {
     pub grid: (u16, u16),
     /// 처음 받은 목록으로 붙을 세션을 정했다.
     started: bool,
+    /// 계정 id를 글로 보일 때 쓰는 이름. 앱이 뜰 때 읽고 창이 다시 활성화될 때 다시 읽는다([`Model::reload_labels`]).
+    pub labels: Labels,
 }
 
 impl Model {
@@ -110,7 +125,18 @@ impl Model {
             message: None,
             grid: DEFAULT_GRID,
             started: false,
+            labels: Labels::default(),
         }
+    }
+
+    /// 계정 이름을 다시 읽는다. 바뀌었으면 `true`다(다시 그려야 한다).
+    ///
+    /// ponytail: 파일 감시는 하지 않는다. 계정을 바꾸거나 별칭을 고치고 창으로 돌아오면 읽는다.
+    pub fn reload_labels(&mut self, state: &State, home: Option<&Path>) -> bool {
+        let labels = Labels::load(state, home);
+        let changed = labels != self.labels;
+        self.labels = labels;
+        changed
     }
 
     /// 데몬 연결의 일을 받는다.
@@ -564,6 +590,38 @@ mod tests {
             waiting: None,
             alive: true,
         }
+    }
+
+    #[test]
+    fn reload_labels_picks_up_new_aliases_and_logins() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let state = State {
+            root: dir.path().join("state"),
+        };
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&state.root).unwrap();
+        let mut m = Model::new(PathBuf::from("/p"));
+        // 읽기 전에는 id 그대로다.
+        assert_eq!(m.labels.get("claude-a"), "claude-a");
+        // 처음 읽을 때 바뀐 것은 codex의 자동 이름뿐이다.
+        assert!(m.reload_labels(&state, Some(&home)));
+        assert_eq!(m.labels.get("claude-a"), "claude-a");
+        assert_eq!(m.labels.get("codex"), "Codex");
+        // 같은 내용을 다시 읽으면 바뀐 것이 없다(다시 그리지 않는다).
+        assert!(!m.reload_labels(&state, Some(&home)));
+        // 창이 다시 활성화될 때: 로그인이 생기면 자동 이름이, 별칭이 생기면 별칭이 보인다.
+        let login = r#"{"oauthAccount":{"emailAddress":"yb@gmail.com"}}"#;
+        std::fs::write(home.join(".claude.json"), login).unwrap();
+        assert!(m.reload_labels(&state, Some(&home)));
+        assert_eq!(m.labels.get("claude-a"), "yb");
+        std::fs::write(
+            state.root.join("config.toml"),
+            "[accounts.claude-a]\nlabel = \"개인\"\n",
+        )
+        .unwrap();
+        assert!(m.reload_labels(&state, Some(&home)));
+        assert_eq!(m.labels.get("claude-a"), "개인");
     }
 
     /// 데몬이 목록을 보냈다. 모델이 시킨 일을 돌려준다.

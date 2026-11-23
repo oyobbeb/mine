@@ -8,6 +8,7 @@ use gpui::{
 };
 use gpui_component::input::Input;
 use gpui_component::{h_flex, v_flex};
+use mine_core::accounts::Labels;
 use mine_core::launch::{Choice, tilde};
 use mine_core::view::folder_name;
 
@@ -28,9 +29,12 @@ const ROWS: [(Choice, &str); 5] = [
 const MENU_W: f32 = 340.;
 const LABEL_W: f32 = 150.;
 
-/// 메뉴 줄 이름. 앞의 넷은 종류 말(`Choice::word`)이고, shell 말고는 그 말이 칩의 계정 이름이기도 하다.
-fn label(choice: Choice) -> &'static str {
-    choice.word().unwrap_or("이름·모델 직접 입력")
+/// 화면에 그리는 메뉴 줄의 글: (선택, 키 표시, 줄 이름). 줄 이름은 [`Choice::label`]이라 계정 줄만 `labels`의
+/// 이름이다. 그리기와 테스트가 같은 글을 쓴다.
+fn row_texts(labels: &Labels) -> Vec<(Choice, &'static str, String)> {
+    ROWS.iter()
+        .map(|&(choice, key)| (choice, key, choice.label(labels).to_string()))
+        .collect()
 }
 
 /// 한 키가 고르는 줄. 꾸밈키(⇧ 포함)가 붙은 키와 그 밖의 키는 무시한다.
@@ -81,10 +85,19 @@ pub fn render(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
                 .text_color(rgb(FAINT))
                 .child(tilde(project, home.as_deref())),
         );
-    let rows = ROWS
-        .iter()
+    let rows = row_texts(&m.labels)
+        .into_iter()
         .enumerate()
-        .map(|(k, &(choice, key))| row(k, choice, key, m.typing && choice == Choice::Typed, cx))
+        .map(|(k, (choice, key, name))| {
+            row(
+                k,
+                choice,
+                key,
+                name,
+                m.typing && choice == Choice::Typed,
+                cx,
+            )
+        })
         .collect::<Vec<_>>();
     let typed = ws.typed_input().filter(|_| m.typing).map(|input| {
         // 입력 상자는 부모 글 크기를 따른다. 뿌리(16px)가 아니라 메뉴와 같은 13px로 둔다.
@@ -133,11 +146,12 @@ pub fn render(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
         )
 }
 
-/// 메뉴 한 줄: `↵  claude-a   [A]`. 누르면 그 줄을 고른다.
+/// 메뉴 한 줄: `↵  claude-a   [A]`. 누르면 그 줄을 고른다. 이름 자리에는 계정 이름이 온다.
 fn row(
     k: usize,
     choice: Choice,
     key: &'static str,
+    name: String,
     selected: bool,
     cx: &mut Context<Workspace>,
 ) -> impl IntoElement + use<> {
@@ -158,12 +172,7 @@ fn row(
                 .text_color(rgb(TITLE))
                 .child(key),
         )
-        .child(
-            div()
-                .w(px(LABEL_W))
-                .text_color(rgb(TEXT))
-                .child(label(choice)),
-        )
+        .child(div().w(px(LABEL_W)).text_color(rgb(TEXT)).child(name))
         .children(account_chip(choice.word()))
         .on_click(cx.listener(move |ws, _, window, cx| ws.launch(choice, window, cx)))
 }
@@ -171,6 +180,7 @@ fn row(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::labels_from;
 
     fn key(source: &str) -> Keystroke {
         Keystroke::parse(source).unwrap()
@@ -211,9 +221,11 @@ mod tests {
 
     #[test]
     fn rows_name_the_kinds_like_the_tui() {
-        let labels: Vec<_> = ROWS.iter().map(|&(c, _)| label(c)).collect();
+        // 이름을 읽기 전의 기본값은 종류 말이다.
+        let rows = row_texts(&Labels::default());
+        let names: Vec<_> = rows.iter().map(|(_, _, name)| name.as_str()).collect();
         assert_eq!(
-            labels,
+            names,
             [
                 "claude-a",
                 "claude-b",
@@ -223,10 +235,43 @@ mod tests {
             ]
         );
         // 칩은 claude-a·claude-b·codex 줄에만 붙는다.
-        let chips: Vec<_> = ROWS
+        let chips: Vec<_> = rows
             .iter()
-            .map(|&(c, _)| chip(c.word()).map(|(letter, _)| letter))
+            .map(|(choice, ..)| chip(choice.word()).map(|(letter, _)| letter))
             .collect();
         assert_eq!(chips, [Some("A"), Some("B"), Some("C"), None, None]);
+    }
+
+    #[test]
+    fn rows_show_account_labels_and_keep_keys_and_choices() {
+        // claude-a는 별칭, codex는 자동 이름이다. claude-b는 정한 것이 없어 id다. shell의 별칭은 쓰지 않는다.
+        let config = "[accounts.claude-a]\nlabel = \"개인\"\n[accounts.shell]\nlabel = \"쉘\"\n";
+        let rows = row_texts(&labels_from(config));
+        let shown: Vec<_> = rows
+            .iter()
+            .map(|(_, key, name)| (*key, name.as_str()))
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                ("↵", "개인"),
+                ("b", "claude-b"),
+                ("x", "Codex"),
+                ("s", "shell"),
+                ("n", "이름·모델 직접 입력"),
+            ]
+        );
+        // 줄을 고르는 값은 이름과 무관하게 종류 말 그대로다(세션의 계정 id가 된다).
+        let words: Vec<_> = rows.iter().map(|(choice, ..)| choice.word()).collect();
+        assert_eq!(
+            words,
+            [
+                Some("claude-a"),
+                Some("claude-b"),
+                Some("codex"),
+                Some("shell"),
+                None
+            ]
+        );
     }
 }

@@ -3,6 +3,7 @@
 use std::collections::HashSet;
 use std::path::Path;
 
+use crate::accounts::Labels;
 use crate::session::{NewSession, SessionInfo};
 use crate::view;
 
@@ -27,6 +28,18 @@ impl Choice {
             Choice::Codex => Some("codex"),
             Choice::Shell => Some("shell"),
             Choice::Typed => None,
+        }
+    }
+
+    /// 실행 화면 줄에 글로 보일 이름. 계정이 있는 줄(claude-a, claude-b, codex)은 `labels`의 이름이고, shell은
+    /// 계정이 없어 `shell` 그대로다. 직접 입력은 설명이다. 세션을 만들 때 쓰는 말은 늘 [`Choice::word`]다.
+    pub fn label(self, labels: &Labels) -> &str {
+        match self {
+            Choice::ClaudeA | Choice::ClaudeB | Choice::Codex => {
+                labels.get(self.word().unwrap_or_default())
+            }
+            Choice::Shell => "shell",
+            Choice::Typed => "이름·모델 직접 입력",
         }
     }
 }
@@ -71,6 +84,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+    use crate::paths::State;
     use crate::session::{Kind, Meta, Restore, SessionState};
 
     fn session(project: &str, name: &str, state: SessionState) -> SessionInfo {
@@ -145,6 +159,29 @@ mod tests {
             let spec = view::parse_new(&format!("{word} x"), Path::new("/p")).unwrap();
             assert_eq!(spec.account.as_deref(), (c != Shell).then_some(word));
         }
+    }
+
+    #[test]
+    fn row_labels_follow_accounts_and_leave_shell_and_typed_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = State {
+            root: dir.path().to_path_buf(),
+        };
+        let config = "[accounts.claude-a]\nlabel = \"개인\"\n[accounts.shell]\nlabel = \"쉘\"\n";
+        std::fs::write(dir.path().join("config.toml"), config).unwrap();
+        let labels = Labels::load(&state, None);
+        let row = |c: Choice| c.label(&labels);
+        // 별칭이 있으면 별칭, 없으면 자동 이름(codex)이나 id(claude-b)다.
+        assert_eq!(row(Choice::ClaudeA), "개인");
+        assert_eq!(row(Choice::ClaudeB), "claude-b");
+        assert_eq!(row(Choice::Codex), "Codex");
+        // shell은 계정이 없어 별칭이 있어도 그대로다.
+        assert_eq!(row(Choice::Shell), "shell");
+        assert_eq!(row(Choice::Typed), "이름·모델 직접 입력");
+        // 이름을 읽지 않은 기본값은 종류 말이다. 세션을 만드는 말은 이름과 무관하다.
+        let ids = Labels::default();
+        assert_eq!(Choice::ClaudeA.label(&ids), "claude-a");
+        assert_eq!(Choice::ClaudeA.word(), Some("claude-a"));
     }
 
     #[test]

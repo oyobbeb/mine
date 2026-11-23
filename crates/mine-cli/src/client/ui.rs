@@ -15,10 +15,22 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::client::launcher;
+use mine_core::accounts::Labels;
 use mine_core::launch::Choice;
 use mine_core::screen::Screen;
 use mine_core::session::{SessionInfo, SessionState};
 use mine_core::view::{self, Group, NEW_USAGE, PROJECT_COLORS, RailItem};
+
+/// 별칭 설정(`config.toml` 내용)으로 만든 이름들. 화면 문자열 테스트가 쓴다. 홈이 없으니 자동 이름은 codex뿐이다.
+#[cfg(test)]
+pub(super) fn labels_from(config: &str) -> Labels {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("config.toml"), config).unwrap();
+    let state = mine_core::paths::State {
+        root: dir.path().to_path_buf(),
+    };
+    Labels::load(&state, None)
+}
 
 /// 화면에 그릴 클라이언트 상태.
 pub struct Model {
@@ -39,6 +51,8 @@ pub struct Model {
     pub status: Option<String>,
     /// 시작 화면(`launcher`)을 터미널 칸에 그린다. 붙은 세션이 없을 때와 `⌃a c`로 연 동안 참이다.
     pub launcher: bool,
+    /// 계정 id를 글로 보일 때 쓰는 이름. 클라이언트가 시작할 때 읽는다.
+    pub labels: Labels,
 }
 
 impl Model {
@@ -183,7 +197,7 @@ pub fn draw(f: &mut Frame, m: &Model, screen: Option<&Screen>) {
     }
     paint_edges(f.buffer_mut(), &a);
     if m.launcher {
-        launcher::draw(f.buffer_mut(), a.term, m.project());
+        launcher::draw(f.buffer_mut(), a.term, m.project(), &m.labels);
     } else if let Some(sc) = screen {
         draw_term(f.buffer_mut(), a.term, sc);
         if m.attached.is_some()
@@ -219,7 +233,7 @@ pub fn hit(a: &Areas, m: &Model, col: u16, row: u16) -> Hit {
     if a.term.contains(pos) {
         // 시작 화면이 세션 칸을 덮는 동안은 선택 줄만 누를 수 있다.
         if m.launcher {
-            return launcher::hit(a.term, col, row).map_or(Hit::None, Hit::Launch);
+            return launcher::hit(a.term, col, row, &m.labels).map_or(Hit::None, Hit::Launch);
         }
         return Hit::Term(col - a.term.x, row - a.term.y);
     }
@@ -611,7 +625,7 @@ fn draw_status(f: &mut Frame, area: Rect, m: &Model) {
                     left.push(Span::raw(path));
                     if let Some(account) = &s.meta.account {
                         left.push(sep());
-                        left.push(Span::raw(account.clone()));
+                        left.push(Span::raw(m.labels.get(account).to_string()));
                     }
                 }
                 // 붙은 세션이 없으면 선택한 프로젝트의 전체 경로를 보여 준다(아이콘 이름 띄우기 대신).
@@ -622,7 +636,12 @@ fn draw_status(f: &mut Frame, area: Rect, m: &Model) {
                 )),
             }
             if m.message.is_empty() {
-                Span::styled(if m.launcher { launcher::KEYS } else { KEYS }, MUTED)
+                let keys = if m.launcher {
+                    launcher::keys(&m.labels)
+                } else {
+                    KEYS.to_string()
+                };
+                Span::styled(keys, MUTED)
             } else {
                 Span::styled(m.message.clone(), YELLOW)
             }
@@ -700,6 +719,7 @@ mod tests {
             toggled: Vec::new(),
             status: None,
             launcher: false,
+            labels: Labels::default(),
         }
     }
 
@@ -915,6 +935,29 @@ mod tests {
             (n.fg, n.bg, n.modifier),
             (Color::Reset, Color::Reset, Modifier::empty())
         );
+    }
+
+    #[test]
+    fn status_line_and_launcher_hint_show_account_labels() {
+        let mut m = kyoto();
+        m.labels = labels_from("[accounts.claude-b]\nlabel = \"회사\"\n");
+        m.attached = Some("k-billing".into());
+        let status = row_text(&render(&m, 140, 20), 19);
+        assert!(
+            status.starts_with("mine │ /p/kyoto/billing │ 회사"),
+            "{status}"
+        );
+        assert!(!status.contains("claude-b"), "{status}");
+        // codex 세션은 자동 이름이다.
+        m.attached = Some("k-ui".into());
+        let status = row_text(&render(&m, 140, 20), 19);
+        assert!(status.starts_with("mine │ /p/kyoto/ui │ Codex"), "{status}");
+        // 시작 화면의 줄과 키 안내도 같은 이름이다.
+        m.launcher = true;
+        let buf = render(&m, 140, 20);
+        assert!(row_of(&buf, "↵").contains("↵  claude-a"));
+        assert!(row_of(&buf, "b  회사").ends_with("B"));
+        assert!(row_text(&buf, 19).ends_with("↵ claude-a · b 회사 · x Codex · s shell"));
     }
 
     #[test]

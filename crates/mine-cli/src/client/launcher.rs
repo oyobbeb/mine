@@ -9,15 +9,19 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
+use mine_core::accounts::Labels;
 use mine_core::launch::{Choice, tilde};
 use mine_core::view::folder_name;
 
 use crate::client::ui::{HEAD, MUTED, chip};
 
-/// 시작 화면이 열려 있을 때 상태줄 오른쪽 키 안내.
-pub const KEYS: &str = "↵ claude-a · b claude-b · x codex · s shell";
+/// 시작 화면이 열려 있을 때 상태줄 오른쪽 키 안내. 계정 줄은 [`Choice::label`]의 이름이다.
+pub fn keys(labels: &Labels) -> String {
+    let [a, b, x] = [Choice::ClaudeA, Choice::ClaudeB, Choice::Codex].map(|c| c.label(labels));
+    format!("↵ {a} · b {b} · x {x} · s shell")
+}
 
-/// 메뉴 줄: (선택, 키 표시). 줄 이름은 [`label`]이다.
+/// 메뉴 줄: (선택, 키 표시). 줄 이름은 [`Choice::label`]이다.
 const ROWS: [(Choice, &str); 5] = [
     (Choice::ClaudeA, "↵"),
     (Choice::ClaudeB, "b"),
@@ -26,16 +30,11 @@ const ROWS: [(Choice, &str); 5] = [
     (Choice::Typed, "n"),
 ];
 
-/// 메뉴 줄 이름. 앞의 넷은 종류 말(`Choice::word`)이고, shell 말고는 그 말이 칩의 계정 이름이기도 하다.
-fn label(choice: Choice) -> &'static str {
-    choice.word().unwrap_or("이름·모델 직접 입력")
-}
-
 /// 맨 위 두 줄(프로젝트 머리와 빈 줄) 다음에 오는 본문: `새 세션`, 빈 줄, 메뉴 줄들, 빈 줄, 안내.
 /// 메뉴 줄은 위에서 네 번째 줄(0부터)에서 시작한다.
 const OPTIONS_AT: u16 = 4;
 const HEIGHT: u16 = OPTIONS_AT + ROWS.len() as u16 + 2;
-/// 이름 칸 폭. 칩이 이 뒤에 같은 열로 맞는다.
+/// 이름 칸의 기본 폭. 칩이 이 뒤에 같은 열로 맞는다.
 const LABEL_W: usize = 10;
 
 /// 한 키가 고르는 줄. 한 번에 읽힌 바이트가 키 하나일 때만 센다. Esc로 시작하는 시퀀스(화살표, 인코딩된 키)와
@@ -54,13 +53,22 @@ pub fn choice_of_key(bytes: &[u8]) -> Option<Choice> {
     })
 }
 
-/// 메뉴 본문 줄들. 프로젝트와 무관하다.
-fn body() -> Vec<Line<'static>> {
+/// 이름 칸 폭. 기본 폭이고, 칩이 붙는 줄의 이름이 더 길면 그에 맞춰 칩이 같은 열에 서게 한다.
+fn label_w(labels: &Labels) -> usize {
+    ROWS.iter()
+        .filter(|(choice, _)| chip(choice.word()).is_some())
+        .map(|(choice, _)| Span::raw(choice.label(labels)).width())
+        .fold(LABEL_W, usize::max)
+}
+
+/// 메뉴 본문 줄들. 프로젝트와 무관하고, 계정 줄의 이름만 `labels`를 따른다.
+fn body(labels: &Labels) -> Vec<Line<'static>> {
     let key = Style::new().add_modifier(Modifier::BOLD);
+    let label_w = label_w(labels);
     let mut out = vec![Line::styled("새 세션", HEAD), Line::default()];
     out.extend(ROWS.iter().map(|&(choice, k)| {
-        let label = label(choice);
-        let pad = LABEL_W.saturating_sub(Span::raw(label).width());
+        let label = choice.label(labels);
+        let pad = label_w.saturating_sub(Span::raw(label).width());
         let mut spans = vec![
             Span::styled(k, key),
             Span::raw(format!("  {label}{}", " ".repeat(pad))),
@@ -78,30 +86,30 @@ fn body() -> Vec<Line<'static>> {
 }
 
 /// 메뉴 폭. 프로젝트 머리(경로가 길 수 있다)는 빼고 잰다. 그래야 경로 길이에 메뉴 자리가 흔들리지 않는다.
-fn menu_width() -> u16 {
-    body().iter().map(Line::width).max().unwrap_or(0) as u16
+fn menu_width(labels: &Labels) -> u16 {
+    body(labels).iter().map(Line::width).max().unwrap_or(0) as u16
 }
 
 /// 터미널 칸 `term` 가운데에 놓은 메뉴의 왼쪽 위. 칸이 작으면 칸의 왼쪽·위에 붙는다.
-fn origin(term: Rect) -> (u16, u16) {
+fn origin(term: Rect, labels: &Labels) -> (u16, u16) {
     (
-        term.x + term.width.saturating_sub(menu_width()) / 2,
+        term.x + term.width.saturating_sub(menu_width(labels)) / 2,
         term.y + term.height.saturating_sub(HEIGHT) / 2,
     )
 }
 
 /// `(col, row)`(바깥 화면 좌표)에 있는 메뉴 줄. 줄이 그려진 폭 안만 센다.
-pub fn hit(term: Rect, col: u16, row: u16) -> Option<Choice> {
-    let (x, y) = origin(term);
+pub fn hit(term: Rect, col: u16, row: u16, labels: &Labels) -> Option<Choice> {
+    let (x, y) = origin(term, labels);
     let i = row.checked_sub(y + OPTIONS_AT)?;
     let (choice, ..) = ROWS.get(usize::from(i))?;
-    (col >= x && col - x < menu_width()).then_some(*choice)
+    (col >= x && col - x < menu_width(labels)).then_some(*choice)
 }
 
 /// 터미널 칸 가운데에 메뉴를 그린다. 기본 바탕 위에 글자만 얹는다. 칸보다 크면 칸 밖은 자른다.
 ///
 /// ponytail: 프로젝트 경로가 길면 오른쪽이 잘린다. 앞을 `…`로 줄여 보이는 일은 필요해지면 한다.
-pub fn draw(buf: &mut Buffer, term: Rect, project: &Path) {
+pub fn draw(buf: &mut Buffer, term: Rect, project: &Path, labels: &Labels) {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let head = Line::from(vec![
         Span::styled(
@@ -110,8 +118,8 @@ pub fn draw(buf: &mut Buffer, term: Rect, project: &Path) {
         ),
         Span::styled(format!("  {}", tilde(project, home.as_deref())), MUTED),
     ]);
-    let (x, top) = origin(term);
-    let lines = [head, Line::default()].into_iter().chain(body());
+    let (x, top) = origin(term, labels);
+    let lines = [head, Line::default()].into_iter().chain(body(labels));
     for (y, line) in (top..term.bottom()).zip(lines) {
         if x < term.right() {
             buf.set_line(x, y, &line, term.right() - x);
@@ -122,6 +130,7 @@ pub fn draw(buf: &mut Buffer, term: Rect, project: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::ui::labels_from;
     use ratatui::style::Color;
 
     #[test]
@@ -160,8 +169,12 @@ mod tests {
     const TERM: Rect = Rect::new(34, 0, 86, 39);
 
     fn drawn(term: Rect, project: &str) -> Buffer {
+        drawn_with(term, project, &Labels::default())
+    }
+
+    fn drawn_with(term: Rect, project: &str, labels: &Labels) -> Buffer {
         let mut buf = Buffer::empty(Rect::new(0, 0, 120, 40));
-        draw(&mut buf, term, Path::new(project));
+        draw(&mut buf, term, Path::new(project), labels);
         buf
     }
 
@@ -210,7 +223,7 @@ mod tests {
             (bottom - top + 1, top),
             (HEIGHT, (TERM.height - HEIGHT) / 2)
         );
-        let width = menu_width();
+        let width = menu_width(&Labels::default());
         assert_eq!(width, 22);
         let left = TERM.x + (TERM.width - width) / 2;
         for (_, x, _) in &rows {
@@ -254,12 +267,51 @@ mod tests {
     }
 
     #[test]
+    fn rows_show_account_labels_and_the_chips_stay_in_one_column() {
+        // claude-a는 별칭, claude-b는 칸보다 긴 별칭, codex는 자동 이름이다. shell의 별칭은 쓰지 않는다.
+        let labels = labels_from(
+            "[accounts.claude-a]\nlabel = \"개인\"\n\
+             [accounts.claude-b]\nlabel = \"company-work\"\n\
+             [accounts.shell]\nlabel = \"쉘\"\n",
+        );
+        let buf = drawn_with(TERM, "/p/kyoto", &labels);
+        let rows = rows(&buf);
+        let texts: Vec<&str> = rows.iter().map(|(_, _, t)| t.as_str()).collect();
+        // 이름 칸은 가장 긴 이름(12칸)에 맞고, 칩은 모두 그 뒤 같은 열이다.
+        assert_eq!(
+            texts[2..7],
+            [
+                "↵  개인          A",
+                "b  company-work  B",
+                "x  Codex         C",
+                "s  shell",
+                "n  이름·모델 직접 입력",
+            ]
+        );
+        for line in ["claude-a", "claude-b", "codex"] {
+            assert!(texts.iter().all(|t| !t.contains(line)), "{line}");
+        }
+        // 줄을 누르는 판정은 그려진 줄과 맞는다.
+        let y = rows[3].0;
+        let left = rows[3].1;
+        assert_eq!(hit(TERM, left, y, &labels), Some(Choice::ClaudeB));
+        assert_eq!(hit(TERM, left + 17, y, &labels), Some(Choice::ClaudeB));
+        // 상태줄 안내도 같은 이름이다.
+        assert_eq!(keys(&labels), "↵ 개인 · b company-work · x Codex · s shell");
+        assert_eq!(
+            keys(&Labels::default()),
+            "↵ claude-a · b claude-b · x codex · s shell"
+        );
+    }
+
+    #[test]
     fn hit_maps_option_rows_and_nothing_else() {
         let buf = drawn(TERM, "/p/kyoto");
         let rows = rows(&buf);
         let y_of = |text: &str| rows.iter().find(|r| r.2.starts_with(text)).unwrap().0;
-        let left = TERM.x + (TERM.width - menu_width()) / 2;
-        let pick = |y, x| hit(TERM, x, y);
+        let ids = Labels::default();
+        let left = TERM.x + (TERM.width - menu_width(&ids)) / 2;
+        let pick = |y, x| hit(TERM, x, y, &ids);
         assert_eq!(pick(y_of("↵"), left), Some(Choice::ClaudeA));
         assert_eq!(pick(y_of("b"), left + 5), Some(Choice::ClaudeB));
         assert_eq!(pick(y_of("x"), left + 21), Some(Choice::Codex));
@@ -267,7 +319,7 @@ mod tests {
         assert_eq!(pick(y_of("n"), left + 10), Some(Choice::Typed));
         // 줄 옆(메뉴 폭 밖)과 제목·머리·안내 줄은 아니다.
         assert_eq!(pick(y_of("↵"), left - 1), None);
-        assert_eq!(pick(y_of("↵"), left + menu_width()), None);
+        assert_eq!(pick(y_of("↵"), left + menu_width(&ids)), None);
         for text in ["kyoto", "새 세션", "⌃a d"] {
             assert_eq!(pick(y_of(text), left + 1), None, "{text}");
         }
@@ -297,7 +349,7 @@ mod tests {
             // 칸 안 어느 곳을 눌러도 판정은 끝난다.
             for y in term.y..term.bottom() {
                 for x in term.x..term.right() {
-                    let _ = hit(term, x, y);
+                    let _ = hit(term, x, y, &Labels::default());
                 }
             }
         }

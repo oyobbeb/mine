@@ -29,6 +29,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use copymode::{CopyMode, CopyOut};
 use input::{Action, Cmd, InputParser};
+use mine_core::accounts::Labels;
 use mine_core::conn::Conn;
 use mine_core::keys::KeyModes;
 use mine_core::launch::{self, Choice};
@@ -53,6 +54,8 @@ type Cells = Vec<(u16, u16, Cell)>;
 
 /// 클라이언트를 실행한다. `⌃a d`로 나오면 `Ok`다. 데몬과 세션은 계속 돈다.
 pub async fn run(state: State, project: PathBuf) -> Result<()> {
+    // 계정 이름은 시작할 때 한 번 읽는다. 읽다 남기는 경고가 화면을 깨지 않게 바깥 터미널을 잡기 전에 읽는다.
+    let labels = Labels::load(&state, std::env::home_dir().as_deref());
     let _tty = tty::Tty::enter()?;
     // 표준 입력 읽기 스레드보다 먼저 묻고 끝낸다(R13). 그사이 들어온 키는 아래에서 먼저 먹인다.
     let (colors, early) = tty::probe_colors();
@@ -68,6 +71,7 @@ pub async fn run(state: State, project: PathBuf) -> Result<()> {
     )))?;
     let mut rx = conn.rx;
     let mut app = App::new(conn.tx, project, terminal.size()?);
+    app.m.labels = labels;
     if let Some((fg, bg)) = colors {
         app.send(ToDaemon::Colors {
             fg: fg.to_string(),
@@ -219,6 +223,7 @@ impl App {
                 toggled: Vec::new(),
                 status: None,
                 launcher: false,
+                labels: Labels::default(),
             },
             screen: None,
             tx,

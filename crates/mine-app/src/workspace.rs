@@ -12,7 +12,7 @@ use gpui::prelude::FluentBuilder;
 use gpui::{
     AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
     KeyDownEvent, ParentElement, PathPromptOptions, PromptButton, PromptLevel, Render, Styled,
-    Subscription, Task, Window, div, px, rgb,
+    Subscription, Task, Window, WindowId, div, px, rgb,
 };
 use gpui_component::input::{InputEvent, InputState};
 use gpui_component::{TitleBar, h_flex, v_flex};
@@ -45,6 +45,8 @@ pub struct Workspace {
     typed: Option<(Entity<InputState>, Subscription)>,
     /// 답을 기다리는 `New`(그 `since`)에 건 타이머. 같은 `New`에 두 번 걸지 않는다.
     pending_timer: Option<Instant>,
+    /// 창이 활성화될 때 계정 이름을 다시 읽으려고 건 구독과 그 창. 이 뷰는 창보다 오래 살아 창마다 새로 건다.
+    activation: Option<(WindowId, Subscription)>,
     /// 연결 스레드의 일을 모델에 먹이는 작업. 뷰가 버려지면 함께 멈춘다.
     _pump: Task<()>,
 }
@@ -68,6 +70,7 @@ impl Workspace {
             picker_open: false,
             typed: None,
             pending_timer: None,
+            activation: None,
             _pump: pump,
         }
     }
@@ -86,6 +89,35 @@ impl Workspace {
                     let _ = self.tx.unbounded_send(msg);
                 }
             }
+        }
+    }
+
+    /// 창이 활성화되면 계정 이름을 다시 읽도록 이 창에 건다. 그릴 때마다 불러도 창마다 한 번만 건다
+    /// (Dock으로 다시 연 창은 새 창이라 다시 건다).
+    ///
+    /// ponytail: 파일 감시는 하지 않는다. 별칭을 고치거나 계정을 바꾼 뒤 창으로 돌아오면 반영된다.
+    fn watch_activation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let id = window.window_handle().window_id();
+        if self
+            .activation
+            .as_ref()
+            .is_some_and(|(seen, _)| *seen == id)
+        {
+            return;
+        }
+        let subscription = cx.observe_window_activation(window, |ws, window, cx| {
+            if window.is_window_active() {
+                ws.reload_labels(cx);
+            }
+        });
+        self.activation = Some((id, subscription));
+    }
+
+    /// 계정 이름을 다시 읽고, 바뀌었으면 다시 그린다.
+    fn reload_labels(&mut self, cx: &mut Context<Self>) {
+        let home = std::env::home_dir();
+        if self.model.reload_labels(&self.state, home.as_deref()) {
+            cx.notify();
         }
     }
 
@@ -310,6 +342,7 @@ impl Render for Workspace {
         if !self.model.typing {
             self.close_typed(window, cx);
         }
+        self.watch_activation(window, cx);
         // 창을 처음 열면(Dock으로 다시 연 창 포함) 포커스가 없다. 실행 화면이 열려 있으면 다른 칸에 남은 포커스도
         // 가져온다(데몬의 일로 붙은 세션이 사라져 실행 화면이 뜬 때처럼 창 없이 바뀐 경우). 단축키와 실행 화면 키가
         // 이 뷰에 와야 한다.

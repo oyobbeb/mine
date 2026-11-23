@@ -120,6 +120,28 @@ mine --project ~/dev/mine new dev     # 프로젝트 폴더를 직접 지정한�
 - 드래그: 선택하고, 손을 떼면 OSC 52로 클립보드에 복사한다. Ghostty가 ⌘C를 가로채므로 이 방식을 쓴다.
 - 클릭: 아이콘 줄의 프로젝트나 목록의 세션 줄을 고른다. 그룹 머리글을 누르면 그룹을 접거나 편다. 시작 화면에서는 메뉴 줄을 누르면 그 줄을 시작한다.
 
+## 계정 이름
+
+화면에는 `claude-a` 같은 계정 id 대신 짧은 이름이 글로 보인다. 시작 화면의 줄과 키 안내, 상태줄의 계정이 그렇고, 목록과 탭의 칩 글자(A·B·C)와 색은 그대로다. 이름은 다음 차례로 정한다.
+
+1. 별칭. `<상태 폴더>/config.toml`(기본 `~/.mine/config.toml`)에 적는다.
+
+   ```toml
+   [accounts.claude-a]
+   label = "개인"
+
+   [accounts.codex]
+   label = "gpt"
+   ```
+
+2. 자동 이름. Claude 계정은 로그인한 이메일의 `@` 앞부분이다. claude-a는 `~/.claude.json`, claude-b는 `<상태 폴더>/profiles/claude-b/.claude.json`의 `oauthAccount.emailAddress`만 읽는다. 두 계정의 앞부분이 같으면 `yb@gmail`, `yb@acme`처럼 도메인 첫 마디를 붙여 가른다. Codex는 `Codex`다.
+3. 둘 다 없으면 계정 id 그대로다.
+
+- 이름은 화면에서만 바뀐다. `mine ls`의 계정 열, `mine new --account`, 시작 화면의 `n` 입력은 계정 id(`claude-a`, `claude-b`, `codex`)를 그대로 쓴다. shell은 계정이 없어 바뀌지 않는다.
+- `config.toml`이 없거나 읽을 수 없으면 별칭 없이 쓴다. 문법이 틀리면 줄 번호와 오류 종류만 경고로 남기고(`mine`은 시작할 때 터미널에, 앱은 표준 오류에) 별칭을 무시한다. 비어 있거나 제어 문자가 든 별칭은 건너뛴다.
+- mine은 자격 증명을 읽거나 저장하지 않는다. 자동 이름을 위해 이메일 한 필드만 읽고, 로그에 이메일을 남기지 않는다. `.credentials.json`과 키체인, Codex 인증 파일은 열지 않는다.
+- 이름은 클라이언트가 시작할 때 한 번 읽는다. 앱은 창이 다시 활성화될 때도 다시 읽는다. 별칭을 고친 뒤 `mine`은 다시 실행해야 반영된다.
+
 ## 상태 폴더
 
 기본 위치는 `~/.mine`이고 `MINE_STATE_DIR`로 바꾼다. 유닉스 소켓 경로가 macOS 한도(104바이트)를 넘지 않도록 짧은 경로를 쓴다.
@@ -132,10 +154,11 @@ mine --project ~/dev/mine new dev     # 프로젝트 폴더를 직접 지정한�
   sessions/<id>/        meta.json, events.jsonl(훅 이벤트), exit(자식 종료 코드)
   run/                  보관 프로세스 소켓
   logs/                 daemon.log, hold-<id>.log
+  config.toml           계정 별칭(선택). 위 "계정 이름"
   profiles/claude-b/    claude-b의 CLAUDE_CONFIG_DIR
 ```
 
-claude-a는 지금의 `~/.claude`를 그대로 쓴다. 설계 5.9의 `config.toml`, `usage/`, `master/`, 세션의 대화·인계 기록은 이후 단계에서 생긴다.
+claude-a는 지금의 `~/.claude`를 그대로 쓴다. `config.toml`은 지금은 계정 별칭만 읽는다. 설계 5.9의 나머지 설정, `usage/`, `master/`, 세션의 대화·인계 기록은 이후 단계에서 생긴다.
 
 ## 지금 되는 것과 아직 안 되는 것
 

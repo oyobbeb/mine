@@ -3874,6 +3874,7 @@ dependencies = [
  "gpui",
  "gpui-component",
  "mine-core",
+ "tempfile",
 ]
 
 [[package]]
@@ -3907,6 +3908,7 @@ dependencies = [
  "sha2 0.11.1",
  "tempfile",
  "tokio",
+ "toml 1.2.2+spec-1.1.0",
 ]
 
 [[package]]
