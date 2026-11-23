@@ -14,14 +14,28 @@ use crate::paths::{State, ensure_dir, sha256_hex_prefix};
 /// `.git`은 폴더든 파일이든 루트 표시다(파일이면 별도 worktree). 중첩 저장소와 별도 worktree는
 /// 가장 가까운 표시를 따르므로 각각 독립 프로젝트가 된다. 등록된 폴더도 같은 순서로 확인한다.
 /// 끝까지 못 찾으면 (실제 경로로 바꾼) 시작 폴더가 프로젝트다.
+/// 홈 폴더와 `/`는 등록된 폴더로 치지 않는다([`register`]).
 pub fn project_root(start: &Path, state: &State) -> Result<PathBuf> {
+    project_root_in(start, state, home().as_deref())
+}
+
+fn project_root_in(start: &Path, state: &State, home: Option<&Path>) -> Result<PathBuf> {
     let start = start
         .canonicalize()
         .with_context(|| format!("경로를 확인할 수 없다: {}", start.display()))?;
     let found = start
         .ancestors()
-        .find(|dir| dir.join(".git").exists() || is_registered(state, dir));
+        .find(|dir| dir.join(".git").exists() || is_registered(state, dir, home));
     Ok(found.unwrap_or(&start).to_path_buf())
+}
+
+/// 실제 경로로 바꾼 홈 폴더. `HOME`이 비었거나 없으면 `std::env::home_dir()`를 쓴다.
+fn home() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|h| !h.as_os_str().is_empty())
+        .or_else(std::env::home_dir)
+        .and_then(|h| h.canonicalize().ok())
 }
 
 /// 실제 경로 바이트의 SHA-256 16진수 앞 16자.
@@ -29,8 +43,15 @@ pub fn project_key(root: &Path) -> String {
     sha256_hex_prefix(root.as_os_str().as_bytes(), 16)
 }
 
-fn is_registered(state: &State, root: &Path) -> bool {
-    registration_file(state, root).is_file()
+/// 홈 폴더(`home`은 실제 경로)와 `/`는 프로젝트로 등록하지 않는다. 등록하면 홈 아래 Git 저장소가 없는
+/// 모든 폴더가 홈 프로젝트로 묶인다. `root`는 실제 경로여야 한다.
+fn is_never_registered(root: &Path, home: Option<&Path>) -> bool {
+    root == Path::new("/") || home == Some(root)
+}
+
+/// 이전 버전이 남긴 홈 등록 파일이 하위 폴더를 끌어가지 않도록, 파일이 있어도 홈과 `/`는 등록되지 않은 것으로 본다.
+fn is_registered(state: &State, root: &Path, home: Option<&Path>) -> bool {
+    !is_never_registered(root, home) && registration_file(state, root).is_file()
 }
 
 fn registration_file(state: &State, root: &Path) -> PathBuf {
@@ -39,13 +60,21 @@ fn registration_file(state: &State, root: &Path) -> PathBuf {
         .join(format!("{}.json", project_key(root)))
 }
 
-/// 프로젝트를 등록한다. `projects/<key>.json`에 실제 경로 문자열을 JSON으로 적는다.
+/// 프로젝트를 등록한다. `projects/<key>.json`에 실제 경로 문자열을 JSON으로 적는다. 홈 폴더와 `/`는 등록하지 않고
+/// 성공으로 돌아간다. 홈에서 시작한 세션의 프로젝트는 여전히 홈이지만 등록은 남지 않는다.
 /// 같은 폴더의 임시 파일에 쓴 뒤 이름을 바꿔서, 읽는 쪽이 쓰다 만 파일을 보지 않게 한다.
 pub fn register(state: &State, root: &Path) -> Result<()> {
+    register_in(state, root, home().as_deref())
+}
+
+fn register_in(state: &State, root: &Path, home: Option<&Path>) -> Result<()> {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let root = root
         .canonicalize()
         .with_context(|| format!("경로를 확인할 수 없다: {}", root.display()))?;
+    if is_never_registered(&root, home) {
+        return Ok(());
+    }
     let text = root
         .to_str()
         .ok_or_else(|| anyhow!("UTF-8이 아닌 경로는 등록할 수 없다: {}", root.display()))?;
@@ -235,5 +264,55 @@ mod tests {
         assert!(k.chars().all(|c| c.is_ascii_hexdigit()));
         assert_eq!(k, project_key(Path::new("/tmp/x")));
         assert_ne!(k, project_key(Path::new("/tmp/y")));
+    }
+
+    /// 홈 폴더 `h`가 있는 임시 폴더. 반환하는 홈은 실제 경로다.
+    fn fake_home(t: &Path) -> PathBuf {
+        std::fs::create_dir_all(t.join("h/sub/x")).unwrap();
+        real(&t.join("h"))
+    }
+
+    #[test]
+    fn registering_home_or_root_is_a_noop() {
+        let (td, st) = fixture();
+        let home = fake_home(td.path());
+        register_in(&st, &home, Some(&home)).unwrap();
+        register_in(&st, Path::new("/"), Some(&home)).unwrap();
+        assert!(registered(&st).unwrap().is_empty());
+        assert!(!is_registered(&st, &home, None));
+        assert!(!is_registered(&st, Path::new("/"), None));
+        // 홈이 아니면 같은 호출이 등록한다.
+        register_in(&st, &home.join("sub"), Some(&home)).unwrap();
+        assert_eq!(registered(&st).unwrap(), vec![home.join("sub")]);
+    }
+
+    #[test]
+    fn stale_home_registration_does_not_capture_subfolders() {
+        let (td, st) = fixture();
+        let home = fake_home(td.path());
+        // 이전 버전이 남긴 홈 등록 파일.
+        std::fs::create_dir_all(st.projects_dir()).unwrap();
+        std::fs::write(
+            registration_file(&st, &home),
+            serde_json::to_string(home.to_str().unwrap()).unwrap(),
+        )
+        .unwrap();
+        // 대조: 홈을 모르면 옛 등록이 하위 폴더를 홈으로 끌어간다.
+        assert_eq!(
+            project_root_in(&home.join("sub/x"), &st, None).unwrap(),
+            home
+        );
+        // 홈을 알면 .git이 없는 하위 폴더는 자기 자신이고, 홈에서 시작한 세션은 홈이 프로젝트다.
+        assert_eq!(
+            project_root_in(&home.join("sub/x"), &st, Some(&home)).unwrap(),
+            home.join("sub/x")
+        );
+        assert_eq!(project_root_in(&home, &st, Some(&home)).unwrap(), home);
+        // 홈 아래 Git 저장소와 등록된 폴더는 그대로 찾는다.
+        std::fs::create_dir_all(home.join("g/.git")).unwrap();
+        assert_eq!(
+            project_root_in(&home.join("g"), &st, Some(&home)).unwrap(),
+            home.join("g")
+        );
     }
 }
