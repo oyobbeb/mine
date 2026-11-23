@@ -139,13 +139,34 @@ pub struct Launch {
 ///
 /// tmux 안에서 띄운 데몬이면 `TMUX`가 tmux를 아는 도구를 바깥 tmux로 보내고, claude 세션 안에서 띄운 데몬이면
 /// `CLAUDECODE`가 중첩 실행을 막거나 `CLAUDE_CONFIG_DIR`가 claude-a 세션을 claude-b 계정으로 돌린다.
+/// 지우는 것은 실행 중인 Claude Code가 자식에게 설정하는 변수뿐이다. 사용자가 일부러 켠 `CLAUDE_*` 설정
+/// (`CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS`, `CLAUDE_CODE_USE_BEDROCK` 등)은 세션까지 그대로 넘긴다.
+/// 접두사로 지우는 `CLAUDE_CODE_SESSION_`은 세션 id, `CLAUDE_CODE_CHILD_`는 자식 세션 정보,
+/// `CLAUDE_CODE_MESSAGING_`은 메시징 소켓과 토큰이다. 토큰이 다른 세션으로 새면 안 된다.
 /// `MINE_STATE_DIR`는 훅(`mine _event`)이 이 데몬을 찾는 데 쓰므로 남긴다.
+// ponytail: 이 목록은 실행 중인 Claude Code 환경에서 관찰한 변수들이다. Claude Code가 새 런타임 변수를 추가하면 늘려야 한다.
 // ponytail: SSH_*(SSH_AUTH_SOCK 등)는 그대로 둔다. 원격 호스트를 다루는 5단계에서 정한다.
 pub fn is_leaked_env(name: &str) -> bool {
     matches!(
         name,
-        "TMUX" | "TMUX_PANE" | "CLAUDECODE" | "CLAUDE_CONFIG_DIR" | "MINE_SESSION"
-    ) || name.starts_with("CLAUDE_CODE_")
+        "TMUX"
+            | "TMUX_PANE"
+            | "CLAUDECODE"
+            | "CLAUDE_CODE_ENTRYPOINT"
+            | "CLAUDE_CODE_EXECPATH"
+            | "CLAUDE_CODE_SSE_PORT"
+            | "CLAUDE_PID"
+            | "CLAUDE_PLUGIN_DATA"
+            | "CLAUDE_EFFORT"
+            | "CLAUDE_CONFIG_DIR"
+            | "MINE_SESSION"
+    ) || [
+        "CLAUDE_CODE_SESSION_",
+        "CLAUDE_CODE_CHILD_",
+        "CLAUDE_CODE_MESSAGING_",
+    ]
+    .iter()
+    .any(|prefix| name.starts_with(prefix))
 }
 
 /// 로그인 셸 경로. `SHELL`이 비어 있거나 없으면 `/bin/zsh`다.
@@ -469,12 +490,32 @@ mod tests {
             "TMUX_PANE",
             "CLAUDECODE",
             "CLAUDE_CODE_ENTRYPOINT",
+            "CLAUDE_CODE_EXECPATH",
+            "CLAUDE_CODE_SSE_PORT",
+            "CLAUDE_PID",
+            "CLAUDE_PLUGIN_DATA",
+            "CLAUDE_EFFORT",
             "CLAUDE_CONFIG_DIR",
             "MINE_SESSION",
+            "CLAUDE_CODE_SESSION_ID",
+            "CLAUDE_CODE_CHILD_SESSION",
+            "CLAUDE_CODE_MESSAGING_SOCKET",
+            "CLAUDE_CODE_MESSAGING_TOKEN",
         ] {
             assert!(is_leaked_env(leaked), "{leaked}");
         }
-        for kept in ["PATH", "HOME", "MINE_STATE_DIR", "SSH_AUTH_SOCK", "CLAUDE"] {
+        // 사용자가 정한 CLAUDE_* 설정은 세션까지 넘어간다.
+        for kept in [
+            "PATH",
+            "HOME",
+            "MINE_STATE_DIR",
+            "SSH_AUTH_SOCK",
+            "CLAUDE",
+            "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_SESSION",
+            "CLAUDE_API_KEY",
+        ] {
             assert!(!is_leaked_env(kept), "{kept}");
         }
     }

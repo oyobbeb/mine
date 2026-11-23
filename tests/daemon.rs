@@ -835,8 +835,14 @@ fn sessions_do_not_inherit_the_daemon_spawners_environment() {
         ("TMUX_PANE", "%1".into()),
         ("CLAUDECODE", "1".into()),
         ("CLAUDE_CODE_ENTRYPOINT", "cli".into()),
+        ("CLAUDE_CODE_SESSION_ID", "fake-session-id".into()),
+        ("CLAUDE_CODE_MESSAGING_TOKEN", "fake-secret-token".into()),
+        ("CLAUDE_PID", "4242".into()),
         ("CLAUDE_CONFIG_DIR", "/tmp/fake-claude-b".into()),
         ("MINE_SESSION", "stale".into()),
+        // 사용자가 일부러 켠 설정은 세션 자식까지 넘어가야 한다.
+        ("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", "1".into()),
+        ("CLAUDE_CODE_USE_BEDROCK", "1".into()),
     ]);
     mine(&st, &["new", "s"]);
     mine(
@@ -860,30 +866,49 @@ fn sessions_do_not_inherit_the_daemon_spawners_environment() {
         "CLAUDE_CONFIG_DIR={}",
         st.root.join("profiles").join("claude-b").display()
     );
+    // 값에는 토큰이 들어 있을 수 있으므로 실패 메시지에는 변수 이름만 적는다.
+    let names = |env: &[String]| -> Vec<String> {
+        env.iter()
+            .map(|kv| {
+                kv.split_once('=')
+                    .map_or(kv.as_str(), |(k, _)| k)
+                    .to_owned()
+            })
+            .collect()
+    };
     for name in ["s", "a", "b"] {
         let env = env_of(name);
-        let leaked: Vec<&String> = env
-            .iter()
-            .filter(|kv| {
+        let leaked: Vec<String> = names(&env)
+            .into_iter()
+            .filter(|k| {
                 [
-                    "TMUX=",
-                    "TMUX_PANE=",
-                    "CLAUDECODE=",
-                    "CLAUDE_CODE_",
-                    "CLAUDE_CONFIG_DIR=",
+                    "TMUX",
+                    "TMUX_PANE",
+                    "CLAUDECODE",
+                    "CLAUDE_CODE_ENTRYPOINT",
+                    "CLAUDE_CODE_SESSION_ID",
+                    "CLAUDE_CODE_MESSAGING_TOKEN",
+                    "CLAUDE_PID",
+                    "CLAUDE_CONFIG_DIR",
                 ]
-                .iter()
-                .any(|p| kv.starts_with(p))
+                .contains(&k.as_str())
             })
-            .filter(|kv| !(name == "b" && **kv == profile))
+            .filter(|k| !(name == "b" && k == "CLAUDE_CONFIG_DIR" && env.contains(&profile)))
             .collect();
-        assert!(leaked.is_empty(), "{name}: {leaked:?}");
+        assert!(leaked.is_empty(), "{name}: 새어 나온 변수 {leaked:?}");
         for want in [
             "TERM=xterm-256color".to_string(),
             "COLORTERM=truecolor".to_string(),
             format!("MINE_SESSION={}", st.id(name)),
+            "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1".to_string(),
+            "CLAUDE_CODE_USE_BEDROCK=1".to_string(),
         ] {
-            assert!(env.contains(&want), "{name}: {want} 없음: {env:?}");
+            assert!(
+                env.contains(&want),
+                "{name}: {} 없음, 있는 변수 {:?}",
+                want.split_once('=').map_or(want.as_str(), |(k, _)| k),
+                names(&env)
+            );
         }
     }
     assert!(env_of("b").contains(&profile));
