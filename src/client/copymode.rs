@@ -7,6 +7,7 @@ use alacritty_terminal::grid::{Dimensions, Grid, Row};
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::{Cell, Flags};
 
+use super::input::HANGUL_HINT;
 use super::select::Selection;
 use crate::screen::Screen;
 
@@ -32,6 +33,8 @@ pub struct CopyMode {
     pub forward: bool,
     /// `/`·`?` 뒤 검색어를 입력하는 중이다.
     pub typing: bool,
+    /// 명령 키 자리에 한글이 와서 아무것도 하지 않았다. 다음 키나 휠까지 상태줄이 영문으로 바꾸라고 알린다.
+    pub hangul: bool,
     /// 입력 중인 검색어. Enter로 확정하기 전에는 `query`를 건드리지 않아서 Esc가 지난 검색을 그대로 둔다.
     pub input: String,
     /// 입력 중인 검색의 방향. Enter로 확정하면 `forward`가 된다.
@@ -102,6 +105,7 @@ impl CopyMode {
             query: String::new(),
             forward: true,
             typing: false,
+            hangul: false,
             input: String::new(),
             typing_forward: true,
             page: 1,
@@ -114,6 +118,7 @@ impl CopyMode {
 
     pub fn key(&mut self, lines: &[String], b: u8) -> CopyOut {
         self.miss = false;
+        self.hangul = false;
         if self.typing {
             self.type_key(lines, b);
             return CopyOut::Stay;
@@ -173,6 +178,7 @@ impl CopyMode {
     /// 키를 거치지 않는 휠에서도 "검색 결과 없음"이 걷히게 여기서 알림을 지운다.
     pub fn move_lines(&mut self, lines: &[String], delta: isize) {
         self.miss = false;
+        self.hangul = false;
         let from = self.line;
         self.go(lines, self.line.saturating_add_signed(delta));
         self.drift += self.line as i32 - from as i32;
@@ -288,7 +294,9 @@ impl CopyMode {
             let prompt = if self.typing_forward { '/' } else { '?' };
             return format!("{prompt}{}", self.input);
         }
-        let hint = if self.miss {
+        let hint = if self.hangul {
+            HANGUL_HINT
+        } else if self.miss {
             "검색 결과 없음"
         } else {
             "v 선택 · y 복사 · / ? 검색 · q 끝"
@@ -1282,5 +1290,25 @@ mod tests {
         // 가득 찬 줄이 아니면 이어진 줄이 아니다.
         let sc = screen(10, 5, b"ab  \r\ncd");
         assert_eq!(copy_range(&sc, "gvjl"), CopyOut::Copy("ab\ncd".to_string()));
+    }
+
+    #[test]
+    fn hangul_hint_replaces_the_status_hint_until_the_next_key_or_wheel() {
+        let ls = l(&["abc", "def"]);
+        let mut c = CopyMode::new(&ls);
+        c.hangul = true;
+        assert_eq!(
+            c.status(2),
+            "복사 모드 │ 2/2 │ 한/영을 영문으로 바꾸고 다시 누르세요"
+        );
+        c.move_lines(&ls, -1);
+        assert!(!c.hangul && c.status(2).ends_with("v 선택 · y 복사 · / ? 검색 · q 끝"));
+        c.hangul = true;
+        c.key(&ls, b'j');
+        assert!(!c.hangul);
+        // 검색어를 입력하는 중에는 입력이 상태줄이다.
+        c.key(&ls, b'/');
+        c.hangul = true;
+        assert_eq!(c.status(2), "/");
     }
 }

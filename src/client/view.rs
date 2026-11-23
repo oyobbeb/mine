@@ -67,6 +67,14 @@ fn initial(root: &Path) -> char {
         .unwrap_or('?')
 }
 
+/// 프로젝트 폴더 이름. 이름이 없는 경로(루트)는 경로 전체다.
+pub fn folder_name(root: &Path) -> String {
+    root.file_name().map_or_else(
+        || root.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    )
+}
+
 /// `project_key` 해시 앞 8자리를 색 개수로 나눈 나머지.
 fn color(root: &Path) -> usize {
     let key = project_key(root);
@@ -252,6 +260,12 @@ mod tests {
         assert!(!r[1].approval);
         // 이름이 없는 경로(루트)는 '?'로 보인다.
         assert_eq!(rail(&[], Path::new("/"))[1].initial, '?');
+    }
+
+    #[test]
+    fn folder_name_is_the_last_component_or_the_whole_root() {
+        assert_eq!(folder_name(Path::new("/p/kyoto")), "kyoto");
+        assert_eq!(folder_name(Path::new("/")), "/");
     }
 
     #[test]

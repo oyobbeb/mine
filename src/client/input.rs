@@ -44,6 +44,28 @@ pub enum Action {
     Mouse(MouseEv),
     /// 붙여넣기 내용(마커 제외).
     Paste(Vec<u8>),
+    /// 접두 뒤에 명령 키 대신 한글이 왔다. 버리고(세션에 넘기지 않는다) 영문으로 바꾸라고 알린다.
+    Hangul,
+}
+
+/// 한글이 명령 키 자리에 왔을 때 상태줄에 띄우는 안내.
+pub const HANGUL_HINT: &str = "한/영을 영문으로 바꾸고 다시 누르세요";
+
+/// 한글 자모(U+1100–11FF, U+3130–318F)나 음절(U+AC00–D7A3)인가.
+pub fn is_hangul(c: char) -> bool {
+    matches!(c, '\u{1100}'..='\u{11FF}' | '\u{3130}'..='\u{318F}' | '\u{AC00}'..='\u{D7A3}')
+}
+
+/// `bytes`가 한글 한 글자로 시작하는가. 글자가 덜 왔으면 아니다.
+pub fn hangul_at(bytes: &[u8]) -> bool {
+    let Some(&lead) = bytes.first() else {
+        return false;
+    };
+    bytes
+        .get(..1 + usize::from(utf8_tail(lead)))
+        .and_then(|c| std::str::from_utf8(c).ok())
+        .and_then(|s| s.chars().next())
+        .is_some_and(is_hangul)
 }
 
 const PREFIX: u8 = 0x01;
@@ -359,6 +381,12 @@ impl InputParser {
             }
             i += 1;
             if self.prefix {
+                let tail = utf8_tail(b);
+                // 여러 바이트 문자는 끝까지 읽어야 한글인지 가른다. 읽기 경계에 걸쳤으면 다음 읽기로 미룬다.
+                if buf.len() < i + usize::from(tail) {
+                    self.pending = buf[i - 1..].to_vec();
+                    break;
+                }
                 self.prefix = false;
                 match (b, command(b)) {
                     (PREFIX, _) => plain.push(PREFIX),
@@ -366,8 +394,14 @@ impl InputParser {
                         flush(&mut out, &mut plain);
                         out.push(Action::Cmd(cmd));
                     }
-                    // 모르는 키는 버린다. 여러 바이트 문자는 끝까지 버린다.
-                    _ => self.skip = utf8_tail(b),
+                    // 모르는 키는 버린다(세션에 넘기지 않는다). 한글이면 알린다. 여러 바이트 문자는 끝까지 버린다.
+                    _ => {
+                        if hangul_at(&buf[i - 1..]) {
+                            flush(&mut out, &mut plain);
+                            out.push(Action::Hangul);
+                        }
+                        self.skip = tail;
+                    }
                 }
                 continue;
             }
@@ -524,17 +558,78 @@ mod tests {
 
     #[test]
     fn prefix_then_multibyte_char_is_dropped_whole() {
-        let all = [b"\x01".as_slice(), "한".as_bytes()].concat();
-        // 읽기 경계가 어디에 걸려도 연속 바이트가 새지 않는다.
-        for cut in 0..=all.len() {
-            let mut ip = InputParser::new();
-            assert!(ip.feed(&all[..cut]).is_empty(), "cut {cut}");
-            assert!(ip.feed(&all[cut..]).is_empty(), "cut {cut}");
+        // 한글이 아닌 여러 바이트 문자(2·3·4바이트)다. 알림도 없이 버린다.
+        for ch in ["é", "あ", "😀"] {
+            let all = [b"\x01".as_slice(), ch.as_bytes()].concat();
+            // 읽기 경계가 어디에 걸려도 연속 바이트가 새지 않는다.
+            for cut in 0..=all.len() {
+                let mut ip = InputParser::new();
+                assert!(ip.feed(&all[..cut]).is_empty(), "{ch} cut {cut}");
+                assert!(ip.feed(&all[cut..]).is_empty(), "{ch} cut {cut}");
+            }
+            // 버린 문자 뒤의 바이트는 평소처럼 전달한다.
+            assert_eq!(
+                p(&[all.as_slice(), b"ls"].concat()),
+                vec![Action::Pass(b"ls".to_vec())],
+                "{ch}"
+            );
         }
-        // 버린 문자 뒤의 바이트는 평소처럼 전달한다.
+    }
+
+    #[test]
+    fn hangul_ranges() {
+        for c in [
+            '\u{1100}', '\u{11FF}', '\u{3130}', 'ㄴ', '\u{318F}', '\u{AC00}', '한', '\u{D7A3}',
+        ] {
+            assert!(is_hangul(c), "{c:?}");
+        }
+        for c in [
+            'a', '\u{10FF}', '\u{1200}', '\u{312F}', '\u{3190}', 'あ', '\u{ABFF}', '\u{D7A4}',
+        ] {
+            assert!(!is_hangul(c), "{c:?}");
+        }
+        assert!(hangul_at("한글".as_bytes()) && !hangul_at(b"a") && !hangul_at(b""));
+        // 덜 온 글자는 한글로 치지 않는다.
+        assert!(!hangul_at(&"한".as_bytes()[..2]));
+    }
+
+    #[test]
+    fn prefix_then_hangul_is_reported_not_passed_to_the_session() {
+        // 자모(ㅊ은 한글 입력의 `c`), 옛 자모 영역, 음절. 읽기 경계가 어디에 걸려도 한 번 알린다.
+        for ch in ["ㅊ", "\u{1100}", "각"] {
+            let all = [b"\x01".as_slice(), ch.as_bytes()].concat();
+            for cut in 0..=all.len() {
+                let mut ip = InputParser::new();
+                let mut got = ip.feed(&all[..cut]);
+                got.extend(ip.feed(&all[cut..]));
+                assert_eq!(got, vec![Action::Hangul], "{ch} cut {cut}");
+            }
+            // 알린 뒤의 바이트는 평소처럼 전달한다. 접두는 풀렸다.
+            assert_eq!(
+                p(&[all.as_slice(), b"ns"].concat()),
+                vec![Action::Hangul, Action::Pass(b"ns".to_vec())],
+                "{ch}"
+            );
+        }
+        // 인코딩된 접두 뒤도 같다.
+        assert_eq!(p(&cat(&[KITTY_A, "한".as_bytes()])), [Action::Hangul]);
+        assert_eq!(p(&cat(&[MOK_A, "ㅊ".as_bytes()])), [Action::Hangul]);
+        // 앞서 온 글자와 순서가 유지된다.
         assert_eq!(
-            p(&[all.as_slice(), b"ls"].concat()),
-            vec![Action::Pass(b"ls".to_vec())]
+            p(&cat(&[b"ab\x01", "ㅊ".as_bytes(), b"c"])),
+            [
+                Action::Pass(b"ab".to_vec()),
+                Action::Hangul,
+                Action::Pass(b"c".to_vec())
+            ]
+        );
+    }
+
+    #[test]
+    fn hangul_without_the_prefix_is_ordinary_input() {
+        assert_eq!(
+            p("한글 ㅊ".as_bytes()),
+            vec![Action::Pass("한글 ㅊ".as_bytes().to_vec())]
         );
     }
 

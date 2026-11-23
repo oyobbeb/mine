@@ -1,6 +1,6 @@
 //! 클라이언트 화면. 아이콘 줄·목록·터미널 칸·상태줄의 배치와 그리기, 마우스 위치 해석만 맡는다.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line as GridLine};
@@ -14,6 +14,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
+use crate::client::launcher::{self, Choice};
 use crate::client::view::{self, Group, NEW_USAGE, PROJECT_COLORS, RailItem};
 use crate::screen::Screen;
 use crate::session::{SessionInfo, SessionState};
@@ -35,9 +36,16 @@ pub struct Model {
     pub toggled: Vec<SessionState>,
     /// 복사 모드처럼 상태줄 전체를 대신할 글. 있으면 세션 경로·키 안내·알림 대신 이것을 그리고, 세션 커서는 숨긴다.
     pub status: Option<String>,
+    /// 시작 화면(`launcher`)을 터미널 칸에 그린다. 붙은 세션이 없을 때와 `⌃a c`로 연 동안 참이다.
+    pub launcher: bool,
 }
 
 impl Model {
+    /// 새 세션을 만들 프로젝트. 선택한 프로젝트, 전체(∗)면 `mine`을 실행한 프로젝트다.
+    pub fn project(&self) -> &Path {
+        self.filter.as_deref().unwrap_or(&self.current_project)
+    }
+
     /// 목록에 그리는 묶음. 기본 접힘에 `toggled`를 얹고, 붙은 세션의 묶음은 늘 펼친다.
     /// 목록 그리기·`hit`·`⌃a n/p`가 모두 이 묶음을 쓴다.
     pub fn visible_groups(&self) -> Vec<Group> {
@@ -69,7 +77,7 @@ impl Model {
 /// 상태줄에서 받는 입력.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Prompt {
-    /// `⌃a c`: 새 세션 명세를 입력 중이다.
+    /// 시작 화면의 `n`: 새 세션 명세를 입력 중이다.
     New(String),
     /// `⌃a x`: 이 세션 id를 닫을지 묻는다.
     ConfirmKill(String),
@@ -91,6 +99,8 @@ pub enum Hit {
     Rail(usize),
     Group(usize),
     Row(usize),
+    /// 시작 화면의 선택 줄.
+    Launch(Choice),
     Term(u16, u16),
     None,
 }
@@ -123,11 +133,17 @@ const YELLOW: Color = rgb(0xe5c07b);
 const PURPLE: Color = rgb(0xc678dd);
 const CYAN: Color = rgb(0x56b6c2);
 const GREEN: Color = rgb(0x98c379);
-const MUTED: Color = rgb(0x6b707a);
-const HEAD: Color = rgb(0x8a8f99);
+pub(super) const MUTED: Color = rgb(0x6b707a);
+pub(super) const HEAD: Color = rgb(0x8a8f99);
 const COUNT: Color = rgb(0x5f646e);
 const SELECTED_BG: Color = rgb(0x2f323a);
 const WAITING: Color = rgb(0xc9a85c);
+/// 패널 바탕(목업 `project-rail.html`). 상태줄은 아이콘 줄과 같은 바탕이다.
+const RAIL_BG: Color = rgb(0x1b1d23);
+const LIST_BG: Color = rgb(0x23252b);
+/// 아이콘 줄·목록의 오른쪽 끝 열 바탕. 패널과 옆 칸을 가른다.
+const BORDER: Color = rgb(0x2c2f36);
+const LIST_FG: Color = rgb(0xd0d3da);
 
 /// 아래 한 줄은 상태줄, 왼쪽부터 아이콘 줄 4칸, (펼쳤으면) 목록 30칸, 나머지가 터미널 칸이다.
 pub fn layout(area: Rect, list_open: bool) -> Areas {
@@ -149,6 +165,7 @@ pub fn layout(area: Rect, list_open: bool) -> Areas {
 
 pub fn draw(f: &mut Frame, m: &Model, screen: Option<&Screen>) {
     let a = layout(f.area(), m.list_open);
+    paint_panels(f.buffer_mut(), &a);
     let rail = view::rail(&m.sessions, &m.current_project);
     let selected = rail
         .iter()
@@ -163,7 +180,10 @@ pub fn draw(f: &mut Frame, m: &Model, screen: Option<&Screen>) {
             .collect();
         f.render_widget(Paragraph::new(lines), list);
     }
-    if let Some(sc) = screen {
+    paint_edges(f.buffer_mut(), &a);
+    if m.launcher {
+        launcher::draw(f.buffer_mut(), a.term, m.project());
+    } else if let Some(sc) = screen {
         draw_term(f.buffer_mut(), a.term, sc);
         if m.attached.is_some()
             && m.status.is_none()
@@ -196,9 +216,34 @@ pub fn hit(a: &Areas, m: &Model, col: u16, row: u16) -> Hit {
         };
     }
     if a.term.contains(pos) {
+        // 시작 화면이 세션 칸을 덮는 동안은 선택 줄만 누를 수 있다.
+        if m.launcher {
+            return launcher::hit(a.term, col, row).map_or(Hit::None, Hit::Launch);
+        }
         return Hit::Term(col - a.term.x, row - a.term.y);
     }
     Hit::None
+}
+
+/// 아이콘 줄·목록·상태줄 바탕을 칠한다. 글자를 그리기 전에 부른다.
+/// 글자가 없는 칸까지 칠해 패널로 읽히고, 투명한 창에서도 비치지 않는다.
+fn paint_panels(buf: &mut Buffer, a: &Areas) {
+    buf.set_style(a.rail, Style::new().fg(LIST_FG).bg(RAIL_BG));
+    if let Some(list) = a.list {
+        buf.set_style(list, Style::new().fg(LIST_FG).bg(LIST_BG));
+    }
+    buf.set_style(a.status, Style::new().fg(LIST_FG).bg(RAIL_BG));
+}
+
+/// 아이콘 줄과 목록의 오른쪽 끝 열 바탕을 경계색으로 바꿔 옆 칸과 가른다.
+/// 선택한 줄의 바탕까지 덮도록 글자를 그린 뒤에 부른다.
+///
+/// ponytail: 글자를 덮지 않게 바탕만 바꾼 한 칸짜리 띠다. 얇은 선 글자는 필요해지면 한다.
+fn paint_edges(buf: &mut Buffer, a: &Areas) {
+    for r in [Some(a.rail), a.list].into_iter().flatten() {
+        let edge = Rect::new(r.right().saturating_sub(1), r.y, r.width.min(1), r.height);
+        buf.set_style(edge, Style::new().bg(BORDER));
+    }
 }
 
 /// 터미널 칸(`area`)에 보이는 세션 화면의 하이퍼링크 구간. 줄을 넘지 않고, 같은 링크가 이어지는 칸끼리 묶는다.
@@ -265,6 +310,8 @@ enum Item {
     Session(usize),
     /// 승인 대기 세션 아래의 대기 문구.
     Waiting(usize),
+    /// 이 프로젝트에 세션이 하나도 없다.
+    Empty,
     NewHint,
 }
 
@@ -278,10 +325,14 @@ impl Item {
     }
 }
 
-/// 목록 줄 순서. 맨 위 프로젝트 이름, 상태 묶음마다 머리와 (펼쳤으면) 세션 줄, 맨 아래 새 세션 안내.
+/// 목록 줄 순서. 맨 위 프로젝트 이름, 상태 묶음마다 머리와 (펼쳤으면) 세션 줄(없으면 `(세션 없음)`), 맨 아래 새 세션 안내.
 fn items(m: &Model) -> Vec<Item> {
     let mut out = vec![Item::Title];
-    for (i, g) in m.visible_groups().into_iter().enumerate() {
+    let groups = m.visible_groups();
+    if groups.is_empty() {
+        out.push(Item::Empty);
+    }
+    for (i, g) in groups.into_iter().enumerate() {
         let rows = if g.collapsed {
             Vec::new()
         } else {
@@ -304,13 +355,10 @@ fn item_line(m: &Model, rail: &[RailItem], item: &Item, width: usize) -> Line<'s
     match item {
         Item::Title => {
             let title = match &m.filter {
-                Some(p) => p.file_name().map_or_else(
-                    || p.display().to_string(),
-                    |n| n.to_string_lossy().into_owned(),
-                ),
+                Some(p) => view::folder_name(p),
                 None => "전체".to_string(),
             };
-            Line::styled(title, Style::new().add_modifier(Modifier::BOLD))
+            Line::styled(title, Style::new().fg(MARK).add_modifier(Modifier::BOLD))
         }
         Item::Head(_, g) => {
             let (glyph, color, label) = match g.state {
@@ -336,6 +384,7 @@ fn item_line(m: &Model, rail: &[RailItem], item: &Item, width: usize) -> Line<'s
             let waiting = m.sessions[*i].waiting.as_deref().unwrap_or_default();
             Line::styled(format!("    {waiting}"), WAITING)
         }
+        Item::Empty => Line::styled("  (세션 없음)", MUTED),
         Item::NewHint => Line::styled("＋ 새 세션  ⌃a c", MUTED),
     }
 }
@@ -381,7 +430,7 @@ fn session_line(m: &Model, rail: &[RailItem], i: usize, width: usize) -> Line<'s
 }
 
 /// 계정 칩. claude-a `A` 노랑, claude-b `B` 보라, codex `C` 청록. 그 밖(shell)은 없다.
-fn chip(account: Option<&str>) -> Option<Span<'static>> {
+pub(super) fn chip(account: Option<&str>) -> Option<Span<'static>> {
     let (letter, bg) = match account? {
         "claude-a" => ("A", YELLOW),
         "claude-b" => ("B", PURPLE),
@@ -572,7 +621,7 @@ fn draw_status(f: &mut Frame, area: Rect, m: &Model) {
                 )),
             }
             if m.message.is_empty() {
-                Span::styled(KEYS, MUTED)
+                Span::styled(if m.launcher { launcher::KEYS } else { KEYS }, MUTED)
             } else {
                 Span::styled(m.message.clone(), YELLOW)
             }
@@ -649,6 +698,7 @@ mod tests {
             message: String::new(),
             toggled: Vec::new(),
             status: None,
+            launcher: false,
         }
     }
 
@@ -940,5 +990,94 @@ mod tests {
         // 칸이 화면보다 좁으면 잘린 만큼만 돌려준다.
         let runs = link_runs(&sc, Rect::new(0, 0, 6, 3));
         assert_eq!(runs[0].text, "a.");
+    }
+
+    #[test]
+    fn panels_are_filled_with_the_mockup_colors_even_far_below_the_content() {
+        let mut m = kyoto();
+        m.attached = Some("k-billing".into());
+        let buf = render(&m, 100, 30);
+        let bg = |x, y| cell(&buf, x, y).bg;
+        let rail = Color::Rgb(0x1b, 0x1d, 0x23);
+        let list = Color::Rgb(0x23, 0x25, 0x2b);
+        let border = Color::Rgb(0x2c, 0x2f, 0x36);
+        // 글자가 없는 아래쪽 칸까지 칠한다.
+        for y in [0, 5, 28] {
+            assert_eq!((bg(0, y), bg(2, y)), (rail, rail), "rail y={y}");
+            assert_eq!((bg(4, y), bg(20, y)), (list, list), "list y={y}");
+            // 아이콘 줄의 오른쪽 끝 열과 목록의 오른쪽 끝 열이 경계다.
+            assert_eq!((bg(3, y), bg(33, y)), (border, border), "border y={y}");
+        }
+        // 터미널 칸은 칠하지 않는다. 상태줄은 아이콘 줄과 같은 바탕이다.
+        assert_eq!(bg(34, 10), Color::Reset);
+        assert_eq!((bg(0, 29), bg(35, 29), bg(60, 29)), (rail, rail, rail));
+        // 선택한 줄은 목록 바탕 위에 선택색이고, 마지막 열은 그래도 경계다.
+        assert_eq!(bg(10, 2), Color::Rgb(0x2f, 0x32, 0x3a));
+        assert_eq!(bg(33, 2), border);
+        // 글자색: 목록 글자, 제목(굵게), 묶음 머리, 대기 문구.
+        let fg = |x, y| cell(&buf, x, y).fg;
+        // 목록은 4열부터다: 빈 칸, 세션 이름(`billing`은 6열), 제목, 묶음 머리, 대기 문구.
+        assert_eq!(fg(10, 8), Color::Rgb(0xd0, 0xd3, 0xda));
+        assert_eq!(fg(6, 2), Color::Rgb(0xd0, 0xd3, 0xda));
+        assert_eq!(fg(4, 0), Color::Rgb(0xe6, 0xe6, 0xe6));
+        assert!(cell(&buf, 4, 0).modifier.contains(Modifier::BOLD));
+        assert_eq!(fg(4, 1), Color::Rgb(0x8a, 0x8f, 0x99));
+        assert_eq!(fg(8, 3), Color::Rgb(0xc9, 0xa8, 0x5c));
+        // 상태줄 글자는 바탕 위에서 읽히는 색이다.
+        assert_eq!(fg(0, 29), Color::Rgb(0xd0, 0xd3, 0xda));
+    }
+
+    #[test]
+    fn list_boundary_follows_the_list_and_the_rail_keeps_its_own_when_collapsed() {
+        let mut m = kyoto();
+        m.list_open = false;
+        let buf = render(&m, 100, 30);
+        let border = Color::Rgb(0x2c, 0x2f, 0x36);
+        assert_eq!(cell(&buf, 3, 12).bg, border);
+        assert_eq!(cell(&buf, 4, 12).bg, Color::Reset);
+        assert_eq!(cell(&buf, 33, 12).bg, Color::Reset);
+    }
+
+    #[test]
+    fn empty_project_list_says_so_in_muted_text() {
+        let buf = render(&model(vec![]), 100, 20);
+        assert_eq!(row_text(&buf, 0).trim(), "kyoto");
+        // 줄 앞쪽은 아이콘 줄이다. 목록은 4열부터고 세션 줄처럼 두 칸 들여 쓴다.
+        assert!(row_text(&buf, 1).ends_with("  (세션 없음)"));
+        assert_eq!(cell(&buf, 6, 1).symbol(), "(");
+        assert_eq!(cell(&buf, 6, 1).fg, Color::Rgb(0x6b, 0x70, 0x7a));
+        assert!(text(&buf).contains("＋ 새 세션  ⌃a c"));
+        // 세션이 있으면 보이지 않는다. 다른 프로젝트 세션만 있으면 이 프로젝트는 빈 것이다.
+        assert!(!text(&render(&kyoto(), 100, 20)).contains("(세션 없음)"));
+        let other = model(vec![s("/p/mine", "core", Working, "codex", None)]);
+        assert!(text(&render(&other, 100, 20)).contains("(세션 없음)"));
+    }
+
+    #[test]
+    fn launcher_replaces_the_term_pane_and_the_status_hint() {
+        let mut sc = Screen::new(20, 3);
+        sc.feed(b"hello");
+        let mut m = model(vec![]);
+        m.launcher = true;
+        let a = layout(Rect::new(0, 0, 100, 20), true);
+        let buf = render_with_screen(&m, &sc, 100, 20);
+        // 세션 화면 대신 시작 화면이 터미널 칸에 그려진다.
+        assert!(!text(&buf).contains("hello"));
+        assert!(row_of(&buf, "claude-a").contains("↵  claude-a"));
+        assert!(row_text(&buf, 19).ends_with("↵ claude-a · b claude-b · x codex · s shell"));
+        // 마우스: 선택 줄은 `Launch`, 칸의 나머지는 세션에 넘기지 않는다.
+        let y = y_of(&buf, "claude-b");
+        let x = (0..100)
+            .find(|&x| cell(&buf, x, y).symbol() == "b")
+            .unwrap();
+        assert_eq!(hit(&a, &m, x, y), Hit::Launch(Choice::ClaudeB));
+        assert_eq!(hit(&a, &m, a.term.x, a.term.y), Hit::None);
+        // 끄면 세션 화면과 평소 안내로 돌아온다.
+        m.launcher = false;
+        m.attached = Some("k-x".into());
+        let buf = render_with_screen(&m, &sc, 100, 20);
+        assert!(text(&buf).contains("hello") && !text(&buf).contains("claude-a"));
+        assert!(row_text(&buf, 19).ends_with("d 나가기"));
+        assert_eq!(hit(&a, &m, a.term.x, a.term.y), Hit::Term(0, 0));
     }
 }
