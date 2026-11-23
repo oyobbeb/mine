@@ -56,7 +56,7 @@ pub fn start(
             {
                 Ok(rt) => rt,
                 Err(e) => {
-                    let reason = format!("데몬 연결 런타임을 만들지 못했다: {e}");
+                    let reason = format!("데몬 연결 런타임을 만들지 못했어요: {e}");
                     let _ = events.unbounded_send(LinkEvent::Disconnected(reason));
                     return;
                 }
@@ -119,7 +119,7 @@ async fn pump(
         tokio::select! {
             msg = rx.recv() => match msg {
                 Some(msg) => events.unbounded_send(LinkEvent::Msg(msg)).ok()?,
-                None => return Some("데몬 연결이 끊겼다".into()),
+                None => return Some("데몬 연결이 끊겼어요".into()),
             },
             msg = outgoing.next() => {
                 // `None`이면 앱이 링크를 버렸다. 보내기가 실패하면 쓰기 작업이 끝난 것이고, 곧 `rx`가 끝을 알린다.

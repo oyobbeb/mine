@@ -611,7 +611,7 @@ fn draw_status(f: &mut Frame, area: Rect, m: &Model) {
                 .iter()
                 .find(|s| s.meta.id == *id)
                 .map_or(id.as_str(), |s| s.meta.name.as_str());
-            left.push(Span::styled(format!("{name} 세션을 닫을까?"), YELLOW));
+            left.push(Span::styled(format!("{name} 세션을 닫을까요?"), YELLOW));
             Span::styled("y 닫기 · 다른 키 취소", MUTED)
         }
         None => {

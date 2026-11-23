@@ -115,7 +115,7 @@ pub async fn run(state: State, project: PathBuf) -> Result<()> {
             },
             msg = rx.recv() => match msg {
                 Some(msg) => app.on_msg(msg),
-                None => bail!("데몬 연결이 끊겼다. mine을 다시 실행하면 세션에 다시 붙는다"),
+                None => bail!("데몬 연결이 끊겼어요. mine을 다시 실행하면 세션에 다시 붙어요"),
             },
             _ = winch.recv() => app.on_resize(terminal.size()?),
             _ = term.recv() => app.quit = true,
@@ -297,7 +297,7 @@ impl App {
                     copy.held.extend_from_slice(&data);
                     if copy.held.len() > MAX_HELD {
                         self.exit_copy();
-                        self.say("복사 모드 종료: 출력이 너무 많다");
+                        self.say("출력이 너무 많아서 복사 모드를 끝냈어요");
                     }
                 } else if let Some(screen) = &mut self.screen {
                     screen.feed(&data);
@@ -511,7 +511,7 @@ impl App {
                     self.m.prompt = Some(Prompt::ConfirmKill(id));
                     self.dirty = true;
                 }
-                None => self.say("닫을 세션이 없다"),
+                None => self.say("닫을 세션이 없어요"),
             },
             Cmd::ToggleList => {
                 self.m.list_open = !self.m.list_open;
@@ -666,7 +666,7 @@ impl App {
         }
         // 시작 화면이 세션 칸을 덮고 있으면 복사할 화면이 보이지 않는다.
         let Some(screen) = self.screen.as_ref().filter(|_| !self.m.launcher) else {
-            return self.say("복사할 세션 화면이 없다");
+            return self.say("복사할 세션 화면이 없어요");
         };
         // 쪽 넘김의 한 쪽(터미널 칸의 줄 수)은 `freeze`가 화면에서 읽는다. 크기가 바뀌면 복사 모드가 끝난다.
         let (lines, mode) = copymode::freeze(screen);
@@ -1775,7 +1775,7 @@ mod tests {
             data: b"\r\nend".to_vec().into_iter().chain([b'!'; 10]).collect(),
         });
         assert!(app.copy.is_none() && app.m.status.is_none());
-        assert_eq!(app.m.message, "복사 모드 종료: 출력이 너무 많다");
+        assert_eq!(app.m.message, "출력이 너무 많아서 복사 모드를 끝냈어요");
         // 넘친 덩이까지 화면에 먹였고 맨 아래로 돌아와 있다.
         assert_eq!(offset(&app), 0);
         assert!(
@@ -2158,7 +2158,7 @@ mod tests {
         app.on_input(b"\x01c");
         app.on_input(b"\x01[");
         assert!(app.copy.is_none() && app.m.launcher);
-        assert_eq!(app.m.message, "복사할 세션 화면이 없다");
+        assert_eq!(app.m.message, "복사할 세션 화면이 없어요");
     }
 
     #[test]

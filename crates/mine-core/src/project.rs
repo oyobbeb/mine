@@ -22,7 +22,7 @@ pub fn project_root(start: &Path, state: &State) -> Result<PathBuf> {
 fn project_root_in(start: &Path, state: &State, home: Option<&Path>) -> Result<PathBuf> {
     let start = start
         .canonicalize()
-        .with_context(|| format!("경로를 확인할 수 없다: {}", start.display()))?;
+        .with_context(|| format!("경로를 확인할 수 없어요: {}", start.display()))?;
     let found = start
         .ancestors()
         .find(|dir| dir.join(".git").exists() || is_registered(state, dir, home));
@@ -71,13 +71,13 @@ fn register_in(state: &State, root: &Path, home: Option<&Path>) -> Result<()> {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let root = root
         .canonicalize()
-        .with_context(|| format!("경로를 확인할 수 없다: {}", root.display()))?;
+        .with_context(|| format!("경로를 확인할 수 없어요: {}", root.display()))?;
     if is_never_registered(&root, home) {
         return Ok(());
     }
     let text = root
         .to_str()
-        .ok_or_else(|| anyhow!("UTF-8이 아닌 경로는 등록할 수 없다: {}", root.display()))?;
+        .ok_or_else(|| anyhow!("UTF-8이 아닌 경로는 등록할 수 없어요: {}", root.display()))?;
     ensure_dir(&state.projects_dir())?;
     let file = registration_file(state, &root);
     // 확장자가 `.json`이 아니라서 `registered`가 읽지 않는다.
@@ -89,7 +89,7 @@ fn register_in(state: &State, root: &Path, home: Option<&Path>) -> Result<()> {
     ));
     fs::write(&tmp, serde_json::to_string(text)?)
         .and_then(|()| fs::rename(&tmp, &file))
-        .with_context(|| format!("등록 파일을 쓸 수 없다: {}", file.display()))
+        .with_context(|| format!("등록 파일을 쓸 수 없어요: {}", file.display()))
         .inspect_err(|_| {
             let _ = fs::remove_file(&tmp);
         })
@@ -101,7 +101,7 @@ pub fn registered(state: &State) -> Result<Vec<PathBuf>> {
     let entries = match fs::read_dir(&dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e).with_context(|| format!("읽을 수 없다: {}", dir.display())),
+        Err(e) => return Err(e).with_context(|| format!("읽을 수 없어요: {}", dir.display())),
     };
     let mut roots = Vec::new();
     for entry in entries {
@@ -114,7 +114,7 @@ pub fn registered(state: &State) -> Result<Vec<PathBuf>> {
             .and_then(|text| Ok(serde_json::from_str::<String>(&text)?));
         match parsed {
             Ok(root) => roots.push(PathBuf::from(root)),
-            Err(e) => eprintln!("경고: 등록 파일을 건너뛴다: {} ({e})", path.display()),
+            Err(e) => eprintln!("경고: 등록 파일을 건너뛰어요: {} ({e})", path.display()),
         }
     }
     roots.sort();

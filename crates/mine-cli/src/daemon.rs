@@ -166,7 +166,7 @@ pub async fn run(state: State) -> Result<()> {
         state.run_dir(),
         state.log_dir(),
     ] {
-        ensure_dir(&dir).with_context(|| format!("폴더를 만들 수 없다: {}", dir.display()))?;
+        ensure_dir(&dir).with_context(|| format!("폴더를 만들 수 없어요: {}", dir.display()))?;
     }
     let _pid = lock_pid_file(&state)?;
     let sock = state.daemon_sock();
@@ -176,13 +176,14 @@ pub async fn run(state: State) -> Result<()> {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => {
-            return Err(e).with_context(|| format!("남은 소켓을 지울 수 없다: {}", sock.display()));
+            return Err(e)
+                .with_context(|| format!("남은 소켓을 지울 수 없어요: {}", sock.display()));
         }
     }
     let listener = UnixListener::bind(&sock)
-        .with_context(|| format!("소켓을 만들지 못했다: {}", sock.display()))?;
+        .with_context(|| format!("소켓을 만들지 못했어요: {}", sock.display()))?;
     fs::set_permissions(&sock, fs::Permissions::from_mode(0o600))?;
-    let exe = std::env::current_exe().context("실행 파일 경로를 알 수 없다")?;
+    let exe = std::env::current_exe().context("실행 파일 경로를 알 수 없어요")?;
     let shared: Shared = Arc::new(Mutex::new(Daemon {
         state,
         exe,
@@ -219,7 +220,7 @@ fn lock_pid_file(state: &State) -> Result<File> {
         .create(true)
         .truncate(false)
         .open(&path)
-        .with_context(|| format!("pid 파일을 열 수 없다: {}", path.display()))?;
+        .with_context(|| format!("pid 파일을 열 수 없어요: {}", path.display()))?;
     let deadline = Instant::now() + PID_LOCK_WAIT;
     loop {
         match file.try_lock() {
@@ -228,11 +229,11 @@ fn lock_pid_file(state: &State) -> Result<File> {
                 std::thread::sleep(Duration::from_millis(20));
             }
             Err(TryLockError::WouldBlock) => {
-                bail!("다른 데몬이 이미 돌고 있다({})", path.display())
+                bail!("다른 데몬이 이미 돌고 있어요({})", path.display())
             }
             Err(TryLockError::Error(e)) => {
                 return Err(e)
-                    .with_context(|| format!("pid 파일을 잠글 수 없다: {}", path.display()));
+                    .with_context(|| format!("pid 파일을 잠글 수 없어요: {}", path.display()));
             }
         }
     }
@@ -315,10 +316,10 @@ async fn serve_client(shared: Shared, stream: UnixStream) {
         Ok(Some(ToDaemon::Hello { version })) => {
             let hint = restart_hint(&shared.lock().await.state);
             Some(format!(
-                "프로토콜 버전이 다르다(클라이언트 {version}, 데몬 {VERSION}). {hint}"
+                "프로토콜 버전이 달라요(클라이언트 {version}, 데몬 {VERSION}). {hint}"
             ))
         }
-        Ok(Some(_)) => Some("첫 메시지는 Hello여야 한다".to_string()),
+        Ok(Some(_)) => Some("첫 메시지는 Hello여야 해요".to_string()),
         Ok(None) | Err(_) => Some(String::new()),
     };
     match refused {
@@ -383,21 +384,23 @@ async fn new_session(shared: &Shared, client: u64, spec: NewSession) {
 
 async fn create(shared: &Shared, spec: NewSession) -> Result<()> {
     validate_name(&spec.name)?;
-    let project = spec
-        .project
-        .canonicalize()
-        .with_context(|| format!("프로젝트 폴더를 확인할 수 없다: {}", spec.project.display()))?;
+    let project = spec.project.canonicalize().with_context(|| {
+        format!(
+            "프로젝트 폴더를 확인할 수 없어요: {}",
+            spec.project.display()
+        )
+    })?;
     let id = session_id(&project_key(&project), &spec.name);
     let (state, exe) = {
         let mut d = shared.lock().await;
         if d.closing.contains_key(&id) {
             bail!(
-                "같은 이름의 세션을 아직 닫는 중이다. 잠시 뒤 다시 만든다: {}",
+                "같은 이름의 세션을 아직 닫는 중이에요. 잠시 뒤 다시 만들어 주세요: {}",
                 spec.name
             );
         }
         if d.sessions.contains_key(&id) || !d.starting.insert(id.clone()) {
-            bail!("같은 이름의 세션이 이미 있다: {}", spec.name);
+            bail!("같은 이름의 세션이 이미 있어요: {}", spec.name);
         }
         (d.state.clone(), d.exe.clone())
     };
@@ -466,7 +469,7 @@ async fn kill(shared: &Shared, client: u64, id: &str) {
             d.reply_sessions(client);
         } else {
             let message = format!(
-                "보관 프로세스가 {}초 안에 끝나지 않았다. 아직 돌고 있을 수 있다: {id}",
+                "보관 프로세스가 {}초 안에 끝나지 않았어요. 아직 돌고 있을 수 있어요: {id}",
                 KILL_WAIT.as_secs()
             );
             d.send(client, FromDaemon::Error { message });
@@ -493,7 +496,7 @@ async fn attach(shared: &Shared, client: u64, id: &str, size: (u16, u16)) {
             Ok(Some(link)) => kill_link(link),
             Ok(None) => d.gone(id),
             Err(e) => {
-                let message = format!("보관 프로세스에 다시 붙지 못했다: {e:#}");
+                let message = format!("보관 프로세스에 다시 붙지 못했어요: {e:#}");
                 eprintln!("{id}: {message}");
                 d.send(client, FromDaemon::Error { message });
             }
@@ -513,7 +516,7 @@ async fn attach(shared: &Shared, client: u64, id: &str, size: (u16, u16)) {
             Err(e) => d.send(
                 client,
                 FromDaemon::Error {
-                    message: format!("세션을 다시 띄우지 못했다: {e:#}"),
+                    message: format!("세션을 다시 띄우지 못했어요: {e:#}"),
                 },
             ),
         }
@@ -546,12 +549,12 @@ async fn start_holder(state: &State, exe: &Path, meta: &Meta) -> Result<Started>
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => {
             return Err(e)
-                .with_context(|| format!("지난 exit 파일을 지울 수 없다: {}", exit.display()));
+                .with_context(|| format!("지난 exit 파일을 지울 수 없어요: {}", exit.display()));
         }
     }
     let log_path = state.log_dir().join(format!("hold-{}.log", meta.id));
     let log = File::create(&log_path)
-        .with_context(|| format!("로그 파일을 열 수 없다: {}", log_path.display()))?;
+        .with_context(|| format!("로그 파일을 열 수 없어요: {}", log_path.display()))?;
     let launch = session::launch(meta, state, exe);
     let mut cmd = tokio::process::Command::new(exe);
     // portable-pty는 보관 프로세스의 환경을 자식에 그대로 넘기므로, 데몬을 띄운 셸의 환경은 여기서 지운다.
@@ -591,7 +594,7 @@ async fn start_holder(state: &State, exe: &Path, meta: &Meta) -> Result<Started>
             Ok(())
         });
     }
-    let mut child = cmd.spawn().context("보관 프로세스를 띄우지 못했다")?;
+    let mut child = cmd.spawn().context("보관 프로세스를 띄우지 못했어요")?;
     let deadline = Instant::now() + START_WAIT;
     loop {
         if let Ok(Some(link)) = connect_holder(&sock).await {
@@ -604,13 +607,13 @@ async fn start_holder(state: &State, exe: &Path, meta: &Meta) -> Result<Started>
             }
             let log = fs::read_to_string(&log_path).unwrap_or_default();
             let log = log.split_whitespace().collect::<Vec<_>>().join(" ");
-            bail!("세션을 띄우지 못했다: {log}");
+            bail!("세션을 띄우지 못했어요: {log}");
         }
         if Instant::now() >= deadline {
             let _ = child.start_kill();
             reap(child);
             bail!(
-                "보관 프로세스가 {}초 안에 뜨지 않았다",
+                "보관 프로세스가 {}초 안에 뜨지 않았어요",
                 START_WAIT.as_secs()
             );
         }
@@ -642,7 +645,8 @@ async fn connect_holder(sock: &Path) -> Result<Option<Link>> {
             return Ok(None);
         }
         Err(e) => {
-            return Err(e).with_context(|| format!("보관 소켓에 붙지 못했다: {}", sock.display()));
+            return Err(e)
+                .with_context(|| format!("보관 소켓에 붙지 못했어요: {}", sock.display()));
         }
     };
     let (read, writer) = stream.into_split();
@@ -650,13 +654,13 @@ async fn connect_holder(sock: &Path) -> Result<Option<Link>> {
     match timeout(LINK_WAIT, recv::<_, HoldOut>(&mut reader)).await?? {
         Some(HoldOut::Hello { version, .. }) if version == HOLD_VERSION => {}
         Some(HoldOut::Hello { version, .. }) => {
-            bail!("보관 프로세스 버전이 다르다(보관 {version}, 데몬 {HOLD_VERSION})")
+            bail!("보관 프로세스 버전이 달라요(보관 {version}, 데몬 {HOLD_VERSION})")
         }
-        other => bail!("보관 프로세스가 Hello를 보내지 않았다: {other:?}"),
+        other => bail!("보관 프로세스가 Hello를 보내지 않았어요: {other:?}"),
     }
     let ring = match timeout(LINK_WAIT, recv::<_, HoldOut>(&mut reader)).await?? {
         Some(HoldOut::Output { data }) => data,
-        other => bail!("보관 프로세스가 출력 버퍼를 보내지 않았다: {other:?}"),
+        other => bail!("보관 프로세스가 출력 버퍼를 보내지 않았어요: {other:?}"),
     };
     Ok(Some(Link {
         reader,
@@ -1107,7 +1111,7 @@ impl Daemon {
             return;
         }
         let Some(s) = self.sessions.get_mut(id) else {
-            let message = format!("세션이 없다: {id}");
+            let message = format!("세션이 없어요: {id}");
             return self.send(client, FromDaemon::Error { message });
         };
         s.resize(size);
@@ -1189,7 +1193,7 @@ impl Daemon {
     /// 돌려준다. 세션이 없으면 클라이언트에 보낼 오류 문구를 돌려준다.
     fn kill(&mut self, client: u64, id: &str) -> Result<Option<oneshot::Receiver<()>>, String> {
         let Some(s) = self.sessions.remove(id) else {
-            return Err(format!("세션이 없다: {id}"));
+            return Err(format!("세션이 없어요: {id}"));
         };
         s.send_hold(HoldIn::Kill);
         if s.unlinked {

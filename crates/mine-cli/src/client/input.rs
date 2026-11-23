@@ -33,7 +33,7 @@ pub enum Action {
 }
 
 /// 한글이 명령 키 자리에 왔을 때 상태줄에 띄우는 안내.
-pub const HANGUL_HINT: &str = "한/영을 영문으로 바꾸고 다시 누르세요";
+pub const HANGUL_HINT: &str = "한/영을 영문으로 바꾸고 다시 눌러 주세요";
 
 /// 한글 자모(U+1100–11FF, U+3130–318F)나 음절(U+AC00–D7A3)인가.
 pub fn is_hangul(c: char) -> bool {

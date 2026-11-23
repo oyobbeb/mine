@@ -125,7 +125,7 @@ fn read_aliases(state: &State) -> HashMap<String, String> {
         return HashMap::new();
     };
     parse_aliases(&text).unwrap_or_else(|why| {
-        eprintln!("경고: {}을 읽지 못해 별칭 없이 쓴다: {why}", path.display());
+        eprintln!("경고: {}을 읽지 못해 별칭 없이 써요: {why}", path.display());
         HashMap::new()
     })
 }

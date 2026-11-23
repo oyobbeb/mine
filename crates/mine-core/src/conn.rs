@@ -74,7 +74,7 @@ impl Conn {
 
     /// 요청을 보내고 응답을 기다린다. 세션 출력(`Output`)은 건너뛰고, `Error`는 오류로 돌려준다.
     pub fn request(&mut self, msg: &ToDaemon) -> Result<FromDaemon> {
-        write_msg(&mut self.writer, msg).context("데몬에 요청을 보내지 못했다")?;
+        write_msg(&mut self.writer, msg).context("데몬에 요청을 보내지 못했어요")?;
         loop {
             match self.recv()? {
                 FromDaemon::Output { .. } => {}
@@ -87,7 +87,7 @@ impl Conn {
     fn recv(&mut self) -> Result<FromDaemon> {
         match read_msg(&mut self.reader) {
             Ok(Some(msg)) => Ok(msg),
-            Ok(None) => bail!("데몬 연결이 끊겼다"),
+            Ok(None) => bail!("데몬 연결이 끊겼어요"),
             Err(e)
                 if matches!(
                     e.kind(),
@@ -96,7 +96,7 @@ impl Conn {
             {
                 Err(no_reply())
             }
-            Err(e) => Err(e).context("데몬 응답을 읽지 못했다"),
+            Err(e) => Err(e).context("데몬 응답을 읽지 못했어요"),
         }
     }
 }
@@ -127,7 +127,7 @@ pub async fn connect_or_spawn_async_with(
     let hello = tokio::time::timeout(REPLY_WAIT, recv(&mut reader))
         .await
         .map_err(|_| no_reply())?
-        .context("데몬 응답을 읽지 못했다")?;
+        .context("데몬 응답을 읽지 못했어요")?;
     check_hello(hello, state)?;
     let (tx, mut outgoing) = mpsc::unbounded_channel::<ToDaemon>();
     tokio::spawn(async move {
@@ -151,18 +151,18 @@ pub async fn connect_or_spawn_async_with(
 }
 
 fn current_exe() -> Result<std::path::PathBuf> {
-    std::env::current_exe().context("실행 파일 경로를 알 수 없다")
+    std::env::current_exe().context("실행 파일 경로를 알 수 없어요")
 }
 
 fn no_reply() -> anyhow::Error {
-    anyhow::anyhow!("데몬이 {}초 안에 답하지 않았다", REPLY_WAIT.as_secs())
+    anyhow::anyhow!("데몬이 {}초 안에 답하지 않았어요", REPLY_WAIT.as_secs())
 }
 
 /// 떠 있는 데몬을 끝내고 다시 띄우는 방법. 버전이 다르다는 오류에 붙인다. 세션은 보관 프로세스가 쥐고 있어
 /// 데몬이 끝나도 남고, 다음 `mine`이 띄운 새 데몬이 다시 붙는다.
 pub fn restart_hint(state: &State) -> String {
     format!(
-        "다음 명령으로 데몬을 끝내고 mine을 다시 실행한다(세션은 그대로 남는다): kill \"$(cat {})\"",
+        "다음 명령으로 데몬을 끝내고 mine을 다시 실행해 주세요(세션은 그대로 남아요): kill \"$(cat {})\"",
         shell_quote(&state.daemon_pid().to_string_lossy())
     )
 }
@@ -173,13 +173,13 @@ fn check_hello(msg: Option<FromDaemon>, state: &State) -> Result<()> {
         Some(FromDaemon::Hello { version }) if version == VERSION => Ok(()),
         Some(FromDaemon::Hello { version }) => {
             bail!(
-                "데몬 프로토콜 버전이 다르다(데몬 {version}, 이 명령 {VERSION}). {}",
+                "데몬 프로토콜 버전이 달라요(데몬 {version}, 이 명령 {VERSION}). {}",
                 restart_hint(state)
             )
         }
-        Some(FromDaemon::Error { message }) => bail!("데몬이 연결을 거절했다: {message}"),
-        Some(other) => bail!("데몬이 Hello 대신 다른 메시지를 보냈다: {other:?}"),
-        None => bail!("데몬 연결이 끊겼다"),
+        Some(FromDaemon::Error { message }) => bail!("데몬이 연결을 거절했어요: {message}"),
+        Some(other) => bail!("데몬이 Hello 대신 다른 메시지를 보냈어요: {other:?}"),
+        None => bail!("데몬 연결이 끊겼어요"),
     }
 }
 
@@ -196,7 +196,7 @@ fn spawn_daemon(state: &State, exe: &Path, env: Option<&[(String, String)]>) -> 
         .create(true)
         .append(true)
         .open(&log_path)
-        .with_context(|| format!("로그 파일을 열 수 없다: {}", log_path.display()))?;
+        .with_context(|| format!("로그 파일을 열 수 없어요: {}", log_path.display()))?;
     let mut cmd = Command::new(exe);
     if let Some(env) = env {
         cmd.env_clear().envs(env.iter().map(|(k, v)| (k, v)));
@@ -219,7 +219,7 @@ fn spawn_daemon(state: &State, exe: &Path, env: Option<&[(String, String)]>) -> 
     }
     let mut child = cmd
         .spawn()
-        .with_context(|| format!("데몬을 띄우지 못했다: {}", exe.display()))?;
+        .with_context(|| format!("데몬을 띄우지 못했어요: {}", exe.display()))?;
     std::thread::spawn(move || child.wait());
     Ok(())
 }
@@ -233,7 +233,7 @@ fn wait_connect(sock: &Path) -> Result<UnixStream> {
             Err(e) if Instant::now() >= deadline => {
                 return Err(e).with_context(|| {
                     format!(
-                        "띄운 데몬에 {}초 안에 붙지 못했다: {}",
+                        "띄운 데몬에 {}초 안에 붙지 못했어요: {}",
                         SPAWN_WAIT.as_secs(),
                         sock.display()
                     )

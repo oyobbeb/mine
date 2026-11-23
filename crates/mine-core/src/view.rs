@@ -162,18 +162,18 @@ pub fn parse_new(input: &str, project: &Path) -> Result<NewSession> {
         "claude-a" | "claude-b" => (Kind::Claude, Some(first.to_string())),
         "codex" => (Kind::Codex, Some(first.to_string())),
         "shell" => (Kind::Shell, None),
-        _ => bail!("알 수 없는 종류다: {first} (형식: {NEW_USAGE})"),
+        _ => bail!("알 수 없는 종류예요: {first} (형식: {NEW_USAGE})"),
     };
     if tokens.len() > 3 {
-        bail!("인자가 너무 많다 (형식: {NEW_USAGE})");
+        bail!("인자가 너무 많아요 (형식: {NEW_USAGE})");
     }
     let Some(&name) = tokens.get(1) else {
-        bail!("세션 이름이 필요하다 (형식: {NEW_USAGE})");
+        bail!("세션 이름이 필요해요 (형식: {NEW_USAGE})");
     };
     validate_name(name)?;
     let model = tokens.get(2).map(|m| m.to_string());
     if kind == Kind::Shell && model.is_some() {
-        bail!("shell 세션에는 모델을 줄 수 없다");
+        bail!("shell 세션에는 모델을 지정할 수 없어요");
     }
     Ok(NewSession {
         project: project.to_path_buf(),

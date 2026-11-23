@@ -86,13 +86,13 @@ pub fn append(dir: &Path, ev: &Event) -> Result<()> {
         .create(true)
         .append(true)
         .open(&path)
-        .with_context(|| format!("열 수 없다: {}", path.display()))?;
+        .with_context(|| format!("열 수 없어요: {}", path.display()))?;
     file.lock()
-        .with_context(|| format!("잠글 수 없다: {}", path.display()))?;
+        .with_context(|| format!("잠글 수 없어요: {}", path.display()))?;
     // 잠금은 파일을 닫을 때 풀린다.
     file.write_all(&line)
         .and_then(|()| file.flush())
-        .with_context(|| format!("쓸 수 없다: {}", path.display()))
+        .with_context(|| format!("쓸 수 없어요: {}", path.display()))
 }
 
 /// `dir/events.jsonl`의 이벤트를 쓴 순서대로 읽는다. 파일이 없으면 빈 목록이다.
@@ -102,7 +102,7 @@ pub fn read_all(dir: &Path) -> Result<Vec<Event>> {
     let text = match fs::read_to_string(&path) {
         Ok(text) => text,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e).with_context(|| format!("읽을 수 없다: {}", path.display())),
+        Err(e) => return Err(e).with_context(|| format!("읽을 수 없어요: {}", path.display())),
     };
     Ok(text
         .lines()

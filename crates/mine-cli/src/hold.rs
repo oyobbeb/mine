@@ -227,23 +227,23 @@ pub fn run(
     argv: Vec<String>,
 ) -> Result<()> {
     let Some((program, args)) = argv.split_first() else {
-        bail!("실행할 명령이 없다");
+        bail!("실행할 명령이 없어요");
     };
     // portable-pty는 없는 폴더를 조용히 홈으로 바꿔 버리므로 먼저 확인한다.
     if !cwd.is_dir() {
-        bail!("작업 폴더가 아니다: {}", cwd.display());
+        bail!("작업 폴더가 아니에요: {}", cwd.display());
     }
 
     // 소켓을 먼저 만들어 경로가 잘못됐으면 자식을 띄우기 전에 실패한다. 연결은 accept 루프가 돌 때까지 대기열에 쌓인다.
     let _ = fs::remove_file(sock);
     let listener = UnixListener::bind(sock)
-        .with_context(|| format!("소켓을 만들지 못했다: {}", sock.display()))?;
+        .with_context(|| format!("소켓을 만들지 못했어요: {}", sock.display()))?;
     let mut sock_guard = SockGuard {
         path: sock.to_path_buf(),
         file: file_id(sock),
     };
     fs::set_permissions(sock, fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("소켓 권한을 바꾸지 못했다: {}", sock.display()))?;
+        .with_context(|| format!("소켓 권한을 바꾸지 못했어요: {}", sock.display()))?;
     // 권한을 바꾸면 변경 시각이 바뀐다.
     sock_guard.file = file_id(sock);
     // 같은 세션의 지난 보관 프로세스가 늦게 남긴 exit 파일을 지운다. 그쪽은 이제 소켓이 바뀐 것을 보고 쓰지 않는다.
@@ -251,9 +251,9 @@ pub fn run(
     // poll이 준비됐다고 한 연결이 그새 끊겨도 accept에서 멈추지 않게 논블로킹으로 둔다.
     listener
         .set_nonblocking(true)
-        .context("소켓을 논블로킹으로 바꾸지 못했다")?;
+        .context("소켓을 논블로킹으로 바꾸지 못했어요")?;
     let (stop_tx, stop_rx) =
-        UnixStream::pair().context("accept 루프를 깨울 소켓을 만들지 못했다")?;
+        UnixStream::pair().context("accept 루프를 깨울 소켓을 만들지 못했어요")?;
 
     let pair = native_pty_system()
         .openpty(PtySize {
@@ -262,7 +262,7 @@ pub fn run(
             pixel_width: 0,
             pixel_height: 0,
         })
-        .context("PTY를 열지 못했다")?;
+        .context("PTY를 열지 못했어요")?;
     let mut cmd = CommandBuilder::new(program);
     cmd.args(args);
     cmd.cwd(cwd);
@@ -272,15 +272,18 @@ pub fn run(
     let mut child = pair
         .slave
         .spawn_command(cmd)
-        .with_context(|| format!("명령을 띄우지 못했다: {program}"))?;
+        .with_context(|| format!("명령을 띄우지 못했어요: {program}"))?;
     // 슬레이브를 이쪽에 남겨 두면 자식이 끝나도 마스터 읽기가 끝나지 않는다.
     drop(pair.slave);
     let child_pid = child
         .process_id()
         .filter(|&pid| pid > 0)
-        .context("자식 pid를 알 수 없다")?;
-    let reader = pair.master.try_clone_reader().context("PTY 읽기 실패")?;
-    let mut writer = pair.master.take_writer().context("PTY 쓰기 실패")?;
+        .context("자식 pid를 알 수 없어요")?;
+    let reader = pair
+        .master
+        .try_clone_reader()
+        .context("PTY를 읽지 못했어요")?;
+    let mut writer = pair.master.take_writer().context("PTY에 쓰지 못했어요")?;
 
     let (input_tx, input_rx) = mpsc::channel::<Vec<u8>>();
     let ctx = Arc::new(Ctx {
@@ -324,7 +327,7 @@ pub fn run(
         thread::spawn(move || accept_loop(listener, stop_rx, &ctx))
     };
 
-    let status = child.wait().context("자식 종료를 기다리지 못했다")?;
+    let status = child.wait().context("자식 종료를 기다리지 못했어요")?;
     ctx.exited.store(true, Ordering::SeqCst);
     // Exited를 알리기 전에 리스너가 닫혔음을 확인한다. 그 뒤로 이 경로에 붙는 데몬은 새로 띄운 보관 프로세스를 찾는다.
     ctx.stop_accepting();
@@ -469,8 +472,10 @@ fn write_exit_file(path: &Path, code: Option<i32>) -> Result<()> {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);
-    fs::write(&tmp, text).with_context(|| format!("exit 파일을 쓰지 못했다: {}", tmp.display()))?;
-    fs::rename(&tmp, path).with_context(|| format!("exit 파일을 옮기지 못했다: {}", path.display()))
+    fs::write(&tmp, text)
+        .with_context(|| format!("exit 파일을 쓰지 못했어요: {}", tmp.display()))?;
+    fs::rename(&tmp, path)
+        .with_context(|| format!("exit 파일을 옮기지 못했어요: {}", path.display()))
 }
 
 #[cfg(test)]

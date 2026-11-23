@@ -1258,7 +1258,7 @@ mod tests {
         c.hangul = true;
         assert_eq!(
             c.status(2),
-            "복사 모드 │ 2/2 │ 한/영을 영문으로 바꾸고 다시 누르세요"
+            "복사 모드 │ 2/2 │ 한/영을 영문으로 바꾸고 다시 눌러 주세요"
         );
         c.move_lines(&ls, -1);
         assert!(!c.hangul && c.status(2).ends_with("v 선택 · y 복사 · / ? 검색 · q 끝"));
