@@ -22,23 +22,31 @@ use mine_core::paths::State;
 use mine_core::project;
 use mine_core::proto::ToDaemon;
 use mine_core::session::SessionState;
-use mine_core::view::{self, folder_name};
+use mine_core::view;
 
 use crate::actions::{
     CONTEXT, CloseSession, NewTask, NextProject, NextSession, PrevProject, PrevSession, SelectTab,
     ToggleSidebar,
 };
 use crate::model::{Close, Effect, Model, PENDING_TIMEOUT};
+use crate::terminal::{self, Pane};
 use crate::theme::*;
 use crate::{launcher, sidebar, tabs};
+
+/// 연결 스레드의 일을 한 번에 이만큼까지 모아 먹인다.
+const LINK_BATCH: usize = 256;
 
 pub struct Workspace {
     pub model: Model,
     tx: UnboundedSender<ToDaemon>,
     /// "＋ 프로젝트 추가"가 등록할 상태 폴더.
     state: State,
-    /// 단축키와 실행 화면 키를 받는 포커스. 입력 상자가 열려 있지 않으면 늘 여기에 둔다.
+    /// 실행 화면이 열려 있을 때 단축키와 실행 화면 키를 받는 포커스. 입력 상자가 열려 있으면 상자에 있다.
+    /// 세션이 붙어 실행 화면이 닫혀 있으면 터미널 칸(`term.focus`)에 있다. 그 칸은 이 뷰 안에 있어 ⌘ 단축키는
+    /// 그대로 온다.
     focus: FocusHandle,
+    /// 터미널 칸의 뷰 상태(포커스, 칸 자리, 휠 나머지, 링크 누르기, 동기화 타이머).
+    pub(crate) term: Pane,
     /// 프로젝트 고르기를 펼쳤다.
     pub picker_open: bool,
     /// 실행 화면의 `n` 입력 상자와 그 Enter 구독. `model.typing`을 따라 만들고 버린다.
@@ -52,12 +60,18 @@ pub struct Workspace {
 }
 
 impl Workspace {
-    /// 연결 스레드의 일을 GPUI 전경 실행기에서 받아 모델에 먹인다.
+    /// 연결 스레드의 일을 GPUI 전경 실행기에서 받아 모델에 먹인다. 와 있는 일은 한 번에 모아 먹인다.
     pub fn new(model: Model, state: State, link: DaemonLink, cx: &mut Context<Self>) -> Self {
         let DaemonLink { tx, mut rx } = link;
         let pump = cx.spawn(async move |this, cx| {
             while let Some(ev) = rx.next().await {
-                if this.update(cx, |ws, cx| ws.on_link(ev, cx)).is_err() {
+                let mut batch = vec![ev];
+                while batch.len() < LINK_BATCH
+                    && let Ok(ev) = rx.try_recv()
+                {
+                    batch.push(ev);
+                }
+                if this.update(cx, |ws, cx| ws.on_link(batch, cx)).is_err() {
                     break;
                 }
             }
@@ -67,6 +81,7 @@ impl Workspace {
             tx,
             state,
             focus: cx.focus_handle(),
+            term: Pane::new(cx),
             picker_open: false,
             typed: None,
             pending_timer: None,
@@ -75,14 +90,20 @@ impl Workspace {
         }
     }
 
-    fn on_link(&mut self, ev: LinkEvent, cx: &mut Context<Self>) {
-        let effects = self.model.on_link(ev);
-        self.apply(effects);
+    /// 연결 스레드의 일을 모델에 먹인다. 출력(`Output`)마다 다시 그리지만, `notify`는 GPUI가 다음 프레임에 한 번으로
+    /// 묶는다(창이 더러우면 화면 주사 때 한 번 그린다).
+    fn on_link(&mut self, batch: Vec<LinkEvent>, cx: &mut Context<Self>) {
+        for ev in batch {
+            let effects = self.model.on_link(ev);
+            self.apply(effects);
+        }
+        self.watch_sync(cx);
         cx.notify();
     }
 
-    /// 모델이 시킨 일을 한다. 연결이 없을 때 보낸 메시지는 연결 스레드가 버린다.
-    fn apply(&self, effects: Vec<Effect>) {
+    /// 모델이 시킨 일을 한다. 모델은 연결이 없을 때 `New`·`Attach`·`Input`·`Resize`를 내지 않는다. 그래도 끊긴 걸
+    /// 모델이 알기 전에 보낸 것은 연결 스레드가 다시 붙을 때 버린다.
+    pub(crate) fn apply(&self, effects: Vec<Effect>) {
         for effect in effects {
             match effect {
                 Effect::Send(msg) => {
@@ -144,12 +165,16 @@ impl Workspace {
         } else if !self.model.typing {
             self.close_typed(window, cx);
         }
-        if self.model.launcher_open() && self.typed.is_none() {
-            // 실행 화면이 열리면 그 키(↵ b x s n, Esc)와 단축키가 이 뷰에 오게 포커스를 가져온다. 다른 칸(Task 4의
-            // 터미널 칸)에 남은 포커스는 그 칸이 그려지지 않으면 키를 받지 못한다.
-            window.focus(&self.focus);
+        if self.model.launcher_open() {
+            if self.typed.is_none() {
+                // 실행 화면이 열리면 그 키(↵ b x s n, Esc)와 단축키가 이 뷰에 오게 포커스를 가져온다. 터미널 칸에
+                // 남은 포커스는 그 칸이 그려지지 않으면 키를 받지 못한다.
+                window.focus(&self.focus);
+            }
+        } else {
+            // 세션에 붙어 실행 화면이 닫혔다(목록·탭 누르기, ⌘1–9, ⌘[ ⌘], Esc). 키가 세션으로 가게 칸에 준다.
+            window.focus(&self.term.focus);
         }
-        // Task 4: 세션에 붙어 실행 화면이 닫히면 여기서 터미널 칸에 포커스를 준다.
         self.watch_pending(cx);
         cx.notify();
     }
@@ -336,6 +361,24 @@ impl Focusable for Workspace {
     }
 }
 
+impl Workspace {
+    /// 그릴 때 포커스를 맞춘다. 창 없이 바뀐 상태(데몬의 일로 세션에 붙거나 붙은 세션이 사라짐)와 처음 연 창(Dock으로
+    /// 다시 연 창 포함, 포커스가 없다)을 다룬다. 그릴 때 포커스를 옮기면 다시 그리지 않고 다음 키부터 그리로 간다.
+    /// - 실행 화면이 열려 있고 입력 상자가 없으면: 이 뷰. 실행 화면 키와 단축키가 와야 한다.
+    /// - 세션이 붙어 칸이 보이면: 포커스가 없거나 이 뷰 자체에 있을 때 칸으로 넘긴다. 목록 묶음 머리나 프로젝트
+    ///   고르기를 누르면 마우스 누름이 이 뷰에 포커스를 주는데, 그 뒤에도 키는 세션으로 가야 한다.
+    fn fix_focus(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let nothing = window.focused(cx).is_none();
+        if self.model.launcher_open() {
+            if nothing || (self.typed.is_none() && !self.focus.is_focused(window)) {
+                window.focus(&self.focus);
+            }
+        } else if nothing || self.focus.is_focused(window) {
+            window.focus(&self.term.focus);
+        }
+    }
+}
+
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // 데몬의 일(새 세션에 붙기)로 입력 상자가 닫히면 그때는 창이 없어 치우지 못한다. 그릴 때 치운다.
@@ -343,13 +386,7 @@ impl Render for Workspace {
             self.close_typed(window, cx);
         }
         self.watch_activation(window, cx);
-        // 창을 처음 열면(Dock으로 다시 연 창 포함) 포커스가 없다. 실행 화면이 열려 있으면 다른 칸에 남은 포커스도
-        // 가져온다(데몬의 일로 붙은 세션이 사라져 실행 화면이 뜬 때처럼 창 없이 바뀐 경우). 단축키와 실행 화면 키가
-        // 이 뷰에 와야 한다.
-        let launcher_keys = self.model.launcher_open() && self.typed.is_none();
-        if window.focused(cx).is_none() || (launcher_keys && !self.focus.is_focused(window)) {
-            window.focus(&self.focus);
-        }
+        self.fix_focus(window, cx);
         frame()
             .track_focus(&self.focus)
             .key_context(CONTEXT)
@@ -373,7 +410,7 @@ impl Render for Workspace {
                     .when(self.model.sidebar_open, |this| {
                         this.child(sidebar::render(self, cx))
                     })
-                    .child(center(self, cx))
+                    .child(center(self, window, cx))
                     // D3의 Changes 칸 자리. D1에서는 접혀 있다.
                     .child(div().w(px(0.)).h_full().flex_shrink_0()),
             )
@@ -394,8 +431,8 @@ fn close_confirmed(answer: Option<usize>) -> bool {
     answer == Some(1)
 }
 
-/// 가운데 칸: 위에 탭, 아래에 실행 화면이나 붙은 세션의 칸, 맨 아래에 알림 줄.
-fn center(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
+/// 가운데 칸: 위에 탭, 아래에 실행 화면이나 붙은 세션의 터미널 칸, 맨 아래에 알림 줄.
+fn center(ws: &Workspace, window: &Window, cx: &mut Context<Workspace>) -> impl IntoElement {
     let m = &ws.model;
     v_flex()
         .flex_1()
@@ -407,7 +444,7 @@ fn center(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
             if m.launcher_open() {
                 this.child(launcher::render(ws, cx))
             } else {
-                this.child(session_pane(m))
+                this.child(terminal::render(ws, window, cx))
             }
         })
         .when_some(m.message.clone(), |this, message| {
@@ -424,25 +461,6 @@ fn center(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
                     .child(message),
             )
         })
-}
-
-/// 붙은 세션의 칸. 터미널 화면은 Task 4가 그린다. 지금은 어느 세션에 붙었는지만 흐리게 보인다.
-fn session_pane(m: &Model) -> impl IntoElement {
-    let title = m
-        .attached
-        .as_deref()
-        .and_then(|id| m.session(id))
-        .map(|s| format!("{} · {}", folder_name(&s.meta.project), s.meta.name))
-        .unwrap_or_default();
-    div()
-        .flex_1()
-        .min_h_0()
-        .flex()
-        .items_center()
-        .justify_center()
-        .text_size(px(13.))
-        .text_color(rgb(FAINT))
-        .child(title)
 }
 
 /// 창 전체 틀: 목업 색의 제목줄과 그 아래 내용.

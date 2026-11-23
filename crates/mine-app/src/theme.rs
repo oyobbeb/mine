@@ -35,18 +35,15 @@ pub const CHIP_FG: u32 = 0x1e2128;
 /// 터미널 기본 글과 바탕. 앱은 붙을 때 이 두 색을 `ToDaemon::Colors`로 데몬에 보낸다.
 pub const TERM_FG: u32 = 0xd0d3da;
 pub const TERM_BG: u32 = 0x1e2128;
-#[allow(dead_code, reason = "Task 4의 터미널 칸이 쓴다")]
 pub const TERM_CURSOR: u32 = 0xd0d3da;
 
 /// ANSI 0–15.
-#[allow(dead_code, reason = "Task 4의 터미널 칸이 쓴다")]
 pub const ANSI: [u32; 16] = [
     0x1e2128, 0xe06c75, 0x98c379, 0xe5c07b, 0x61afef, 0xc678dd, 0x56b6c2, 0xd0d3da, //
     0x5c6370, 0xef8a92, 0xb5d99c, 0xf0d197, 0x8cc5f5, 0xd898e6, 0x7fcbd5, 0xffffff,
 ];
 
 /// 256색 팔레트의 `i`번 색. 0–15는 [`ANSI`], 16–231은 xterm 6×6×6 큐브, 232–255는 회색 단계다.
-#[allow(dead_code, reason = "Task 4의 터미널 칸이 쓴다")]
 pub fn indexed(i: u8) -> u32 {
     const LEVELS: [u32; 6] = [0, 95, 135, 175, 215, 255];
     match i {

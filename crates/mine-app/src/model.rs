@@ -10,6 +10,7 @@ use mine_core::launch::{self, Choice};
 use mine_core::link::LinkEvent;
 use mine_core::paths::State;
 use mine_core::proto::{FromDaemon, ToDaemon};
+use mine_core::screen::Screen;
 use mine_core::session::{NewSession, SessionInfo, SessionState};
 use mine_core::view::{self, Group, STATES};
 
@@ -49,9 +50,6 @@ pub const PENDING_TIMEOUT: Duration = Duration::from_secs(5);
 const START_FAILED: &str = "세션을 시작하지 못했어요";
 /// 앞서 보낸 `New`의 답을 기다리는 동안 다시 고르면 띄운다.
 const CREATING: &str = "만드는 중이에요";
-
-/// 붙을 때 보내는 터미널 칸 크기(열, 행)의 처음 값. Task 4가 칸 크기로 바꾼다.
-pub const DEFAULT_GRID: (u16, u16) = (80, 24);
 
 /// 연결이 없을 때 실행 화면에서 고르면 띄우는 글. 연결 스레드는 연결 전에 보낸 메시지를 버린다.
 const NOT_CONNECTED: &str =
@@ -97,8 +95,13 @@ pub struct Model {
     pub closing: Option<String>,
     /// 데몬이 보낸 오류나 입력 오류. 가운데 아래에 띄우고 다음 동작에서 지운다.
     pub message: Option<String>,
-    /// `Attach`에 실을 터미널 칸 크기(열, 행).
-    pub grid: (u16, u16),
+    /// 터미널 칸 크기(열, 행). 칸이 처음 그려질 때 안다([`Model::set_grid`]). `Attach`와 `Resize`가 싣는다.
+    pub grid: Option<(u16, u16)>,
+    /// 붙은 세션의 화면. `Snapshot`이 오면 칸 크기로 새로 만들어 먹이고, `Output`은 이어 먹인다. 붙은 세션이
+    /// 바뀌면 버리고 새 `Snapshot`을 기다린다.
+    pub screen: Option<Screen>,
+    /// 붙은 세션의 `Attach`를 이번 연결에서 보냈다. 칸 크기를 모르거나 연결이 없어 미룬 동안은 `false`다.
+    attach_sent: bool,
     /// 처음 받은 목록으로 붙을 세션을 정했다.
     started: bool,
     /// 계정 id를 글로 보일 때 쓰는 이름. 앱이 뜰 때 읽고 창이 다시 활성화될 때 다시 읽는다([`Model::reload_labels`]).
@@ -123,7 +126,9 @@ impl Model {
             pending: None,
             closing: None,
             message: None,
-            grid: DEFAULT_GRID,
+            grid: None,
+            screen: None,
+            attach_sent: false,
             started: false,
             labels: Labels::default(),
         }
@@ -141,24 +146,29 @@ impl Model {
 
     /// 데몬 연결의 일을 받는다.
     ///
-    /// 붙을 때마다(다시 붙을 때도) 목록을 구독하고(R18) 터미널 색을 알린다. `Hello`는 연결이 이미 주고받았다.
-    /// 끊겨도 세션 목록은 그대로 두고, 다시 붙어 새 목록이 오면 바꾼다.
+    /// 붙을 때마다(다시 붙을 때도) 목록을 구독하고(R18) 터미널 색을 알린 뒤, 붙어 있던 세션에 다시 붙는다.
+    /// `Hello`는 연결이 이미 주고받았다. 끊겨도 세션 목록과 화면은 그대로 두고, 다시 붙어 새 목록과 `Snapshot`이
+    /// 오면 바꾼다.
     pub fn on_link(&mut self, ev: LinkEvent) -> Vec<Effect> {
         match ev {
             LinkEvent::Connected => {
                 self.connected = true;
                 self.offline = None;
-                vec![
+                let mut effects = vec![
                     Effect::Send(ToDaemon::List),
                     Effect::Send(ToDaemon::Colors {
                         fg: theme::hex(theme::TERM_FG),
                         bg: theme::hex(theme::TERM_BG),
                     }),
-                ]
+                ];
+                effects.extend(self.send_attach());
+                effects
             }
             LinkEvent::Disconnected(reason) => {
                 self.connected = false;
                 self.offline = Some(reason);
+                // 새 데몬은 이 연결이 어느 세션에 붙었는지 모른다. 다시 붙을 때 `Attach`를 새로 보낸다.
+                self.attach_sent = false;
                 // 보낸 `New`가 끊기기 전에 데몬에 닿았는지 알 수 없다. 답을 기다리지 않고 다시 고를 수 있게 한다.
                 // 닿았으면 다시 붙은 뒤 오는 목록에 그 세션이 보인다.
                 self.pending = None;
@@ -175,9 +185,33 @@ impl Model {
                 self.message = Some(message);
                 Vec::new()
             }
-            // 화면(Snapshot·Output)은 터미널 칸을 그리는 Task 4가 다룬다.
-            LinkEvent::Msg(_) => Vec::new(),
+            LinkEvent::Msg(FromDaemon::Snapshot { id, data }) if self.is_attached(&id) => {
+                // 쌓아 둔 출력도 스냅숏에 들어 있다. 앞 화면은 버린다.
+                if let Some((cols, rows)) = self.grid {
+                    let mut screen = Screen::new(cols, rows);
+                    screen.feed(&data);
+                    screen.take_replies();
+                    self.screen = Some(screen);
+                }
+                Vec::new()
+            }
+            LinkEvent::Msg(FromDaemon::Output { id, data }) if self.is_attached(&id) => {
+                if let Some(screen) = &mut self.screen {
+                    screen.feed(&data);
+                    // 세션의 질의(DA1, 커서 위치, 색)에는 데몬의 화면이 답한다. 같은 질의에 두 번 답하지 않게 버린다.
+                    screen.take_replies();
+                }
+                Vec::new()
+            }
+            // 버전은 연결이 확인했다. 다른 세션의 화면은 붙은 세션을 바꾸기 전에 보낸 것이라 버린다.
+            LinkEvent::Msg(
+                FromDaemon::Hello { .. } | FromDaemon::Snapshot { .. } | FromDaemon::Output { .. },
+            ) => Vec::new(),
         }
+    }
+
+    fn is_attached(&self, id: &str) -> bool {
+        self.attached.as_deref() == Some(id)
     }
 
     /// 새 목록을 받았다. 기다리던 새 세션이 나타나면 붙는다. 처음 받은 목록이거나 붙은 세션이 사라졌으면 보이는 첫
@@ -206,7 +240,7 @@ impl Model {
             .as_ref()
             .is_some_and(|id| !self.sessions.iter().any(|s| s.meta.id == *id));
         if gone {
-            self.attached = None;
+            self.detach();
         }
         if !self.started || gone {
             self.started = true;
@@ -252,20 +286,41 @@ impl Model {
     }
 
     /// 세션에 붙는다. 실행 화면과 입력 상자는 닫는다. 이미 붙은 세션이면 데몬에 다시 알리지 않는다.
+    ///
+    /// `Attach`는 붙은 세션의 PTY를 실린 크기로 바꾼다. 그래서 칸 크기를 알 때만 보낸다. 칸이 아직 그려지지 않았으면
+    /// 처음 그려질 때([`Model::set_grid`]), 연결이 없으면 다시 붙을 때 보낸다.
     pub fn attach(&mut self, id: &str) -> Vec<Effect> {
         self.launcher = false;
         self.typing = false;
         self.message = None;
-        if self.attached.as_deref() == Some(id) {
+        if self.is_attached(id) {
             return Vec::new();
         }
+        self.detach();
         self.attached = Some(id.to_string());
-        let (cols, rows) = self.grid;
-        vec![Effect::Send(ToDaemon::Attach {
-            id: id.to_string(),
-            cols,
-            rows,
-        })]
+        self.send_attach()
+    }
+
+    /// 붙은 세션을 놓는다. 데몬에는 떨어지는 메시지가 없어 그 세션 출력이 계속 오지만 버린다.
+    fn detach(&mut self) {
+        self.attached = None;
+        self.screen = None;
+        self.attach_sent = false;
+    }
+
+    /// 붙은 세션에 아직 보내지 않은 `Attach`를 지금 칸 크기로 보낸다. 칸 크기를 모르거나 연결이 없으면 미룬다.
+    fn send_attach(&mut self) -> Vec<Effect> {
+        match (&self.attached, self.grid) {
+            (Some(id), Some((cols, rows))) if self.connected && !self.attach_sent => {
+                self.attach_sent = true;
+                vec![Effect::Send(ToDaemon::Attach {
+                    id: id.clone(),
+                    cols,
+                    rows,
+                })]
+            }
+            _ => Vec::new(),
+        }
     }
 
     /// 보이는 순서(접힌 묶음은 뺀 목록 순서)로 `delta`만큼 옆 세션에 붙는다. 끝에서는 처음으로 돈다.
@@ -308,7 +363,7 @@ impl Model {
             .and_then(|id| self.session(id))
             .is_some_and(|s| self.filter.as_ref().is_none_or(|p| s.meta.project == *p));
         if !shown {
-            self.attached = None;
+            self.detach();
         }
     }
 
@@ -474,6 +529,70 @@ impl Model {
         }
     }
 
+    /// 터미널 칸을 그려 보니 (`cols`, `rows`)이다(창 크기, 목록 접기). 바뀌었을 때만 화면을 맞추고 `Resize`를
+    /// 보낸다. 미뤄 둔 `Attach`가 있으면 그 크기로 붙는다. 연결이 없으면 기억만 하고 다시 붙을 때 싣는다.
+    pub fn set_grid(&mut self, cols: u16, rows: u16) -> Vec<Effect> {
+        if self.grid == Some((cols, rows)) {
+            return Vec::new();
+        }
+        self.grid = Some((cols, rows));
+        if let Some(screen) = &mut self.screen {
+            screen.resize(cols, rows);
+        }
+        match &self.attached {
+            // `attach_sent`는 연결이 있을 때만 켜져 있다(끊기면 끈다).
+            Some(id) if self.attach_sent => vec![Effect::Send(ToDaemon::Resize {
+                id: id.clone(),
+                cols,
+                rows,
+            })],
+            _ => self.send_attach(),
+        }
+    }
+
+    /// 화면 사본만 `lines`줄 스크롤한다(양수가 과거 쪽). 세션에는 보내지 않는다. 보이는 자리가 바뀌었으면
+    /// `true`다(다시 그려야 한다).
+    pub fn scroll(&mut self, lines: i32) -> bool {
+        let Some(screen) = &mut self.screen else {
+            return false;
+        };
+        let before = screen.term().grid().display_offset();
+        screen.scroll(lines);
+        screen.term().grid().display_offset() != before
+    }
+
+    /// 키 입력과 붙여넣기를 붙은 세션에 보낸다. 스크롤해 둔 화면은 맨 아래로 돌려놓는다. 연결이 없으면 보내지
+    /// 않는다(연결 스레드의 큐에 쌓이기만 하고 다시 붙을 때 버려진다).
+    #[allow(dead_code, reason = "Task 5의 키 입력이 쓴다")]
+    pub fn input(&mut self, data: Vec<u8>) -> Vec<Effect> {
+        let Some(id) = self.attached.clone().filter(|_| self.connected) else {
+            return Vec::new();
+        };
+        if let Some(screen) = &mut self.screen {
+            let scrolled = screen.term().grid().display_offset();
+            screen.scroll(-(scrolled as i32));
+        }
+        vec![Effect::Send(ToDaemon::Input { id, data })]
+    }
+
+    /// 붙은 세션이 끝내지 않은 동기화 갱신(`?2026`)의 기한.
+    pub fn sync_deadline(&self) -> Option<Instant> {
+        self.screen.as_ref()?.sync_deadline()
+    }
+
+    /// 동기화 갱신이 기한(`now` 기준)을 넘겼으면 끝내고 모아 둔 출력을 화면에 반영한다. 칸이 멈춘 화면에 갇히지
+    /// 않게 한다. 끝냈으면 `true`다(다시 그려야 한다).
+    pub fn end_stale_sync(&mut self, now: Instant) -> bool {
+        match &mut self.screen {
+            Some(screen) if screen.sync_deadline().is_some_and(|t| t <= now) => {
+                screen.end_sync();
+                screen.take_replies();
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// 목록에 그리는 묶음. 기본 접힘에 `toggled`를 얹고, 붙은 세션의 묶음은 늘 펼친다.
     pub fn visible_groups(&self) -> Vec<Group> {
         let attached = self
@@ -570,6 +689,7 @@ pub fn status_text(s: &SessionInfo) -> (&str, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alacritty_terminal::grid::Dimensions;
     use mine_core::session::{Kind, Meta, Restore};
 
     fn s(project: &str, name: &str, state: SessionState) -> SessionInfo {
@@ -629,20 +749,207 @@ mod tests {
         m.on_link(LinkEvent::Msg(FromDaemon::Sessions { sessions }))
     }
 
-    /// 붙은 모델. 첫 목록은 비어 있어 아무 세션에도 저절로 붙지 않는다.
+    /// 테스트의 터미널 칸 크기(열, 행).
+    const GRID: (u16, u16) = (80, 24);
+
+    /// 붙은 모델. 터미널 칸 크기는 [`GRID`]이고, 첫 목록은 비어 있어 아무 세션에도 저절로 붙지 않는다.
     fn connected(project: &str) -> Model {
         let mut m = Model::new(PathBuf::from(project));
         m.on_link(LinkEvent::Connected);
+        assert!(m.set_grid(GRID.0, GRID.1).is_empty());
         assert!(listed(&mut m, Vec::new()).is_empty());
         m
     }
 
-    fn attach_msg(id: &str) -> Effect {
+    fn attach_at(id: &str, cols: u16, rows: u16) -> Effect {
         Effect::Send(ToDaemon::Attach {
             id: id.into(),
-            cols: DEFAULT_GRID.0,
-            rows: DEFAULT_GRID.1,
+            cols,
+            rows,
         })
+    }
+
+    fn attach_msg(id: &str) -> Effect {
+        attach_at(id, GRID.0, GRID.1)
+    }
+
+    fn resize_at(id: &str, cols: u16, rows: u16) -> Effect {
+        Effect::Send(ToDaemon::Resize {
+            id: id.into(),
+            cols,
+            rows,
+        })
+    }
+
+    /// 칸 크기를 아는 모델이 `/p`의 세션 `t1`에 붙어 있다.
+    fn attached_t1() -> Model {
+        let mut m = connected("/p");
+        listed(&mut m, vec![s("/p", "t1", SessionState::Idle)]);
+        assert_eq!(m.attach("k-t1"), [attach_msg("k-t1")]);
+        m
+    }
+
+    fn output(id: &str, data: &[u8]) -> LinkEvent {
+        LinkEvent::Msg(FromDaemon::Output {
+            id: id.into(),
+            data: data.to_vec(),
+        })
+    }
+
+    fn snapshot(id: &str, data: Vec<u8>) -> LinkEvent {
+        LinkEvent::Msg(FromDaemon::Snapshot {
+            id: id.into(),
+            data,
+        })
+    }
+
+    fn lines(m: &Model) -> Vec<String> {
+        m.screen.as_ref().expect("화면이 없다").lines()
+    }
+
+    #[test]
+    fn first_attach_waits_for_the_pane_size() {
+        let mut m = Model::new(PathBuf::from("/p"));
+        m.on_link(LinkEvent::Connected);
+        // 칸이 아직 그려지지 않아 크기를 모른다. 붙을 세션은 정하지만 `Attach`는 미룬다. 틀린 크기로 붙으면
+        // 돌고 있는 세션의 PTY 크기가 바뀌어 화면이 깨진다.
+        assert!(listed(&mut m, vec![s("/p", "t1", SessionState::Idle)]).is_empty());
+        assert_eq!(m.attached.as_deref(), Some("k-t1"));
+        assert!(!m.launcher_open());
+        // 처음 그려져 크기를 알면 그 크기로 붙는다(`Resize`가 아니다).
+        assert_eq!(m.set_grid(100, 30), [attach_at("k-t1", 100, 30)]);
+        assert!(m.set_grid(100, 30).is_empty());
+        assert_eq!(m.set_grid(90, 30), [resize_at("k-t1", 90, 30)]);
+    }
+
+    #[test]
+    fn resize_only_on_change() {
+        let mut m = attached_t1();
+        assert_eq!(m.set_grid(100, 30), [resize_at("k-t1", 100, 30)]);
+        assert!(m.set_grid(100, 30).is_empty());
+        assert_eq!(m.set_grid(100, 31), [resize_at("k-t1", 100, 31)]);
+        // 붙은 세션이 없으면 크기만 기억하고, 다음에 붙을 때 그 크기를 싣는다.
+        m.set_filter(Some(PathBuf::from("/q")));
+        assert!(m.attached.is_none());
+        assert!(m.set_grid(120, 40).is_empty());
+        m.set_filter(None);
+        assert_eq!(m.attach("k-t1"), [attach_at("k-t1", 120, 40)]);
+    }
+
+    #[test]
+    fn reattach_after_reconnect() {
+        let mut m = attached_t1();
+        assert!(m.on_link(LinkEvent::Disconnected("끊김".into())).is_empty());
+        // 끊긴 동안 칸 크기가 바뀌면 보내지 않고 기억한다.
+        assert!(m.set_grid(100, 30).is_empty());
+        // 다시 붙으면 구독하고 색을 알린 뒤, 같은 세션에 지금 크기로 다시 붙는다.
+        let effects = m.on_link(LinkEvent::Connected);
+        assert_eq!(effects.len(), 3);
+        assert_eq!(effects[0], Effect::Send(ToDaemon::List));
+        assert!(matches!(effects[1], Effect::Send(ToDaemon::Colors { .. })));
+        assert_eq!(effects[2], attach_at("k-t1", 100, 30));
+        // 그 뒤로는 바뀐 크기만 `Resize`로 간다.
+        assert_eq!(m.set_grid(100, 32), [resize_at("k-t1", 100, 32)]);
+        // 붙은 세션이 없으면 다시 붙을 것이 없다.
+        let mut m = connected("/p");
+        m.on_link(LinkEvent::Disconnected("끊김".into()));
+        assert_eq!(m.on_link(LinkEvent::Connected).len(), 2);
+    }
+
+    #[test]
+    fn offline_input_and_resize_are_not_queued() {
+        // 연결이 없을 때 보낸 메시지는 연결 스레드의 큐에 쌓였다가 버려진다. 끊긴 동안은 보내지 않는다.
+        let mut m = attached_t1();
+        assert_eq!(
+            m.input(b"ls\r".to_vec()),
+            [Effect::Send(ToDaemon::Input {
+                id: "k-t1".into(),
+                data: b"ls\r".to_vec(),
+            })]
+        );
+        m.on_link(LinkEvent::Disconnected("끊김".into()));
+        assert!(m.input(b"x".to_vec()).is_empty());
+        assert!(m.set_grid(50, 20).is_empty());
+        // 연결 전에 고른 세션에도 `Attach`를 보내지 않고, 붙은 뒤에 보낸다.
+        let mut m = Model::new(PathBuf::from("/p"));
+        assert!(m.set_grid(GRID.0, GRID.1).is_empty());
+        assert!(m.attach("k-t1").is_empty());
+        assert_eq!(m.on_link(LinkEvent::Connected)[2], attach_msg("k-t1"));
+        // 붙은 세션이 없으면 입력을 보낼 곳이 없다.
+        let mut m = connected("/p");
+        assert!(m.input(b"x".to_vec()).is_empty());
+    }
+
+    #[test]
+    fn snapshot_builds_screen_at_pane_size() {
+        let mut m = attached_t1();
+        m.set_grid(100, 30);
+        // 다른 세션의 화면은 버린다(붙은 세션을 바꾸기 전에 보낸 것).
+        m.on_link(snapshot("k-old", b"old".to_vec()));
+        assert!(m.screen.is_none());
+        let mut source = Screen::new(100, 30);
+        source.feed(b"\x1b[31mhello\x1b[0m\r\nworld");
+        assert!(m.on_link(snapshot("k-t1", source.snapshot())).is_empty());
+        let grid = m.screen.as_ref().unwrap().term().grid();
+        assert_eq!((grid.columns(), grid.screen_lines()), (100, 30));
+        assert_eq!(lines(&m)[..2], ["hello", "world"]);
+        // 이어 오는 출력을 먹인다. 질의(DA1)의 답은 데몬이 하니 클라이언트 화면의 답은 버린다.
+        assert!(m.on_link(output("k-t1", b"!\x1b[c")).is_empty());
+        assert_eq!(lines(&m)[1], "world!");
+        assert!(m.screen.as_mut().unwrap().take_replies().is_empty());
+        // 다른 세션의 출력은 먹이지 않는다.
+        m.on_link(output("k-old", b"zzz"));
+        assert_eq!(lines(&m)[1], "world!");
+        // 칸 크기가 바뀌면 화면도 맞춘다.
+        m.set_grid(90, 20);
+        let grid = m.screen.as_ref().unwrap().term().grid();
+        assert_eq!((grid.columns(), grid.screen_lines()), (90, 20));
+        // 다른 세션에 붙으면 화면을 버리고 그 세션의 `Snapshot`을 기다린다.
+        listed(
+            &mut m,
+            vec![
+                s("/p", "t1", SessionState::Idle),
+                s("/p", "t2", SessionState::Idle),
+            ],
+        );
+        assert_eq!(m.attach("k-t2"), [attach_at("k-t2", 90, 20)]);
+        assert!(m.screen.is_none());
+    }
+
+    #[test]
+    fn stale_sync_ends_after_the_deadline() {
+        let mut m = attached_t1();
+        m.on_link(snapshot("k-t1", Screen::new(80, 24).snapshot()));
+        assert_eq!(m.sync_deadline(), None);
+        // 동기화 갱신(`?2026`)을 열고 닫지 않았다. 그동안의 출력은 화면에 나타나지 않는다.
+        m.on_link(output("k-t1", b"\x1b[?2026hstuck"));
+        let deadline = m.sync_deadline().expect("기한이 없다");
+        assert_eq!(lines(&m)[0], "");
+        assert!(!m.end_stale_sync(deadline - Duration::from_millis(1)));
+        // 기한이 지나면 끝내고 모아 둔 출력을 화면에 반영한다.
+        assert!(m.end_stale_sync(deadline));
+        assert_eq!(lines(&m)[0], "stuck");
+        assert_eq!(m.sync_deadline(), None);
+        assert!(!m.end_stale_sync(deadline + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn scroll_moves_the_view_and_input_returns_to_the_bottom() {
+        let mut m = attached_t1();
+        // 화면이 오기 전에는 스크롤할 것이 없다.
+        assert!(!m.scroll(3));
+        m.on_link(snapshot("k-t1", Screen::new(80, 24).snapshot()));
+        let many: String = (1..=40).map(|i| format!("{i}\r\n")).collect();
+        m.on_link(output("k-t1", many.as_bytes()));
+        let offset = |m: &Model| m.screen.as_ref().unwrap().term().grid().display_offset();
+        assert!(m.scroll(3));
+        assert_eq!(offset(&m), 3);
+        assert!(!m.scroll(0));
+        assert!(m.scroll(-1));
+        assert_eq!(offset(&m), 2);
+        // 세션에 입력을 보내면 맨 아래로 돌아간다.
+        assert_eq!(m.input(b"x".to_vec()).len(), 1);
+        assert_eq!(offset(&m), 0);
     }
 
     fn new_msg(project: &str, name: &str, kind: Kind, account: Option<&str>) -> Effect {
@@ -973,6 +1280,7 @@ mod tests {
     fn step_session_wraps() {
         let mut m = Model::new(PathBuf::from("/p"));
         m.on_link(LinkEvent::Connected);
+        m.set_grid(GRID.0, GRID.1);
         // 처음 받은 목록이면 보이는 첫 세션에 붙는다(승인 대기가 먼저다).
         assert_eq!(
             listed(

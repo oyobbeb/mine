@@ -9,6 +9,7 @@ name = "mine-app"
 path = "src/main.rs"
 
 [dependencies]
+alacritty_terminal.workspace = true
 anyhow.workspace = true
 futures.workspace = true
 # Metal Toolchain 없이 빌드하려고 셰이더를 실행할 때 컴파일한다(runtime_shaders).

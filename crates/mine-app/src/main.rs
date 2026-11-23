@@ -8,6 +8,7 @@ mod launcher;
 mod model;
 mod sidebar;
 mod tabs;
+mod terminal;
 mod theme;
 mod workspace;
 
