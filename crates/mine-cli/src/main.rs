@@ -1,3 +1,4 @@
+use std::io::Write as _;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -69,6 +70,10 @@ enum Cmd {
     Event {
         /// Session directory (`<state directory>/sessions/<id>`).
         dir: PathBuf,
+        /// Claude's `PermissionRequest` hook: ask the daemon to hold the request for an answer from the app or the TUI, and print
+        /// the decision.
+        #[arg(long)]
+        ask: bool,
     },
 }
 
@@ -192,9 +197,16 @@ fn main() -> Result<()> {
         }) => hold::run(&sock, &exit, &cwd, env, argv)?,
         // A hook must not block or fail the stock CLI: it exits 0 and prints nothing, and a failure goes to logs/hooks.log.
         // Without a state directory there is nowhere to note it.
-        Some(Cmd::Event { dir }) => {
-            if let Ok(state) = paths::State::from_env() {
-                hooks::run_event_cmd(&state, &dir, std::io::stdin().lock());
+        Some(Cmd::Event { dir, ask }) => {
+            let Ok(state) = paths::State::from_env() else {
+                return Ok(());
+            };
+            let stdin = std::io::stdin().lock();
+            if !ask {
+                hooks::run_event_cmd(&state, &dir, stdin);
+            } else if let Some(decision) = hooks::run_ask_cmd(&state, &dir, stdin) {
+                // Only the decision goes to stdout, and a closed stdout must not fail the hook either.
+                let _ = writeln!(std::io::stdout(), "{decision}");
             }
         }
         Some(Cmd::App) => run_app()?,

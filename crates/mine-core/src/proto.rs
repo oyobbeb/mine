@@ -14,8 +14,9 @@ use crate::profiles::ProfileInfo;
 use crate::session::{NewSession, SessionInfo};
 
 /// Protocol version between client and daemon. `Colors` was added in 2, `Focus` in 3, and in 4 the hello reply's `features` and
-/// `daemon`, `Profiles` and `ReloadProfiles`. Up to 3 a side dropped the connection on a message type it didn't know; from 4 it
-/// ignores it ([`ToDaemon::Unknown`], [`FromDaemon::Unknown`]). New behavior is gated on a feature name in the hello reply.
+/// `daemon`, `Profiles`, `ReloadProfiles`, `Presence`, `Ask`, `Answer` and `AskReply`. Up to 3 a side dropped the connection on a
+/// message type it didn't know; from 4 it ignores it ([`ToDaemon::Unknown`], [`FromDaemon::Unknown`]). New behavior is gated on
+/// a feature name in the hello reply.
 pub const VERSION: u32 = 4;
 /// The oldest client version the daemon serves. The app bundle and the CLI are updated separately, so a daemon serves older clients
 /// and sends each only what its version knows.
@@ -187,6 +188,21 @@ pub enum ToDaemon {
     },
     /// Reread the profiles in `config.toml` and send the new list to every client.
     ReloadProfiles,
+    /// From the `PermissionRequest` hook (`_event --ask`), on a connection of its own: Claude asks to run `tool` in session `id`. The
+    /// daemon holds it until a client answers, then replies [`FromDaemon::AskReply`] on that connection. Accepted whatever the
+    /// hook's protocol version, like `Poke`, and only from a daemon that announced `ask`.
+    Ask {
+        id: String,
+        tool: String,
+        summary: String,
+    },
+    /// The user's answer to held request `request` of session `id` ([`crate::session::PendingAsk`]). One that is no longer pending
+    /// is ignored.
+    Answer {
+        id: String,
+        request: u64,
+        allow: bool,
+    },
     /// A message type from a newer client. Ignored.
     #[serde(other)]
     Unknown,
@@ -235,9 +251,22 @@ pub enum FromDaemon {
     Error {
         message: String,
     },
+    /// The answer to an `Ask`, on its connection only.
+    AskReply {
+        decision: Decision,
+    },
     /// A message type from a newer daemon. Ignored.
     #[serde(other)]
     Unknown,
+}
+
+/// What a held permission request comes to. `Pass` leaves it to Claude's own prompt.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum Decision {
+    Allow,
+    Deny,
+    Pass,
 }
 
 /// Turns a message into one line of JSON (including the trailing `\n`). Returned as a single buffer so it is written in one go.

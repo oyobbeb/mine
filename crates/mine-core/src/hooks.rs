@@ -1,19 +1,19 @@
 //! Accumulates CLI hook events in the session directory's `events.jsonl` and computes the session state from that record.
 
 use std::fs::{self, OpenOptions};
-use std::io::{ErrorKind, Read, Write};
+use std::io::{BufReader, ErrorKind, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::paths::State;
-use crate::proto::{ToDaemon, VERSION, write_msg};
+use crate::proto::{Decision, FromDaemon, ToDaemon, VERSION, read_msg, write_msg};
 use crate::session::SessionState;
 
 const EVENTS_FILE: &str = "events.jsonl";
@@ -189,19 +189,137 @@ pub fn fold(
     (state, waiting, resume_id)
 }
 
-/// Sends `Hello` and `Poke` to the daemon. Gives up if the connection or the write exceeds `POKE_TIMEOUT`.
-fn poke(state: &State, id: &str) -> Result<()> {
+/// Connects to the daemon within `POKE_TIMEOUT`, with writes bounded by it too.
+fn connect(state: &State) -> Result<UnixStream> {
     let sock = state.daemon_sock();
     // std has no connect timeout, so connect and wait on a separate thread.
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let _ = tx.send(UnixStream::connect(sock));
     });
-    let mut stream = rx.recv_timeout(POKE_TIMEOUT)??;
+    let stream = rx.recv_timeout(POKE_TIMEOUT)??;
     stream.set_write_timeout(Some(POKE_TIMEOUT))?;
+    Ok(stream)
+}
+
+/// Sends `Hello` and `Poke` to the daemon. Gives up if the connection or the write exceeds `POKE_TIMEOUT`.
+fn poke(state: &State, id: &str) -> Result<()> {
+    let mut stream = connect(state)?;
     write_msg(&mut stream, &ToDaemon::Hello { version: VERSION })?;
     write_msg(&mut stream, &ToDaemon::Poke { id: id.to_string() })?;
     Ok(())
+}
+
+/// Reads stdin as JSON. The payload is never part of an error, so the log can't leak a prompt or a reply.
+fn read_payload(mut stdin: impl Read) -> Result<Value> {
+    let mut input = Vec::new();
+    stdin
+        .read_to_end(&mut input)
+        .context("Couldn't read the hook payload")?;
+    let Ok(payload) = serde_json::from_slice::<Value>(&input) else {
+        bail!("The hook payload isn't valid JSON");
+    };
+    Ok(payload)
+}
+
+/// Tools whose permission request is never held: a yes or no from the task list can't answer them. `AskUserQuestion` needs real
+/// answers, and `ExitPlanMode` would approve a plan nobody read.
+pub const PASS_TOOLS: &[&str] = &["AskUserQuestion", "ExitPlanMode"];
+
+/// How long `_event --ask` waits for the daemon's answer. The daemon lets go after 120 s, and Claude's hook timeout is 130 s.
+const ASK_WAIT: Duration = Duration::from_secs(125);
+
+/// The longest [`ask_summary`], in characters.
+const SUMMARY_MAX: usize = 80;
+
+/// What `_event --ask` prints for `allow` and `deny`. Never `updatedPermissions`: one answer covers exactly one request.
+const ALLOW_JSON: &str = r#"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}"#;
+const DENY_JSON: &str = r#"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"deny","message":"Denied from mine"}}}"#;
+
+/// A permission request in a line: `Bash(npm run deploy)`, `Edit(src/a.rs)`. Only Claude's own shell, file and notebook tools show
+/// their argument; any other tool (an MCP tool, WebFetch, Grep, …) shows its name alone, since its input can hold anything, a token
+/// included, and the summary reaches notifications. Whitespace runs become one space. Past [`SUMMARY_MAX`] characters a command is
+/// cut at the end and a path at the start, so the file name stays, both with `…`.
+pub fn ask_summary(tool: &str, input: &Value) -> String {
+    let key = match tool {
+        "Bash" => "command",
+        "Edit" | "MultiEdit" | "Write" | "Read" => "file_path",
+        "NotebookEdit" => "notebook_path",
+        _ => return tool.to_string(),
+    };
+    let Some(arg) = input.get(key).and_then(Value::as_str) else {
+        return tool.to_string();
+    };
+    let arg = arg.split_whitespace().collect::<Vec<_>>().join(" ");
+    let full = format!("{tool}({arg})");
+    let len = full.chars().count();
+    if len <= SUMMARY_MAX {
+        return full;
+    }
+    if key == "command" {
+        let mut cut: String = full.chars().take(SUMMARY_MAX - 1).collect();
+        cut.push('…');
+        return cut;
+    }
+    // Drops enough of the path's start to fit, plus one for the `…`.
+    let tail: String = arg.chars().skip(len - SUMMARY_MAX + 1).collect();
+    format!("{tool}(…{tail})")
+}
+
+/// The body of `mine _event <session dir> --ask`, which Claude's `PermissionRequest` hook runs. Returns what to print: the
+/// decision JSON for allow or deny, nothing for pass.
+///
+/// Asks the daemon and waits for its answer, at most `ASK_WAIT`. It fails open like [`run_event_cmd`]: any failure (a bad
+/// payload, no daemon, no answer in time) is one line in `hooks.log` and prints nothing, so Claude shows its own prompt.
+pub fn run_ask_cmd(state: &State, dir: &Path, stdin: impl Read) -> Option<&'static str> {
+    match ask(state, dir, stdin) {
+        Ok(Decision::Allow) => Some(ALLOW_JSON),
+        Ok(Decision::Deny) => Some(DENY_JSON),
+        Ok(Decision::Pass) => None,
+        Err(e) => {
+            log_failure(state, &e);
+            None
+        }
+    }
+}
+
+fn ask(state: &State, dir: &Path, stdin: impl Read) -> Result<Decision> {
+    let payload = read_payload(stdin)?;
+    let tool = (payload.get("tool_name").and_then(Value::as_str))
+        .context("The permission request names no tool")?;
+    let summary = ask_summary(tool, payload.get("tool_input").unwrap_or(&Value::Null));
+    let id =
+        (dir.file_name().and_then(|n| n.to_str())).context("The session directory has no name")?;
+    let deadline = Instant::now() + ASK_WAIT;
+    let mut stream = connect(state).context("Couldn't reach the daemon")?;
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut next = || -> Result<FromDaemon> {
+        let left = deadline.saturating_duration_since(Instant::now());
+        reader
+            .get_ref()
+            .set_read_timeout(Some(left.max(Duration::from_millis(1))))?;
+        read_msg(&mut reader)
+            .context("No answer from the daemon")?
+            .context("The daemon closed the connection")
+    };
+    write_msg(&mut stream, &ToDaemon::Hello { version: VERSION })?;
+    // A daemon from before `ask` would ignore the request.
+    match next()? {
+        FromDaemon::Hello { features, .. } if features.iter().any(|f| f == "ask") => {}
+        FromDaemon::Hello { .. } => return Ok(Decision::Pass),
+        _ => bail!("The daemon didn't say Hello"),
+    }
+    let ask = ToDaemon::Ask {
+        id: id.to_string(),
+        tool: tool.to_string(),
+        summary,
+    };
+    write_msg(&mut stream, &ask)?;
+    loop {
+        if let FromDaemon::AskReply { decision } = next()? {
+            return Ok(decision);
+        }
+    }
 }
 
 /// The body of `mine _event <session dir>`, which hooks run.
@@ -215,15 +333,8 @@ pub fn run_event_cmd(state: &State, dir: &Path, stdin: impl Read) {
     }
 }
 
-fn record(state: &State, dir: &Path, mut stdin: impl Read) -> Result<()> {
-    let mut input = Vec::new();
-    stdin
-        .read_to_end(&mut input)
-        .context("Couldn't read the hook payload")?;
-    // The payload is never part of an error, so the log can't leak a prompt or a reply.
-    let Ok(payload) = serde_json::from_slice::<Value>(&input) else {
-        bail!("The hook payload isn't valid JSON");
-    };
+fn record(state: &State, dir: &Path, stdin: impl Read) -> Result<()> {
+    let payload = read_payload(stdin)?;
     let Some(ev) = parse_hook(&payload, now_ms()) else {
         return Ok(());
     };
@@ -249,7 +360,6 @@ fn log_failure(state: &State, err: &anyhow::Error) {
 
 #[cfg(test)]
 mod tests {
-    use std::io::BufReader;
     use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
 
@@ -257,7 +367,6 @@ mod tests {
 
     use super::EventKind::*;
     use super::*;
-    use crate::proto::read_msg;
 
     fn tmp() -> tempfile::TempDir {
         tempfile::Builder::new()
@@ -655,6 +764,74 @@ mod tests {
         run_event_cmd(&state, &dir, Broken);
         assert!(!dir.join("events.jsonl").exists());
         assert_eq!(hooks_log(&state).len(), 1);
+    }
+
+    #[test]
+    fn ask_summary_formats() {
+        assert_eq!(
+            ask_summary("Bash", &json!({"command": "npm run deploy"})),
+            "Bash(npm run deploy)"
+        );
+        assert_eq!(
+            ask_summary("Edit", &json!({"file_path": "src/a.rs", "old_string": "x"})),
+            "Edit(src/a.rs)"
+        );
+        assert_eq!(
+            ask_summary("NotebookEdit", &json!({"notebook_path": "n.ipynb"})),
+            "NotebookEdit(n.ipynb)"
+        );
+        // Any other tool shows its name alone, whatever its input holds: an MCP tool's command, a URL with a token.
+        assert_eq!(
+            ask_summary("mcp__x__run", &json!({"command": "secret"})),
+            "mcp__x__run"
+        );
+        let fetch = ask_summary("WebFetch", &json!({"url": "https://x.test/?token=abc"}));
+        assert_eq!(fetch, "WebFetch");
+        assert!(!fetch.contains("abc"));
+        assert_eq!(ask_summary("Grep", &json!({"pattern": "p"})), "Grep");
+        // No argument: the tool alone. A multi-line command stays on one line.
+        assert_eq!(ask_summary("Bash", &json!(null)), "Bash");
+        assert_eq!(
+            ask_summary("Bash", &json!({"command": "a\n\tb"})),
+            "Bash(a b)"
+        );
+        let long = ask_summary("Bash", &json!({"command": "x".repeat(200)}));
+        assert!(long.chars().count() <= 80, "{long}");
+        assert!(
+            long.starts_with("Bash(xxx") && long.ends_with('…'),
+            "{long}"
+        );
+        // A long path keeps its end, where the file name is.
+        let path = format!("{}/name.rs", "/deep/dir".repeat(25));
+        let edit = ask_summary("Write", &json!({"file_path": path}));
+        assert!(edit.chars().count() <= 80, "{edit}");
+        assert!(
+            edit.starts_with("Write(…") && edit.ends_with("/deep/dir/name.rs)"),
+            "{edit}"
+        );
+    }
+
+    #[test]
+    fn ask_passes_on_a_daemon_without_ask() {
+        let t = tmp();
+        let (state, dir) = state_in(&t);
+        let listener = UnixListener::bind(state.daemon_sock()).unwrap();
+        // A daemon from before `ask`: it would ignore the request, so the hook must not wait for an answer.
+        let _server = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let hello = FromDaemon::Hello {
+                version: VERSION,
+                features: vec!["profiles".into()],
+                daemon: None,
+            };
+            write_msg(&mut conn, &hello).unwrap();
+            std::thread::sleep(Duration::from_secs(5));
+        });
+        let payload = br#"{"hook_event_name":"PermissionRequest","tool_name":"Bash"}"#;
+        let started = std::time::Instant::now();
+        assert_eq!(run_ask_cmd(&state, &dir, &payload[..]), None);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(hooks_log(&state).is_empty());
     }
 
     #[test]

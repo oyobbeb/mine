@@ -16,9 +16,10 @@ use std::time::{Duration, Instant};
 use mine_core::paths::State;
 use mine_core::project::project_key;
 use mine_core::proto::{
-    FromDaemon, HoldIn, HoldOut, MIN_CLIENT_VERSION, ToDaemon, VERSION, read_msg, write_msg,
+    Decision, FromDaemon, HoldIn, HoldOut, MIN_CLIENT_VERSION, ToDaemon, VERSION, read_msg,
+    write_msg,
 };
-use mine_core::session::{Kind, Meta, NewSession, Restore, SessionState, session_id};
+use mine_core::session::{Kind, Meta, NewSession, PendingAsk, Restore, SessionState, session_id};
 
 /// Maximum time for socket reads and waiting on conditions. Generous so that it holds up even when many tests run together and slow things down.
 const WAIT: Duration = Duration::from_secs(10);
@@ -494,6 +495,7 @@ fn v4_hello_has_features_and_identity() {
     };
     assert_eq!(version, VERSION);
     assert!(features.iter().any(|f| f == "profiles"), "{features:?}");
+    assert!(features.iter().any(|f| f == "ask"), "{features:?}");
     let daemon = daemon.expect("no daemon identity");
     assert_eq!(Some(daemon.pid as i32), daemon_pid(&st));
     assert_eq!(daemon.version, env!("CARGO_PKG_VERSION"));
@@ -1747,4 +1749,322 @@ fn shell_output_shows_working_then_idle_after_quiet() {
     assert_eq!(state_push(&mut c), SessionState::Idle);
     assert!(working_at.elapsed() >= Duration::from_millis(1500));
     assert_eq!(ls(&st)[0][4], "idle");
+}
+
+/// What `_event --ask` prints for an allow, exactly.
+const ALLOW: &str = r#"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}"#;
+
+/// A fake `claude` that asks for permission when told to. It reads lines from its terminal: `ask <tool>` runs the
+/// `PermissionRequest` hook command from its `--settings` with a payload for that tool (a Bash-style `npm run deploy`) and puts
+/// the hook's stdout in `@OUT@/<n>` once the hook returns, numbered from 1. Any other line is appended to `@OUT@/typed`.
+/// `@OUT@/ready` appears once it reads.
+const ASKING_CLAUDE: &str = r#"#!/bin/sh
+hook=$(printf '%s\n' "$2" | sed -n 's/.*"PermissionRequest":[^]]*"command":"\([^"]*\)".*/\1/p')
+n=0
+: > "@OUT@/ready"
+while IFS= read -r line; do
+  case "$line" in
+    "ask "*)
+      n=$((n+1))
+      printf '{"hook_event_name":"PermissionRequest","tool_name":"%s","tool_input":{"command":"npm run deploy"}}' "${line#ask }" \
+        | sh -c "$hook" > "@OUT@/$n.part"
+      mv "@OUT@/$n.part" "@OUT@/$n" ;;
+    *) printf '%s\n' "$line" >> "@OUT@/typed" ;;
+  esac
+done
+"#;
+
+/// Claude session `c`, running [`ASKING_CLAUDE`].
+struct Asking {
+    st: St,
+    out: PathBuf,
+    /// Requests asked so far.
+    asked: usize,
+    _bin: tempfile::TempDir,
+}
+
+/// An [`Asking`] session on a daemon that also gets `env`.
+fn asking(env: &[(&'static str, &str)]) -> Asking {
+    let bin = tmp();
+    let out = bin.path().join("out");
+    fs::create_dir(&out).unwrap();
+    let claude = bin.path().join("claude");
+    fs::write(
+        &claude,
+        ASKING_CLAUDE.replace("@OUT@", &out.to_string_lossy()),
+    )
+    .unwrap();
+    fs::set_permissions(&claude, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut st = state_with_path(bin.path());
+    st.env
+        .extend(env.iter().map(|&(key, value)| (key, OsString::from(value))));
+    mine(&st, &["new", "c", "--kind", "claude"]);
+    // So that timings start with the fake reading, not with it starting up.
+    wait_until(|| out.join("ready").exists());
+    Asking {
+        st,
+        out,
+        asked: 0,
+        _bin: bin,
+    }
+}
+
+impl Asking {
+    /// Sends `data` to the session from a client that doesn't view it, and waits until the daemon handled it.
+    fn input(&self, data: &[u8]) {
+        let mut c = client(&self.st);
+        c.send(&ToDaemon::Input {
+            id: self.st.id("c"),
+            data: data.to_vec(),
+        });
+        sync(&mut c);
+    }
+
+    /// Has the fake ask for `tool`. Returns when the daemon passed the line on.
+    fn ask(&mut self, tool: &str) -> Instant {
+        self.asked += 1;
+        self.input(format!("ask {tool}\n").as_bytes());
+        Instant::now()
+    }
+
+    /// The hook's stdout for the latest request, once the hook has returned.
+    fn reply(&self) -> String {
+        let path = self.out.join(self.asked.to_string());
+        wait_until(|| path.exists());
+        fs::read_to_string(path).unwrap()
+    }
+
+    fn pending(&self) -> Option<PendingAsk> {
+        let mut c = client(&self.st);
+        c.send(&ToDaemon::List);
+        loop {
+            if let FromDaemon::Sessions { sessions } = c.recv().expect("the connection dropped") {
+                return sessions.into_iter().find(|s| s.meta.name == "c")?.pending;
+            }
+        }
+    }
+
+    fn wait_pending(&self) -> PendingAsk {
+        let mut pending = None;
+        wait_until(|| {
+            pending = self.pending();
+            pending.is_some()
+        });
+        pending.unwrap()
+    }
+
+    fn answer(&self, request: u64, allow: bool) {
+        let mut c = client(&self.st);
+        c.send(&ToDaemon::Answer {
+            id: self.st.id("c"),
+            request,
+            allow,
+        });
+        sync(&mut c);
+    }
+}
+
+#[test]
+fn ask_held_when_nobody_views() {
+    let mut a = asking(&[]);
+    a.ask("Bash");
+    let p = a.wait_pending();
+    assert_eq!(p.summary, "Bash(npm run deploy)");
+    let row = &ls(&a.st)[0];
+    assert_eq!(
+        (row[4].as_str(), row[5].as_str()),
+        ("approval", "Allow Bash(npm run deploy)?")
+    );
+    a.answer(p.request, true);
+    assert_eq!(a.reply(), format!("{ALLOW}\n"));
+    assert_eq!(a.pending(), None);
+}
+
+#[test]
+fn ask_denied_has_message() {
+    let mut a = asking(&[]);
+    a.ask("Bash");
+    let p = a.wait_pending();
+    a.answer(p.request, false);
+    let out = a.reply();
+    assert!(out.contains(r#""behavior":"deny""#), "{out}");
+    assert!(out.contains("Denied from mine"), "{out}");
+}
+
+#[test]
+fn ask_passes_when_viewed() {
+    let mut a = asking(&[]);
+    // Visible and viewing, but idle for 200 s: holding ignores the presence window.
+    let mut viewer = client(&a.st);
+    presence(&mut viewer, &a.st, true, 200_000, "c");
+    let asked = a.ask("Bash");
+    assert_eq!(a.reply(), "");
+    assert!(
+        asked.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        asked.elapsed()
+    );
+}
+
+#[test]
+fn ask_released_when_viewer_arrives() {
+    let mut a = asking(&[]);
+    a.ask("Bash");
+    a.wait_pending();
+    // A client viewing the session from a hidden window releases nothing.
+    let mut viewer = client(&a.st);
+    presence(&mut viewer, &a.st, false, 0, "c");
+    assert!(a.pending().is_some());
+    presence(&mut viewer, &a.st, true, 200_000, "c");
+    assert_eq!(a.reply(), "");
+    assert_eq!(a.pending(), None);
+    // Claude shows its own prompt next, so the session still needs approval.
+    assert_eq!(ls(&a.st)[0][4], "approval");
+}
+
+#[test]
+fn ask_released_on_input() {
+    let mut a = asking(&[]);
+    a.ask("Bash");
+    a.wait_pending();
+    // A focus report passed on to the session isn't typing.
+    a.input(b"\x1b[I");
+    assert!(a.pending().is_some());
+    a.input(b"typed-after\n");
+    assert_eq!(a.reply(), "");
+    let typed = a.out.join("typed");
+    wait_until(|| fs::read_to_string(&typed).is_ok_and(|t| t.contains("typed-after")));
+}
+
+#[test]
+fn ask_times_out_to_pass() {
+    let mut a = asking(&[("MINE_ASK_TIMEOUT_MS", "300")]);
+    let asked = a.ask("Bash");
+    assert_eq!(a.reply(), "");
+    let took = asked.elapsed();
+    assert!(
+        took >= Duration::from_millis(300) && took < Duration::from_secs(5),
+        "{took:?}"
+    );
+    assert_eq!(a.pending(), None);
+}
+
+#[test]
+fn ask_released_when_daemon_stops() {
+    let mut a = asking(&[]);
+    a.ask("Bash");
+    a.wait_pending();
+    kill_daemon(&a.st);
+    assert_eq!(a.reply(), "");
+}
+
+#[test]
+fn pass_tools_never_held() {
+    let mut a = asking(&[]);
+    for tool in ["AskUserQuestion", "ExitPlanMode"] {
+        let asked = a.ask(tool);
+        assert_eq!(a.reply(), "", "{tool}");
+        assert!(
+            asked.elapsed() < Duration::from_secs(1),
+            "{tool}: {:?}",
+            asked.elapsed()
+        );
+    }
+}
+
+#[test]
+fn second_answer_is_ignored() {
+    let mut a = asking(&[]);
+    a.ask("Bash");
+    let first = a.wait_pending();
+    // The app and the TUI both answer the same request: the first one decides.
+    a.answer(first.request, true);
+    a.answer(first.request, false);
+    assert_eq!(a.reply(), format!("{ALLOW}\n"));
+    // An answer to the old request doesn't touch a newer one.
+    a.ask("Bash");
+    let second = a.wait_pending();
+    assert_ne!(second.request, first.request);
+    a.answer(first.request, true);
+    assert_eq!(a.pending(), Some(second.clone()));
+    a.answer(second.request, false);
+    assert!(a.reply().contains("Denied from mine"));
+    let log = fs::read_to_string(a.st.root.join("logs").join("daemon.log")).unwrap();
+    assert_eq!(log.matches("no longer pending").count(), 2, "{log}");
+}
+
+#[test]
+fn decision_never_has_updated_permissions() {
+    let mut a = asking(&[]);
+    for allow in [true, false] {
+        a.ask("Bash");
+        let p = a.wait_pending();
+        a.answer(p.request, allow);
+        let out = a.reply();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            v["hookSpecificOutput"]["hookEventName"],
+            "PermissionRequest"
+        );
+        assert!(!out.contains("updatedPermissions"), "{out}");
+    }
+}
+
+#[test]
+fn ask_fails_open_without_daemon() {
+    let st = state();
+    let dir = st.root.join("sessions").join("k1-rust");
+    fs::create_dir_all(&dir).unwrap();
+    let dir = dir.to_string_lossy();
+    let payload = r#"{"hook_event_name":"PermissionRequest","tool_name":"Bash","tool_input":{"command":"SECRET-CMD"}}"#;
+    // No daemon, garbage, and a payload without a tool.
+    for input in [payload, "SECRET-NOT-JSON", "{}"] {
+        let out = mine_stdin(&st, &["_event", &dir, "--ask"], input);
+        assert!(out.stdout.is_empty(), "{:?}", out.stdout);
+    }
+    assert!(daemon_pid(&st).is_none());
+    let log = fs::read_to_string(st.root.join("logs").join("hooks.log")).unwrap();
+    assert_eq!(log.lines().count(), 3, "{log}");
+    assert!(!log.contains("SECRET"), "{log}");
+}
+
+/// Opens a hook's connection that asks about session `c`, the way `_event --ask` speaking `version` would.
+fn ask_raw(a: &Asking, version: u32) -> Client {
+    let mut hook = connect(&a.st);
+    // Set now: macOS refuses it once the daemon has replied and closed the connection.
+    hook.reader.get_ref().set_read_timeout(Some(WAIT)).unwrap();
+    hook.send(&ToDaemon::Hello { version });
+    hook.send(&ToDaemon::Ask {
+        id: a.st.id("c"),
+        tool: "Bash".into(),
+        summary: "Bash(x)".into(),
+    });
+    hook
+}
+
+/// Like `Poke`, a hook's `Ask` is served whatever protocol version it speaks, even one too old for anything else.
+#[test]
+fn ask_accepted_at_any_version() {
+    let a = asking(&[]);
+    for version in [MIN_CLIENT_VERSION - 1, VERSION, VERSION + 1] {
+        let mut hook = ask_raw(&a, version);
+        let p = a.wait_pending();
+        a.answer(p.request, true);
+        loop {
+            if let FromDaemon::AskReply { decision } =
+                read_msg(&mut hook.reader).unwrap().expect("no AskReply")
+            {
+                break assert_eq!(decision, Decision::Allow);
+            }
+        }
+    }
+}
+
+#[test]
+fn ask_dropped_connection_clears_pending() {
+    let a = asking(&[]);
+    let hook = ask_raw(&a, VERSION);
+    a.wait_pending();
+    drop(hook);
+    wait_until(|| a.pending().is_none());
 }

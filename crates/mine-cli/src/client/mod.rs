@@ -345,10 +345,11 @@ impl App {
                 self.dirty = true;
             }
             // The version was checked at connect time, and the other sessions' screens are no longer viewed. The connection already
-            // skips unknown messages.
+            // skips unknown messages, and `AskReply` only goes to a hook's own connection.
             FromDaemon::Hello { .. }
             | FromDaemon::Snapshot { .. }
             | FromDaemon::Output { .. }
+            | FromDaemon::AskReply { .. }
             | FromDaemon::Unknown => {}
         }
     }
@@ -2077,6 +2078,7 @@ mod tests {
             state: SessionState::Idle,
             waiting: None,
             alive: true,
+            pending: None,
         }
     }
 

@@ -13,6 +13,10 @@
 //!   terminal it shows (a v3 client's `Focus` stands in). A client is present when it's visible and its input is within
 //!   `PRESENT_WINDOW_MS`. Only a present client viewing a session marks it seen (Done → Idle), and when a session newly needs
 //!   approval with no present client viewing it, the daemon shows a macOS notification (`MINE_NOTIFY`, default `osascript`).
+//! - Claude's `PermissionRequest` hook (`_event --ask`) sends `Ask` on a connection of its own. Unless a visible client views that
+//!   session (typing or not), the daemon holds it as the session's `pending` (Needs approval) and replies Allow or Deny on that
+//!   connection when a client sends `Answer`. A viewer arriving, input to the session, `ASK_TIMEOUT` or the daemon stopping hands it
+//!   to Claude's own prompt instead (`Pass`).
 //! - Any client from `MIN_CLIENT_VERSION` up is served, and gets only what its version knows: the profile list goes to v4+ clients
 //!   only, right after `Hello` and again to all of them after `ReloadProfiles`. A message type the daemon doesn't know is ignored.
 //! - When the daemon starts again, it scans `sessions/*/meta.json`, reattaches to the holder processes that are alive, and rebuilds
@@ -31,7 +35,7 @@ use std::time::{Duration, Instant};
 
 use alacritty_terminal::vte::ansi::Rgb;
 use anyhow::{Context, Result, bail};
-use tokio::io::BufReader;
+use tokio::io::{AsyncReadExt, BufReader};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -45,12 +49,13 @@ use mine_core::paths::{State, check_sock_path, ensure_dir};
 use mine_core::profiles::{self, ProfileInfo, ProfileKind, Profiles};
 use mine_core::project::{self, project_key};
 use mine_core::proto::{
-    DaemonInfo, FromDaemon, HOLD_VERSION, HoldIn, HoldOut, MIN_CLIENT_VERSION, PRESENT_WINDOW_MS,
-    ToDaemon, VERSION, recv, send,
+    DaemonInfo, Decision, FromDaemon, HOLD_VERSION, HoldIn, HoldOut, MIN_CLIENT_VERSION,
+    PRESENT_WINDOW_MS, ToDaemon, VERSION, recv, send,
 };
 use mine_core::screen::Screen;
 use mine_core::session::{
-    self, Kind, Meta, NewSession, Restore, SessionInfo, SessionState, session_id, validate_name,
+    self, Kind, Meta, NewSession, PendingAsk, Restore, SessionInfo, SessionState, session_id,
+    validate_name,
 };
 use mine_core::share;
 
@@ -88,9 +93,11 @@ const HOLD_READ_BUF: usize = 64 * 1024;
 // To cut it further, count the queue in bytes.
 const BATCH_MAX: usize = 16 * 1024;
 /// The features this daemon announces in its hello reply. Clients gate new behavior on these names, not on the version alone.
-const FEATURES: &[&str] = &["profiles", "presence"];
+const FEATURES: &[&str] = &["profiles", "presence", "ask"];
 /// The first client version that knows `FromDaemon::Profiles`.
 const PROFILES_SINCE: u32 = 4;
+/// How long a permission request is held before it goes to Claude's own prompt. `MINE_ASK_TIMEOUT_MS` overrides it (tests).
+const ASK_TIMEOUT: Duration = Duration::from_secs(120);
 
 // ponytail: global lock; per-session locks once there are hundreds of sessions
 type Shared = Arc<Mutex<Daemon>>;
@@ -146,6 +153,14 @@ struct Sess {
     /// The hook log said Needs approval at the last refresh. Starts `true` so the first refresh, which rereads old events after a daemon
     /// restart, announces nothing.
     asking: bool,
+    /// The permission request held for an answer from a client.
+    pending: Option<Pending>,
+}
+
+/// A held permission request, and where its decision goes: the `Ask` connection waiting in [`ask`]. Dropping `reply` passes it.
+struct Pending {
+    info: PendingAsk,
+    reply: oneshot::Sender<Decision>,
 }
 
 /// A holder process connection. `link` is numbered afresh for each connection, filtering out events sent by a previous connection's tasks.
@@ -409,26 +424,78 @@ async fn serve_client(shared: Shared, stream: UnixStream) {
     };
     if served {
         while let Ok(Some(msg)) = recv::<_, ToDaemon>(&mut reader).await {
+            // The hook's `Ask` has the connection to itself, which ends with the reply.
+            if let ToDaemon::Ask { id, tool, summary } = msg {
+                ask(&shared, client, &mut reader, &id, &tool, summary).await;
+                break;
+            }
             if !handle(&shared, client, msg).await {
                 break;
             }
         }
+    } else if hello {
+        // A session's hook runs the `mine` copy the session was started from, which can be another version than this
+        // daemon (a bundle copy and a cargo copy are updated separately). A poke only says "re-read this session's
+        // events", and the events file is the real contract, so it is honoured across versions, even one too old to be
+        // served. So is an `Ask`, which only needs its reply. Nothing else is.
+        match timeout(POKE_WAIT, recv::<_, ToDaemon>(&mut reader)).await {
+            Ok(Ok(Some(ToDaemon::Poke { id }))) => {
+                let mut d = shared.lock().await;
+                d.refresh(&id);
+                d.publish();
+            }
+            Ok(Ok(Some(ToDaemon::Ask { id, tool, summary }))) => {
+                ask(&shared, client, &mut reader, &id, &tool, summary).await;
+            }
+            _ => {}
+        }
     }
     // Dropping the sender makes the write task send the remaining messages (errors included) and close the connection.
     shared.lock().await.clients.remove(&client);
-    // A session's hook runs the `mine` copy the session was started from, which can be another version than this
-    // daemon (a bundle copy and a cargo copy are updated separately). A poke only says "re-read this session's
-    // events", and the events file is the real contract, so it is honoured across versions, even one too old to be
-    // served. Nothing else is.
-    if hello
-        && !served
-        && let Ok(Ok(Some(ToDaemon::Poke { id }))) =
-            timeout(POKE_WAIT, recv::<_, ToDaemon>(&mut reader)).await
-    {
-        let mut d = shared.lock().await;
-        d.refresh(&id);
-        d.publish();
-    }
+}
+
+/// `Ask`: holds Claude's permission request (see [`Daemon::hold`]) until a client answers, the hold times out, or the hook's
+/// connection drops, then replies on this connection. A request that isn't held, or is let go, is `Pass`.
+async fn ask(
+    shared: &Shared,
+    client: u64,
+    reader: &mut BufReader<OwnedReadHalf>,
+    id: &str,
+    tool: &str,
+    summary: String,
+) {
+    let (reply, decided) = oneshot::channel();
+    let held = shared.lock().await.hold(id, tool, summary, reply);
+    let decision = match held {
+        None => Decision::Pass,
+        Some(request) => {
+            let wait = std::env::var("MINE_ASK_TIMEOUT_MS")
+                .ok()
+                .and_then(|ms| ms.parse().ok())
+                .map_or(ASK_TIMEOUT, Duration::from_millis);
+            tokio::select! {
+                decision = decided => decision.unwrap_or(Decision::Pass),
+                () = tokio::time::sleep(wait) => {
+                    shared.lock().await.release(id, request, true);
+                    Decision::Pass
+                }
+                () = closed(reader) => {
+                    shared.lock().await.release(id, request, false);
+                    return;
+                }
+            }
+        }
+    };
+    shared
+        .lock()
+        .await
+        .send(client, FromDaemon::AskReply { decision });
+}
+
+/// Resolves once the peer closes the connection (or it fails). Anything it sends meanwhile is dropped.
+async fn closed(reader: &mut BufReader<OwnedReadHalf>) {
+    let mut buf = [0u8; 256];
+    while matches!(reader.read(&mut buf).await, Ok(n) if n > 0) {}
 }
 
 /// Handles one message. Returns `false` if the client dropped in the meantime.
@@ -459,6 +526,9 @@ async fn handle(shared: &Shared, client: u64, msg: ToDaemon) -> bool {
             d.refresh(&id);
             d.publish();
         }
+        // `serve_client` hands it the connection before it gets here.
+        ToDaemon::Ask { .. } => {}
+        ToDaemon::Answer { id, request, allow } => shared.lock().await.answer(&id, request, allow),
         ToDaemon::Colors { fg, bg } => shared.lock().await.set_colors(&fg, &bg),
         ToDaemon::Focus { focused } => {
             shared
@@ -1051,6 +1121,11 @@ fn notify(meta: &Meta, waiting: Option<&str>) {
     });
 }
 
+/// The waiting text of a held permission request.
+fn ask_waiting(p: &PendingAsk) -> String {
+    format!("Allow {}?", p.summary)
+}
+
 /// An AppleScript string literal. Backslashes and quotes are escaped.
 fn applescript_str(text: &str) -> String {
     format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
@@ -1072,6 +1147,7 @@ impl Sess {
             unlinked: false,
             busy: false,
             asking: true,
+            pending: None,
         }
     }
 
@@ -1081,6 +1157,7 @@ impl Sess {
             state: self.state.clone(),
             waiting: self.waiting.clone(),
             alive: self.hold.is_some() || self.unlinked,
+            pending: self.pending.as_ref().map(|p| p.info.clone()),
         }
     }
 
@@ -1106,6 +1183,23 @@ impl Sess {
         let deadline = self.screen.sync_deadline()?;
         self.sync_timer = true;
         Some(deadline)
+    }
+
+    /// Lets the held request go to Claude's own prompt (`Pass`: its reply is dropped). That prompt is up next, so an Approval event
+    /// with the same text keeps the session Needs approval meanwhile, and the Notification hook that follows doesn't notify again.
+    fn pass(&mut self, dir: &Path) {
+        let Some(p) = self.pending.take() else {
+            return;
+        };
+        let ev = Event {
+            ms: now_ms(),
+            kind: EventKind::Approval,
+            text: Some(ask_waiting(&p.info)),
+            resume_id: None,
+        };
+        if let Err(e) = hooks::append(dir, &ev) {
+            eprintln!("{e:#}");
+        }
     }
 
     /// Changes the screen and PTY size. Does nothing if the size is the same.
@@ -1314,10 +1408,15 @@ impl Daemon {
     /// Only events after the creation time are looked at, so a session recreated with the same id doesn't inherit the previous session's events.
     fn refresh(&mut self, id: &str) {
         let watched = self.watched(id);
+        let viewed = self.visible_viewers(id).next().is_some();
         let dir = self.state.session_dir(id);
         let Some(s) = self.sessions.get_mut(id) else {
             return;
         };
+        // Someone is looking at the terminal now, so a held request goes to Claude's own prompt there.
+        if viewed {
+            s.pass(&dir);
+        }
         if watched {
             let now = now_ms();
             s.viewed_ms = Some(now);
@@ -1333,11 +1432,16 @@ impl Daemon {
             .into_iter()
             .filter(|ev| ev.ms >= s.meta.created_ms)
             .collect();
-        let (mut state, waiting, resume_id) = hooks::fold(&events, s.viewed_ms);
+        let (mut state, mut waiting, resume_id) = hooks::fold(&events, s.viewed_ms);
         // A shell session decides Working from output instead of hooks (`active` exists only for shell sessions). If the hook log decided a
         // state other than Idle, follow that.
         if s.active.is_some() && state == SessionState::Idle {
             state = SessionState::Working;
+        }
+        // A held request needs approval, whatever the hook log says.
+        if let Some(p) = &s.pending {
+            state = SessionState::Approval;
+            waiting = Some(ask_waiting(&p.info));
         }
         // Only the step into Needs approval pops a notification, and only while no present client views the session.
         let asking = state == SessionState::Approval;
@@ -1352,6 +1456,81 @@ impl Daemon {
         if new_request && !watched && s.state == SessionState::Approval {
             notify(&s.meta, s.waiting.as_deref());
         }
+    }
+
+    /// `Ask`: holds Claude's permission request as the session's `pending` and returns its id. It passes at once (`None`) for a
+    /// tool in [`hooks::PASS_TOOLS`], for a session someone is looking at (a visible client viewing it, typing or not: spec 9),
+    /// and for an unknown session.
+    fn hold(
+        &mut self,
+        id: &str,
+        tool: &str,
+        summary: String,
+        reply: oneshot::Sender<Decision>,
+    ) -> Option<u64> {
+        if hooks::PASS_TOOLS.contains(&tool) || self.visible_viewers(id).next().is_some() {
+            return None;
+        }
+        let request = self.next_id();
+        let s = self.sessions.get_mut(id)?;
+        // ponytail: one held request per session; another one meanwhile goes to Claude's own prompt. A queue if parallel tool calls
+        // ask often.
+        if s.pending.is_some() {
+            return None;
+        }
+        let info = PendingAsk {
+            request,
+            summary,
+            since_ms: now_ms(),
+        };
+        s.pending = Some(Pending { info, reply });
+        self.refresh(id);
+        self.publish();
+        Some(request)
+    }
+
+    /// The session, if the request it holds is `request`.
+    fn holding(&mut self, id: &str, request: u64) -> Option<&mut Sess> {
+        let s = self.sessions.get_mut(id)?;
+        s.pending
+            .as_ref()
+            .is_some_and(|p| p.info.request == request)
+            .then_some(s)
+    }
+
+    /// `Answer`: decides the held request if it is still `request`. An answer to one already decided or let go, or to an earlier
+    /// request, is ignored with a log line, so two clients answering one request make exactly one decision.
+    fn answer(&mut self, id: &str, request: u64, allow: bool) {
+        let Some(p) = self.holding(id, request).and_then(|s| s.pending.take()) else {
+            eprintln!(
+                "Ignoring an answer to a request that is no longer pending: {id} (request {request})"
+            );
+            return;
+        };
+        let decision = if allow {
+            Decision::Allow
+        } else {
+            Decision::Deny
+        };
+        let _ = p.reply.send(decision);
+        self.refresh(id);
+        self.publish();
+    }
+
+    /// The hold of `request` ended without an answer: it timed out (`prompting`: Claude shows its own prompt next), or its hook
+    /// went away.
+    fn release(&mut self, id: &str, request: u64, prompting: bool) {
+        let dir = self.state.session_dir(id);
+        let Some(s) = self.holding(id, request) else {
+            return;
+        };
+        if prompting {
+            s.pass(&dir);
+        } else {
+            s.pending = None;
+        }
+        self.refresh(id);
+        self.publish();
     }
 
     /// `List`: recomputes all sessions and replies, and makes this client a subscriber to list changes.
@@ -1456,6 +1635,10 @@ impl Daemon {
         };
         if s.hold.is_none() {
             return;
+        }
+        // Typing into the session lets a held request go to Claude's own prompt, before the keys reach it.
+        if typed {
+            s.pass(&dir);
         }
         if let Some(size) = size {
             s.resize(size);

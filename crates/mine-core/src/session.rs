@@ -79,6 +79,19 @@ pub struct SessionInfo {
     pub state: SessionState,
     pub waiting: Option<String>,
     pub alive: bool,
+    /// A Claude permission request the daemon is holding for an answer from a client. A list from a daemon before `ask` has none.
+    #[serde(default)]
+    pub pending: Option<PendingAsk>,
+}
+
+/// A held permission request. `request` names it in `ToDaemon::Answer`, so an answer meant for an earlier request can't hit this one.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct PendingAsk {
+    pub request: u64,
+    /// The tool and its main argument, as [`crate::hooks::ask_summary`] puts it.
+    pub summary: String,
+    /// When the hold began (Unix ms).
+    pub since_ms: u64,
 }
 
 const META_FILE: &str = "meta.json";
@@ -288,10 +301,14 @@ pub fn launch(
         Kind::Claude => {
             let c = json!({"type": "command", "command": command});
             let h = json!({"hooks": [c]});
+            // Held for an answer from the app or the TUI (`_event --ask`). The daemon lets go after 120 s, well inside this timeout.
+            let ask =
+                json!({"type": "command", "command": format!("{command} --ask"), "timeout": 130});
             let settings = json!({"hooks": {
                 "UserPromptSubmit": [h],
                 "Stop": [h],
                 "Notification": [{"matcher": "permission_prompt", "hooks": [c]}],
+                "PermissionRequest": [{"hooks": [ask]}],
             }});
             argv.extend([
                 "claude".to_string(),
@@ -482,6 +499,41 @@ mod tests {
             v["hooks"]["Notification"][0]["hooks"][0]["command"],
             command
         );
+    }
+
+    #[test]
+    fn ask_hook_in_claude_settings() {
+        let l = run(&meta(Kind::Claude, Some("claude-a")));
+        let v: serde_json::Value = serde_json::from_str(&l.argv[2]).unwrap();
+        let group = &v["hooks"]["PermissionRequest"][0];
+        // Every request, no matcher.
+        assert!(group.get("matcher").is_none(), "{group}");
+        assert_eq!(
+            group["hooks"][0],
+            json!({"type": "command", "command": "/x/mine _event /s/sessions/k1-rust --ask", "timeout": 130})
+        );
+        // Codex only listens: its PermissionRequest hook never holds.
+        let codex = run(&meta(Kind::Codex, Some("codex")));
+        assert!(
+            !codex.argv.iter().any(|a| a.contains("--ask")),
+            "{:?}",
+            codex.argv
+        );
+    }
+
+    #[test]
+    fn ask_pending_defaults_in_old_session_lists() {
+        // A list from a daemon before `ask` has no `pending`.
+        let info = SessionInfo {
+            meta: sample_meta(),
+            state: SessionState::Idle,
+            waiting: None,
+            alive: true,
+            pending: None,
+        };
+        let mut v = serde_json::to_value(&info).unwrap();
+        v.as_object_mut().unwrap().remove("pending");
+        assert_eq!(serde_json::from_value::<SessionInfo>(v).unwrap(), info);
     }
 
     #[test]

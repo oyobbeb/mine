@@ -299,11 +299,12 @@ impl Model {
                 Vec::new()
             }
             // The connection checked the version. A screen for another session was sent before the attached session changed, so drop it.
-            // The connection already skips unknown messages.
+            // The connection already skips unknown messages, and `AskReply` only goes to a hook's own connection.
             LinkEvent::Msg(
                 FromDaemon::Hello { .. }
                 | FromDaemon::Snapshot { .. }
                 | FromDaemon::Output { .. }
+                | FromDaemon::AskReply { .. }
                 | FromDaemon::Unknown,
             ) => Vec::new(),
         }
@@ -841,6 +842,7 @@ pub(crate) mod tests {
             state,
             waiting: None,
             alive: true,
+            pending: None,
         }
     }
 

@@ -172,6 +172,7 @@ mod tests {
             state,
             waiting: None,
             alive: true,
+            pending: None,
         }
     }
 

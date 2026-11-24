@@ -733,6 +733,7 @@ mod tests {
             state,
             waiting: waiting.map(str::to_string),
             alive: true,
+            pending: None,
         }
     }
 
