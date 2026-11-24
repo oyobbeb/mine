@@ -66,6 +66,8 @@ const START_WAIT: Duration = Duration::from_secs(5);
 const LINK_WAIT: Duration = Duration::from_secs(5);
 /// If a holder process connection that had been up for less than this drops, the process is considered to have ended rather than reattached (to avoid attaching and dropping over and over).
 const RELINK_MIN_AGE: Duration = Duration::from_secs(1);
+/// After a refused `Hello`, wait this long for a hook's `Poke` (`mine _event` writes both at once).
+const POKE_WAIT: Duration = Duration::from_secs(1);
 /// If another daemon is just finishing, wait this long for the pid file lock to be released.
 const PID_LOCK_WAIT: Duration = Duration::from_secs(1);
 /// Read buffer size of a holder process connection. Sets how much backed-up output can be gathered at once.
@@ -307,7 +309,8 @@ fn read_viewed(dir: &Path) -> Option<u64> {
         .ok()
 }
 
-/// Handles one client connection. The first message must be a `Hello` of the same version.
+/// Handles one client connection. The first message must be a `Hello` of the same version, except for a
+/// hook's `Poke` (see below).
 async fn serve_client(shared: Shared, stream: UnixStream) {
     let (read, mut write) = stream.into_split();
     let (tx, mut rx) = mpsc::channel::<FromDaemon>(QUEUE_CAP);
@@ -320,9 +323,11 @@ async fn serve_client(shared: Shared, stream: UnixStream) {
     });
     let client = shared.lock().await.add_client(tx, writer.abort_handle());
     let mut reader = BufReader::new(read);
+    let mut mismatch = false;
     let refused = match recv::<_, ToDaemon>(&mut reader).await {
         Ok(Some(ToDaemon::Hello { version })) if version == VERSION => None,
         Ok(Some(ToDaemon::Hello { version })) => {
+            mismatch = true;
             let hint = restart_hint(&shared.lock().await.state);
             Some(format!(
                 "Protocol version mismatch (client {version}, daemon {VERSION}). {hint}"
@@ -349,6 +354,17 @@ async fn serve_client(shared: Shared, stream: UnixStream) {
     }
     // Dropping the sender makes the write task send the remaining messages (errors included) and close the connection.
     shared.lock().await.clients.remove(&client);
+    // A session's hook runs the `mine` copy the session was started from, which can be another version than this
+    // daemon (a bundle copy and a cargo copy are updated separately). A poke only says "re-read this session's
+    // events", and the events file is the real contract, so it is honoured across versions. Nothing else is.
+    if mismatch
+        && let Ok(Ok(Some(ToDaemon::Poke { id }))) =
+            timeout(POKE_WAIT, recv::<_, ToDaemon>(&mut reader)).await
+    {
+        let mut d = shared.lock().await;
+        d.refresh(&id);
+        d.publish();
+    }
 }
 
 /// Handles one message. Returns `false` if the client dropped in the meantime.

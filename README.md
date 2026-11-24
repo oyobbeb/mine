@@ -213,10 +213,14 @@ State lives in `~/.mine` (override with `MINE_STATE_DIR`).
 
 A running daemon keeps its old code after you install a new build. Stop it once and the next `mine` starts the new one. Sessions survive because their holders keep running.
 
+The desktop app restarts a stopped daemon right away from the `mine` inside its bundle, so quit the app first, and update both copies of `mine` from the same commit before you stop the daemon:
+
 ```sh
+# Quit the app first (⌘Q).
 cargo install --path crates/mine-cli
+scripts/bundle-app.sh                  # if you use the bundle
 kill "$(cat ~/.mine/daemon.pid)"
-mine
+mine                                   # or mine app
 ```
 
 If you installed an earlier build whose package was named `mine`, the first reinstall needs `cargo install --path crates/mine-cli --force` (the package is now `mine-cli`).

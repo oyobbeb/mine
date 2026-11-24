@@ -499,6 +499,40 @@ fn subscribed_client_gets_pushed_sessions_after_hook() {
     }
 }
 
+/// A hook from another copy of `mine` announces another protocol version. Its poke must still update the state.
+#[test]
+fn hook_poke_from_another_version_updates_state() {
+    let st = state();
+    mine(&st, &["new", "h"]);
+    // Let the shell go quiet first so that no output timer refreshes the state on its own.
+    wait_shell_quiet(&st, "h");
+    let mut c = client(&st);
+    c.send(&ToDaemon::List);
+    assert!(matches!(c.recv(), Some(FromDaemon::Sessions { .. })));
+    let dir = PathBuf::from(session_dir(&st, "h"));
+    let id = dir.file_name().unwrap().to_str().unwrap().to_string();
+    for (version, message) in [(VERSION - 1, "Older?"), (VERSION + 1, "Newer?")] {
+        // Record the event without a poke, then poke the way that version's `mine _event` would.
+        let payload = serde_json::json!({"hook_event_name": "Notification", "message": message});
+        let ev = mine_core::hooks::parse_hook(&payload, mine_core::hooks::now_ms()).unwrap();
+        mine_core::hooks::append(&dir, &ev).unwrap();
+        let mut stream = UnixStream::connect(st.sock()).unwrap();
+        write_msg(&mut stream, &ToDaemon::Hello { version }).unwrap();
+        write_msg(&mut stream, &ToDaemon::Poke { id: id.clone() }).unwrap();
+        drop(stream);
+        loop {
+            match c.recv().expect("the connection dropped") {
+                FromDaemon::Sessions { sessions }
+                    if sessions[0].waiting.as_deref() == Some(message) =>
+                {
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
 /// Creates in `dir` a fake `MINE_NOTIFY` that appends each call's arguments to the calls file as one line. Returns (script, calls file).
 fn fake_notify(dir: &Path) -> (PathBuf, PathBuf) {
     let calls = dir.join("calls");

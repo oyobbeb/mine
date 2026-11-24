@@ -213,10 +213,14 @@ mine은 자격 증명을 읽거나 저장하지 않아요. 자동 이름을 위�
 
 새 빌드를 설치해도 이미 떠 있는 데몬은 옛 코드로 돌아요. 한 번 끝내면 다음 `mine`이 새 데몬을 띄워요. 보관 프로세스가 계속 돌기 때문에 세션은 살아 있어요.
 
+데스크톱 앱은 멈춘 데몬을 묶음 안의 `mine`으로 바로 다시 띄워요. 그러니 먼저 앱을 끝내고, 데몬을 끝내기 전에 두 `mine`을 같은 커밋으로 모두 새로 설치해요.
+
 ```sh
+# 먼저 앱을 끝내요(⌘Q).
 cargo install --path crates/mine-cli
+scripts/bundle-app.sh                  # 묶음을 쓴다면
 kill "$(cat ~/.mine/daemon.pid)"
-mine
+mine                                   # 또는 mine app
 ```
 
 이름이 `mine`이던 예전 패키지로 설치한 빌드가 있다면, 처음 다시 설치할 때는 `cargo install --path crates/mine-cli --force`가 필요해요(패키지 이름이 이제 `mine-cli`예요).
