@@ -5,25 +5,39 @@
 # ponytail: no icon and no code signing yet (stage 8, with the Homebrew install).
 set -euo pipefail
 
+usage() { echo "usage: scripts/bundle-app.sh [--dest DIR]" >&2; exit 2; }
 dest="$HOME/Applications"
 case "$#:${1:-}" in
   0:) ;;
   2:--dest) dest=$2 ;;
-  *) echo "usage: scripts/bundle-app.sh [--dest DIR]" >&2; exit 2 ;;
+  *) usage ;;
 esac
+[ -n "$dest" ] || usage
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 manifest="$root/Cargo.toml"
 cargo build --release --manifest-path "$manifest" -p mine-app -p mine-cli
 version=$(cargo pkgid --manifest-path "$manifest" -p mine-app | sed 's/.*[#@]//')
+# Ask cargo where it built, so CARGO_TARGET_DIR and a `build.target-dir` in a cargo config both work.
+target=$(cargo metadata --format-version 1 --no-deps --manifest-path "$manifest" |
+  plutil -extract target_directory raw -o - -)
+bin="$target/release"
 
+# The bundle's `mine` is what the running daemon starts every new holder with and what every session's hook
+# runs, so the old bundle stays in place until the new one is complete, and then the two are swapped.
+# ponytail: two renames leave a moment with no bundle; renamex_np(RENAME_SWAP) if that ever matters.
+mkdir -p "$dest"
 app="$dest/mine.app"
-rm -rf "$app"
-mkdir -p "$app/Contents/MacOS"
-bin="${CARGO_TARGET_DIR:-$root/target}/release"
-cp "$bin/mine-app" "$bin/mine" "$app/Contents/MacOS/"
+tmp=$(mktemp -d "$dest/.mine.app.XXXXXX")
+trap 'rm -rf "$tmp"' EXIT
+new="$tmp/mine.app"
+mkdir -p "$new/Contents/MacOS"
+cp "$bin/mine-app" "$bin/mine" "$new/Contents/MacOS/"
+for f in mine-app mine; do
+  [ -x "$new/Contents/MacOS/$f" ] || { echo "Couldn't copy $f into the bundle" >&2; exit 1; }
+done
 
-cat > "$app/Contents/Info.plist" <<PLIST
+cat > "$new/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -38,5 +52,14 @@ cat > "$app/Contents/Info.plist" <<PLIST
 </dict>
 </plist>
 PLIST
+
+# The old bundle moves into the temp dir, which the trap removes once the new one is in place.
+old="$tmp/old.app"
+if [ -e "$app" ]; then mv "$app" "$old"; fi
+if ! mv "$new" "$app"; then
+  if [ -e "$old" ]; then mv "$old" "$app"; fi
+  echo "Couldn't move the new bundle into $app" >&2
+  exit 1
+fi
 
 echo "Built $app (version $version)"
