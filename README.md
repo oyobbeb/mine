@@ -2,55 +2,38 @@
 
 # mine
 
-**AI 코딩 에이전트를 위한 나만의 작업 공간**
+**Your coding-agent sessions, never interrupted.**
 
-Claude Code 계정 두 개, Codex, 일반 셸 세션을 프로젝트별로 한눈에 봅니다.<br>
-화면을 닫거나 SSH가 끊겨도 세션은 계속 돕니다.
+Claude Code and Codex sessions that keep running across windows, accounts, machines, and dropped connections.
 
-[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#라이선스)
-[![Rust 1.89+](https://img.shields.io/badge/rust-1.89%2B-orange)](https://www.rust-lang.org)
-[![macOS](https://img.shields.io/badge/platform-macOS-lightgrey)](#설치)
+[Install](#install) &nbsp;•&nbsp; [Quick start](#quick-start) &nbsp;•&nbsp; [How it works](#how-it-works) &nbsp;•&nbsp; [Roadmap](#roadmap) &nbsp;•&nbsp; [한국어](README.ko.md)
 
-<img src="docs/images/mine-app.png" alt="mine 데스크톱 앱: 왼쪽에 상태별 작업 목록, 위에 세션 탭, 가운데에 세션 터미널" width="880">
-
-<sub>데스크톱 앱(개발 중). 왼쪽은 상태별 작업 목록, 위는 세션 탭, 가운데는 세션 터미널입니다.</sub>
+<img src="docs/images/mine-app.png" alt="The mine desktop app: a task list grouped by status on the left, session tabs on top, and a live Claude Code session in the terminal pane" width="880">
 
 </div>
 
-## 왜 mine인가요
+## About
 
-Ghostty에서 tmux로 에이전트 세션을 여러 개 띄워 쓰다 보면 이런 일이 생깁니다.
+Agent work rarely fits in one sitting. A refactor outlives your terminal window, an account hits its usage limit halfway through, or you want to check on a task from another machine. Each time, the session — and the context built up in it — is the thing you lose.
 
-- 어느 프로젝트에서 어떤 에이전트가 승인을 기다리는지 한눈에 보이지 않아요.
-- 한 계정의 한도가 바닥나면 다른 계정으로 옮기면서 맥락을 다시 설명해야 해요.
-- 원격 머신의 세션을 오가는 일이 번거로워요.
+mine treats a session as something that outlives everything around it. A small daemon owns every Claude Code, Codex, and shell session. Windows and SSH connections come and go, and you pick the session back up where you left it: in the desktop app, in a terminal over SSH, and eventually on another account or another host.
 
-mine은 "어느 터미널에 접속할까"가 아니라 **"지금 이 작업을 어느 에이전트·계정에 맡길까"** 에 답하는 도구를 목표로 합니다.
+> [!NOTE]
+> mine is early and shaped around one person's workflow on macOS (Apple Silicon). Sessions that survive disconnects work today; account handoff and remote hosts are next. See the [roadmap](#roadmap).
 
-## 특징
+## Highlights
 
-- **상태별 작업 목록.** 모든 프로젝트의 세션을 `◆ 승인 대기 → ◐ 작업 중 → ✓ 끝남 → ○ 대기` 순서로 묶어 보여 줘요. 상태는 Claude Code와 Codex의 순정 훅으로 정해요.
-- **죽지 않는 세션.** 세션마다 따로 뜨는 보관 프로세스가 PTY를 쥐고 있어서, 화면을 닫거나 데몬을 다시 띄워도 claude·codex·shell 프로세스는 계속 돌아요. 다시 붙으면 같은 화면이 돌아와요.
-- **계정 두 개.** claude-a(`~/.claude`)와 claude-b(따로 로그인한 프로필)를 세션마다 골라 써요. 화면에는 로그인 이메일 앞부분이나 직접 정한 별칭이 보여요.
-- **키 하나로 시작.** 시작 화면에서 ↵ / `b` / `x` / `s` 한 번으로 claude-a / claude-b / codex / shell 세션을 바로 만들어요.
-- **tmux 수준의 스크롤과 복사.** 휠 스크롤, 드래그 복사(OSC 52), `⌃a [` 복사 모드(쪽 넘김, 검색)를 지원해요.
-- **순정 CLI 그대로.** 세션 화면은 Claude Code와 Codex를 그대로 띄워요. 키보드 모드(kitty 키보드, modifyOtherKeys)도 바깥 터미널로 넘겨서 Shift+Enter가 그대로 동작해요.
+- **Sessions outlive their window.** Each session's PTY is held by its own holder process. Close the app, lose SSH, or restart the daemon, and `claude`, `codex`, and your dev server keep running. Reattach and the screen comes back.
+- **Exited conversations resume.** A Claude or Codex session whose process ended stays in the list as *Exited*. Select it and the same conversation starts again.
+- **Two Claude accounts, one list.** Run sessions on two separately logged-in Claude accounts side by side. Each shows as your login name or a label you choose.
+- **See what needs you.** Sessions from every project are grouped as *Needs approval → Working → Done → Idle*, driven by the stock CLI hooks.
+- **One key to start.** The launcher creates a Claude, second-account Claude, Codex, or shell session with a single key.
+- **The real CLIs.** Sessions run stock Claude Code and Codex. Keyboard modes (kitty keyboard, modifyOtherKeys) pass through, so Shift+Enter just works.
+- **Desktop app and terminal UI.** A GPUI desktop app for daily use and a terminal UI for SSH, both attached to the same daemon.
 
-## 상태
+## Install
 
-| 단계 | 내용 | 상태 |
-|---|---|---|
-| 1 | 데몬, 보관 프로세스, 터미널 UI(`mine`), 상태별 목록, 복사 모드 | ✅ 사용 가능 |
-| D1 | 데스크톱 앱 창 뼈대: 작업 목록, 세션 탭, 시작 화면, 터미널 칸 | 🚧 개발 중 (입력·마우스·알림·`.app` 남음) |
-| D2 | 데스크톱 앱 채팅 화면(Claude·Codex 대화, 승인 버튼, 서브에이전트 카드) | ⏳ 계획 |
-| D3 | Changes 칸(미커밋 변경 트리와 커밋 목록) | ⏳ 계획 |
-| 2–8 | 계정 한도 넘기기, 재부팅 복원, git graph, 원격, 마스터 세션, 브라우저 칸, Homebrew 배포 | ⏳ 계획 |
-
-설계는 [멀티플렉서 설계](docs/superpowers/specs/2026-11-20-mine-multiplexer-design.md)와 [데스크톱 앱 설계](docs/superpowers/specs/2026-11-23-mine-desktop-design.md)에 있어요.
-
-## 설치
-
-macOS(Apple Silicon)와 Rust 1.89 이상이 필요해요. 쓰려는 에이전트 CLI(`claude`, `codex`)는 따로 설치하고 로그인해 두세요.
+Requires macOS and Rust 1.89 or newer. Install and log in to the agent CLIs you want to use (`claude`, `codex`) separately.
 
 ```sh
 git clone https://github.com/oyobbeb/mine.git
@@ -58,147 +41,142 @@ cd mine
 cargo install --path crates/mine-cli
 ```
 
-`~/.cargo/bin`이 PATH에 있어야 해요. 새 셸에서 `command -v mine`으로 확인하세요.
+Make sure `~/.cargo/bin` is on your `PATH` (`command -v mine`).
 
-> [!NOTE]
-> 예전에 패키지 이름이 `mine`이던 판을 설치했다면 처음 한 번은 `cargo install --path crates/mine-cli --force`로 덮어써야 해요.
-
-## 빠른 시작
-
-프로젝트 폴더 안에서 실행하세요. 가장 가까운 Git 작업 트리 루트가 프로젝트가 돼요.
+The desktop app is in development. To try it:
 
 ```sh
-mine                 # 화면을 열어요. 세션이 없으면 시작 화면이 떠요
-mine ls              # 세션 목록
-mine new dev         # shell 세션 "dev"를 만들어요
+cargo run --release -p mine-app
 ```
 
-화면에서는 `⌃a`(Control+a)를 누른 뒤 명령 키를 누릅니다. 예를 들어 `⌃a d`는 Control+a를 누르고 손을 뗀 다음 `d`를 눌러요. 화면에서만 나가고 세션은 계속 돌아요.
+## Quick start
 
-## 사용법
-
-### 명령
+Run mine inside a project. The nearest Git work tree becomes the project.
 
 ```sh
-mine                                  # 화면을 연다
-mine ls                               # 세션 목록 (탭으로 나눈 기계용 출력)
-mine new rust-core --kind claude --account claude-b --model opus
-mine new dev                          # 종류를 생략하면 shell
-mine kill rust-core                   # 세션을 닫는다(세션 폴더와 기록은 남는다)
-mine projects                         # 등록된 프로젝트
-mine --project ~/dev/app new dev      # 시작 폴더를 직접 지정한다
+mine            # open the terminal UI; starts the daemon if needed
+mine new dev    # create a shell session named "dev"
+mine ls         # list sessions
 ```
 
-- `mine ls`는 한 줄에 `기호 프로젝트폴더 이름 계정 상태 대기문구`를 탭으로 나눠 써요. 빈 칸은 `-`예요.
-- 세션 이름은 프로젝트 안에서 고유해야 하고, 영문·숫자로 시작해 영문·숫자·`_~-`만 64자까지 써요.
-- `--project`는 하위 명령 앞에 써요. 그 폴더에서 위로 올라가며 프로젝트를 찾아요.
+Inside the terminal UI, press the prefix `⌃a` (Control+a), release it, then press a command key. `⌃a d` detaches: the UI closes and every session keeps running. Run `mine` again to get back.
 
-### 키
+## Usage
 
-| 키 | 동작 |
+### Commands
+
+```sh
+mine                                  # open the terminal UI
+mine ls                               # list sessions (tab-separated, script-friendly)
+mine new review --kind claude --account claude-b --model opus
+mine new dev                          # kind defaults to shell
+mine kill review                      # close a session (its directory and history stay)
+mine projects                         # list registered projects
+mine --project ~/dev/app new dev      # pick the project explicitly
+```
+
+- `mine ls` prints `symbol project name account state waiting-text` per line, tab-separated, with `-` for empty fields.
+- Session names are unique per project: up to 64 characters, starting with a letter or digit, using letters, digits, and `_~-`.
+- `--project` goes before the subcommand. mine walks up from that folder to find the project.
+
+### Keys
+
+| Key | Action |
 |---|---|
-| `⌃a ⌃a` | 세션에 `⌃a` 자체를 보내요 |
-| `⌃a n` / `⌃a p` | 다음 / 이전 세션 |
-| `⌃a )` / `⌃a (` | 다음 / 이전 프로젝트 |
-| `⌃a 0` | 모든 프로젝트 |
-| `⌃a c` | 새 세션(시작 화면) |
-| `⌃a x` | 현재 세션 닫기(`y`로 확인) |
-| `⌃a b` | 목록 접기 / 펴기 |
-| `⌃a [` | 복사 모드 |
-| `⌃a d` | 화면에서 나가기(세션은 계속 돌아요) |
+| `⌃a ⌃a` | Send a literal `⌃a` to the session |
+| `⌃a n` / `⌃a p` | Next / previous session |
+| `⌃a )` / `⌃a (` | Next / previous project |
+| `⌃a 0` | All projects |
+| `⌃a c` | New session (launcher) |
+| `⌃a x` | Close the current session (`y` to confirm) |
+| `⌃a b` | Collapse / expand the list |
+| `⌃a [` | Copy mode |
+| `⌃a d` | Detach (sessions keep running) |
 
 <details>
-<summary><b>시작 화면</b></summary>
+<summary><b>Launcher</b></summary>
 
-붙은 세션이 없으면 터미널 칸 가운데에 새 세션 메뉴가 떠요. `⌃a c`는 세션 위에 이 화면을 열어요.
+When no session is attached, the terminal pane shows the launcher. `⌃a c` opens it over the current session.
 
-| 키 | 동작 |
+| Key | Action |
 |---|---|
-| Enter / `b` / `x` / `s` | claude-a / claude-b / codex / shell 세션을 만들어 바로 붙어요 |
-| `n` | `<claude-a\|claude-b\|codex\|shell> <이름> [모델]`을 직접 입력해요 |
-| Esc | 세션 위에 연 시작 화면을 닫아요 |
+| Enter / `b` / `x` / `s` | Create a Claude (first account) / Claude (second account) / Codex / shell session and attach |
+| `n` | Type `<claude-a\|claude-b\|codex\|shell> <name> [model]` yourself |
+| Esc | Close a launcher opened over a session |
 
-이름은 프로젝트에서 쓰지 않은 가장 작은 `t1`, `t2`, … 가 돼요. 메뉴 줄을 클릭해도 같아요. 한글 입력 상태에서 명령 키를 누르면 `한/영을 영문으로 바꾸고 다시 눌러 주세요`라고 알려 줘요.
+New sessions get the smallest unused name in the project: `t1`, `t2`, …. Clicking a menu row does the same. If a Korean input method is active when you press a command key, the status line asks you to switch to English.
 
 </details>
 
 <details>
-<summary><b>복사 모드</b></summary>
+<summary><b>Copy mode</b></summary>
 
-스크롤백을 얼려 놓고 키보드로 움직이며 복사해요.
+Freezes the scrollback so you can move around and copy with the keyboard.
 
-| 키 | 동작 |
+| Key | Action |
 |---|---|
-| `h` `j` `k` `l` / 방향키 | 커서 이동 |
-| `g` / `G` | 맨 위 / 맨 아래 |
-| `0` / `$` | 줄 처음 / 줄 끝 |
-| PgUp / PgDn, `⌃b` / `⌃f` | 한 쪽 위 / 아래 |
-| `⌃u` / `⌃d` | 반 쪽 위 / 아래 |
-| `/` / `?` | 아래로 / 위로 검색(대소문자 구분 없음) |
-| `n` / `N` | 같은 방향 / 반대 방향 다음 일치 |
-| `v` | 선택 시작 / 해제 |
-| `y` / Enter | 복사하고 끝내기 |
-| `q` / Esc | 끝내기 |
+| `h` `j` `k` `l` / arrows | Move the cursor |
+| `g` / `G` | Top / bottom |
+| `0` / `$` | Start / end of line |
+| PgUp / PgDn, `⌃b` / `⌃f` | Page up / down |
+| `⌃u` / `⌃d` | Half page up / down |
+| `/` / `?` | Search forward / backward (case-insensitive) |
+| `n` / `N` | Next match, same / opposite direction |
+| `v` | Start / clear selection |
+| `y` / Enter | Copy and exit |
+| `q` / Esc | Exit |
 
 </details>
 
 <details>
-<summary><b>마우스</b></summary>
+<summary><b>Mouse</b></summary>
 
-- 휠: 스크롤백을 움직여요. 세션 프로그램이 마우스를 받으면 그 프로그램에 넘겨요.
-- 드래그: 고르고 손을 떼면 OSC 52로 클립보드에 복사해요.
-- 클릭: 프로젝트 아이콘, 세션 줄, 그룹 머리글(접기/펴기), 시작 화면 메뉴를 골라요.
+- Wheel scrolls the session's scrollback, or goes to the program if it requested mouse input.
+- Drag selects; releasing copies to the clipboard over OSC 52.
+- Click picks a project, a session, a group header (collapse / expand), or a launcher row.
 
 </details>
 
-### 데스크톱 앱 (개발 중)
+## Configuration
 
-```sh
-cargo run -p mine-app
-```
+### Account labels
 
-같은 데몬에 붙는 GPUI 창이에요. 앱을 닫아도 세션은 계속 돌아요. 지금은 작업 목록, 세션 탭, 시작 화면, 터미널 화면 표시까지 돼요. 키 입력, 마우스 선택, 승인 알림, `.app` 묶음은 개발 중이에요.
+The UI shows a short name for each account instead of `claude-a` / `claude-b`:
 
-## 설정
-
-### 계정 이름
-
-화면에는 계정 id(`claude-a` …) 대신 짧은 이름이 보여요. 정하는 차례는 다음과 같아요.
-
-1. 별칭: `~/.mine/config.toml`에 적어요.
+1. A label you set in `~/.mine/config.toml`:
 
    ```toml
    [accounts.claude-a]
-   label = "개인"
+   label = "personal"
 
    [accounts.claude-b]
-   label = "회사"
+   label = "work"
    ```
 
-2. 자동 이름: 각 Claude 프로필의 로그인 이메일 `@` 앞부분. Codex는 `Codex`예요.
-3. 둘 다 없으면 계정 id 그대로예요.
+2. Otherwise, the part before `@` in that Claude profile's login email. Codex shows as `Codex`.
+3. Otherwise, the account id.
 
-mine은 자격 증명을 읽거나 저장하지 않아요. 자동 이름을 위해 `.claude.json`의 이메일 한 필드만 읽고, 로그에 남기지 않아요. 별칭은 화면에만 쓰여서 `mine ls`, `mine new --account`, 시작 화면의 `n` 입력은 계정 id를 그대로 써요.
+mine never reads or stores credentials. For automatic names it reads a single field, the login email in `.claude.json`, and never logs it. Labels are display-only: `mine ls`, `mine new --account`, and the launcher's `n` prompt use the account ids.
 
-### 상태 폴더
+### State directory
 
-기본 위치는 `~/.mine`이고 `MINE_STATE_DIR`로 바꿀 수 있어요.
+State lives in `~/.mine` (override with `MINE_STATE_DIR`).
 
 ```text
 ~/.mine/
-  daemon.sock           클라이언트가 붙는 유닉스 소켓
-  daemon.pid            데몬이 하나만 뜨게 하는 잠금 파일
-  config.toml           계정 별칭(선택)
-  projects/<key>.json   등록된 프로젝트 경로
-  sessions/<id>/        meta.json, events.jsonl(훅 이벤트), exit
-  run/                  보관 프로세스 소켓
+  daemon.sock           Unix socket clients attach to
+  daemon.pid            lock file that keeps a single daemon running
+  config.toml           account labels (optional)
+  projects/<key>.json   registered project paths
+  sessions/<id>/        meta.json, events.jsonl (hook events), exit
+  run/                  holder process sockets
   logs/                 daemon.log, hold-<id>.log
-  profiles/claude-b/    claude-b의 CLAUDE_CONFIG_DIR
+  profiles/claude-b/    CLAUDE_CONFIG_DIR for the second Claude account
 ```
 
-## 업그레이드
+### Upgrading
 
-새 판을 설치해도 이미 떠 있는 데몬은 옛 코드로 돌아요. 설치한 뒤 데몬을 한 번 끝내면 다음 `mine`이 새 데몬을 띄워요. 세션은 보관 프로세스가 쥐고 있어서 죽지 않아요.
+A running daemon keeps its old code after you install a new build. Stop it once and the next `mine` starts the new one. Sessions survive because their holders keep running.
 
 ```sh
 cargo install --path crates/mine-cli
@@ -206,43 +184,58 @@ kill "$(cat ~/.mine/daemon.pid)"
 mine
 ```
 
-## 동작 방식
+## How it works
 
 ```mermaid
 flowchart LR
-    App["mine-app (GPUI 창)"] --> Daemon
-    TUI["mine (터미널 UI)"] --> Daemon
+    App["mine-app<br/>desktop"] --> Daemon
+    TUI["mine<br/>terminal UI"] --> Daemon
     CLI["mine ls / new / kill"] --> Daemon
-    Daemon["mine daemon<br/>세션 목록 · 상태 · 화면"] --> H1["mine hold"] --> S1["claude"]
+    Daemon["mine daemon<br/>sessions · state · screens"] --> H1["mine hold"] --> S1["claude"]
     Daemon --> H2["mine hold"] --> S2["codex / shell"]
-    Hook["순정 CLI 훅"] -->|"mine _event"| Daemon
+    Hooks["stock CLI hooks"] -->|"mine _event"| Daemon
 ```
 
-- **클라이언트**(`mine`, `mine-app`)는 화면을 그리고 키를 받아요. 유닉스 소켓의 JSON 줄 프로토콜로 데몬에 붙어요.
-- **데몬**(`mine daemon`)은 세션 목록과 상태, 세션마다의 터미널 화면([alacritty_terminal](https://github.com/alacritty/alacritty))을 유지해요. 처음 `mine`을 실행할 때 알아서 떠요.
-- **보관 프로세스**(`mine hold`)가 세션마다 PTY를 쥐어요. 그래서 데몬이 다시 떠도 세션이 살아요.
+- **Clients** (`mine-app`, `mine`) draw and take input. They talk to the daemon in JSON lines over a Unix socket, and any number can attach at once.
+- **The daemon** keeps the session list, each session's state, and a terminal screen per session ([alacritty_terminal](https://github.com/alacritty/alacritty)). The first `mine` starts it.
+- **Holders** (`mine hold`), one per session, own the PTY. They are why a session outlives the client and the daemon itself.
 
-| 크레이트 | 역할 |
+| Crate | Role |
 |---|---|
-| [`crates/mine-core`](crates/mine-core) | 공용 라이브러리: 프로토콜, 세션 타입, 화면, 데몬 연결 |
-| [`crates/mine-cli`](crates/mine-cli) | `mine` 실행 파일: 명령, 데몬, 보관 프로세스, 터미널 UI |
-| [`crates/mine-app`](crates/mine-app) | `mine-app` 실행 파일: GPUI 데스크톱 앱 |
+| [`mine-core`](crates/mine-core) | Shared library: protocol, session types, screens, daemon link |
+| [`mine-cli`](crates/mine-cli) | The `mine` binary: commands, daemon, holder, terminal UI |
+| [`mine-app`](crates/mine-app) | The `mine-app` binary: GPUI desktop app |
 
-## 개발
+## Roadmap
+
+| Stage | What | Status |
+|---|---|---|
+| 1 | Daemon, holders, terminal UI, status-grouped list, copy mode | ✅ Done |
+| D1 | Desktop app shell: task list, session tabs, launcher, terminal pane | 🚧 In progress (input, mouse, notifications, `.app` bundle left) |
+| D2 | Chat view for Claude and Codex with approval buttons and subagent cards | Planned |
+| D3 | Changes panel: uncommitted tree and commit list | Planned |
+| 2 | Usage limits and one-key handoff of a task to another account, with context | Planned |
+| 3 | Restore sessions after a reboot | Planned |
+| 4 | Git graph and files pane | Planned |
+| 5 | Remote hosts in the same list, over SSH | Planned |
+| 6 | Optional master session that drives the others | Planned |
+| 7 | Headless browser pane | Planned |
+| 8 | Homebrew install | Planned |
+
+Design docs: [multiplexer design](docs/superpowers/specs/2026-11-20-mine-multiplexer-design.md) · [desktop app design](docs/superpowers/specs/2026-11-23-mine-desktop-design.md).
+
+## Development
 
 ```sh
 cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace
 ```
 
-- 설계 문서와 구현 계획은 [`docs/superpowers`](docs/superpowers)에 있어요.
-- 커밋 제목은 `type(scope): 한글 명령형 요약`을 써요. 타입은 `feat|fix|refactor|docs|chore|style|perf|test`이고, 스코프는 `cli`, `app`, `daemon`, `screen`, `accounts`, `workspace`, `architecture`, `workflow`처럼 바꾼 책임을 드러내요. 본문에는 바꾼 동작, 이유, 검증을 적어요.
-- 한 커밋은 독립적으로 설명하고 되돌릴 수 있는 동작 하나를 담고, 각 커밋에서 위 검사가 통과해야 해요.
+- Each commit holds one behavior you can explain and revert on its own, and passes the check above.
+- Commit subjects follow [Conventional Commits](https://www.conventionalcommits.org) in English: `type(scope): imperative summary`, with `feat|fix|refactor|docs|chore|style|perf|test`. The body says what changed, why, and how it was verified.
+- Design docs and implementation plans live in [`docs/superpowers`](docs/superpowers).
 
-## 라이선스
+## License
 
-다음 둘 중 하나를 골라 쓸 수 있어요.
+Licensed under either of [Apache License 2.0](LICENSE-APACHE) or [MIT License](LICENSE-MIT), at your option.
 
-- [Apache License 2.0](LICENSE-APACHE)
-- [MIT License](LICENSE-MIT)
-
-따로 밝히지 않는 한, 이 저장소에 기여한 코드는 Apache-2.0 라이선스 정의에 따라 위 두 라이선스로 함께 배포하는 데 동의한 것으로 봐요.
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in this work, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
