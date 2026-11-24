@@ -9,15 +9,15 @@ use alacritty_terminal::vte::ansi::Rgb;
 use ratatui::crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use tokio::sync::mpsc;
 
-/// Enables the alternate screen, SGR mouse (press 1000, drag 1002, SGR format 1006) and bracketed paste (2004).
-/// 1003, which reports motion only, is not enabled because it floods us with events.
+/// Enables the alternate screen, SGR mouse (press 1000, drag 1002, SGR format 1006), focus reports (1004, for presence) and
+/// bracketed paste (2004). 1003, which reports motion only, is not enabled because it floods us with events.
 /// Finally pushes one kitty keyboard level (`CSI > 0 u`). Flags set per session go on this level only.
-const ENTER: &[u8] = b"\x1b[?1049h\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?2004h\x1b[>0u";
+const ENTER: &[u8] = b"\x1b[?1049h\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?1004h\x1b[?2004h\x1b[>0u";
 /// Resets the per-session key encoding modes (DECCKM, numeric keypad, modifyOtherKeys) to their defaults, pops the pushed kitty level
 /// to return to the outer terminal's original one, then turns `ENTER` off in reverse and shows the cursor again.
 /// The kitty level is per screen, so it is popped before leaving the alternate screen.
 const LEAVE: &[u8] = b"\x1b[?1l\x1b>\x1b[>4;0m\x1b[<u\
-    \x1b[?2004l\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?1049l\x1b[?25h";
+    \x1b[?2004l\x1b[?1004l\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?1049l\x1b[?25h";
 /// Appends DA1 after the default foreground and background color queries. The terminal answers in order and always answers DA1,
 /// so once the DA1 reply arrives, the earlier replies (if any) have all arrived.
 const QUERY: &[u8] = b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\\x1b[c";

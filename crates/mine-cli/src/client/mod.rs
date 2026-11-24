@@ -30,10 +30,11 @@ use tokio::sync::mpsc::UnboundedSender;
 use copymode::{CopyMode, CopyOut};
 use input::{Action, Cmd, InputParser};
 use mine_core::conn::Conn;
+use mine_core::hooks::now_ms;
 use mine_core::keys::KeyModes;
 use mine_core::launch::{self, Choice};
 use mine_core::paths::State;
-use mine_core::proto::{FromDaemon, ToDaemon};
+use mine_core::proto::{FromDaemon, PresenceReport, ToDaemon};
 use mine_core::screen::Screen;
 use mine_core::select::{
     MouseEv, MouseKind, encode_sgr, selected_text, session_takes, wants_mouse,
@@ -68,6 +69,9 @@ pub async fn run(state: State, project: PathBuf) -> Result<()> {
     )))?;
     let mut rx = conn.rx;
     let mut app = App::new(conn.tx, project, terminal.size()?);
+    app.presence = conn.features.iter().any(|f| f == "presence");
+    // Running `mine` was the user's input.
+    app.report.input(now_ms());
     if let Some((fg, bg)) = colors {
         app.send(ToDaemon::Colors {
             fg: fg.to_string(),
@@ -80,6 +84,7 @@ pub async fn run(state: State, project: PathBuf) -> Result<()> {
     let mut last_draw: Option<Instant> = None;
     loop {
         app.end_stale_sync();
+        app.sync_presence(Instant::now());
         // The key encoding modes are applied right after the state changes, between frames, over the same write path as the screen.
         let keys = app.sync_keys();
         if !keys.is_empty() {
@@ -99,6 +104,7 @@ pub async fn run(state: State, project: PathBuf) -> Result<()> {
             app.dirty
                 .then(|| last_draw.map_or_else(Instant::now, |t| t + FRAME)),
             app.sync_deadline(),
+            app.presence_deadline(),
         ]
         .into_iter()
         .flatten()
@@ -201,6 +207,11 @@ struct App {
     held: bool,
     /// The key encoding modes currently set on the outer terminal.
     keys: KeyModes,
+    /// The daemon announced `presence`. Without it the client reports nothing, as before.
+    presence: bool,
+    /// The outer terminal has focus: true until a focus-out report (a terminal without focus reporting counts as visible).
+    visible: bool,
+    report: PresenceReport,
     dirty: bool,
     quit: bool,
 }
@@ -234,9 +245,28 @@ impl App {
             esc_exit: None,
             held: false,
             keys: KeyModes::default(),
+            presence: false,
+            visible: true,
+            report: PresenceReport::default(),
             dirty: true,
             quit: false,
         }
+    }
+
+    /// Sends `Presence` if it's due ([`PresenceReport::due`]). The attached session counts as viewed unless the launcher covers it.
+    fn sync_presence(&mut self, now: Instant) {
+        if !self.presence {
+            return;
+        }
+        let viewing = self.m.attached.as_deref().filter(|_| !self.m.launcher);
+        if let Some(msg) = self.report.due(now, self.visible, viewing) {
+            self.send(msg);
+        }
+    }
+
+    /// When the next heartbeat is due.
+    fn presence_deadline(&self) -> Option<Instant> {
+        self.report.deadline()
     }
 
     /// The bytes that adjust the key encoding modes to set on the outer terminal. Assumes the returned bytes were written and updates the applied state.
@@ -415,6 +445,10 @@ impl App {
     }
 
     fn on_action(&mut self, action: Action) {
+        if let Action::Focus(focused) = action {
+            return self.on_focus(focused);
+        }
+        self.report.input(now_ms());
         if !matches!(action, Action::Mouse(_)) {
             // Pressing a key clears the selection inversion and the notice.
             if self.select.clear() || !self.m.message.is_empty() {
@@ -455,6 +489,23 @@ impl App {
                 self.command(cmd);
             }
             Action::Mouse(ev) => self.mouse(ev),
+            Action::Focus(_) => {} // Handled above.
+        }
+    }
+
+    /// The outer terminal's focus report. Focusing counts as input, as `Focus` does in the daemon. A session that turned focus
+    /// reporting on itself (mode 1004) gets the report too.
+    fn on_focus(&mut self, focused: bool) {
+        self.visible = focused;
+        if focused {
+            self.report.input(now_ms());
+        }
+        let wants = self
+            .screen
+            .as_ref()
+            .is_some_and(|s| s.mode().contains(TermMode::FOCUS_IN_OUT));
+        if wants {
+            self.forward(if focused { b"\x1b[I" } else { b"\x1b[O" }.to_vec());
         }
     }
 
@@ -1917,6 +1968,78 @@ mod tests {
         assert_eq!(keys(&mut alone), APPLY);
         alone.detach();
         assert_eq!(keys(&mut alone), RESET);
+    }
+
+    #[test]
+    fn focus_events_parsed_not_forwarded() {
+        let (mut app, mut rx) = app(b"");
+        app.on_input(b"\x1b[O\x1b[I");
+        assert!(sent(&mut rx).is_empty());
+        assert!(app.visible);
+        // A session that turned focus reporting on gets them as they came.
+        app.on_msg(FromDaemon::Output {
+            id: "s1".into(),
+            data: b"\x1b[?1004h".to_vec(),
+        });
+        app.on_input(b"\x1b[O\x1b[I");
+        assert_eq!(sent(&mut rx), [input(b"\x1b[O"), input(b"\x1b[I")]);
+    }
+
+    #[test]
+    fn presence_follows_focus_attach_and_input() {
+        let presence = |rx: &mut UnboundedReceiver<ToDaemon>| -> Vec<(bool, u64, Option<String>)> {
+            sent(rx)
+                .into_iter()
+                .filter_map(|m| match m {
+                    ToDaemon::Presence {
+                        visible,
+                        last_input_ms,
+                        viewing,
+                    } => Some((visible, last_input_ms, viewing)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let s1 = || Some("s1".to_string());
+        let secs = Duration::from_secs;
+        let (mut app, mut rx) = app(b"");
+        let t0 = Instant::now();
+        // A daemon that doesn't know `Presence` hears nothing.
+        app.sync_presence(t0);
+        assert!(sent(&mut rx).is_empty());
+        assert_eq!(app.presence_deadline(), None);
+        app.presence = true;
+        // Visible until the terminal says otherwise, and viewing the attached session.
+        app.sync_presence(t0);
+        assert_eq!(presence(&mut rx), [(true, 0, s1())]);
+        app.on_input(b"\x1b[O");
+        app.sync_presence(t0 + secs(1));
+        assert_eq!(presence(&mut rx), [(false, 0, s1())]);
+        // Coming back and typing is input, and the change goes out at once.
+        let typed = now_ms();
+        app.on_input(b"\x1b[Ix");
+        app.sync_presence(t0 + secs(2));
+        let [(true, first, _)] = presence(&mut rx)[..] else {
+            panic!("no Presence on focus-in");
+        };
+        assert!(first >= typed);
+        // More typing within 5 s of that waits for the next send past it.
+        app.on_input(b"y");
+        app.sync_presence(t0 + secs(3));
+        assert!(presence(&mut rx).is_empty());
+        app.sync_presence(t0 + secs(7));
+        let [(true, second, _)] = presence(&mut rx)[..] else {
+            panic!("the input wasn't reported");
+        };
+        assert!(second >= first);
+        // The launcher over the session hides its terminal. While visible, the heartbeat comes 30 s after the last send.
+        app.on_input(b"\x01c");
+        app.sync_presence(t0 + secs(8));
+        assert_eq!(presence(&mut rx), [(true, second, None)]);
+        assert_eq!(
+            app.presence_deadline(),
+            Some(t0 + secs(8) + mine_core::proto::PRESENCE_HEARTBEAT)
+        );
     }
 
     #[test]

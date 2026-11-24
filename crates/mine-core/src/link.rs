@@ -21,8 +21,9 @@ const RETRY_MAX: Duration = Duration::from_secs(5);
 /// What the connection thread tells the app.
 #[derive(Clone, Debug, PartialEq)]
 pub enum LinkEvent {
-    /// Attached to the daemon and exchanged `Hello`. The app sends the subscription (`List`) and reattach (`Attach`).
-    Connected,
+    /// Attached to the daemon and exchanged `Hello`, which announced these features. The app sends the subscription (`List`) and
+    /// reattach (`Attach`).
+    Connected(Vec<String>),
     Msg(FromDaemon),
     /// The connection dropped or could not attach. It will reattach soon.
     Disconnected(String),
@@ -85,7 +86,10 @@ async fn run(
                     // Messages queued so far arrived while there was no connection, so they are discarded. The subscription and reattach needed after attaching
                     // are sent fresh by the app once it receives `Connected`.
                     while outgoing.try_recv().is_ok() {}
-                    if events.unbounded_send(LinkEvent::Connected).is_err() {
+                    if events
+                        .unbounded_send(LinkEvent::Connected(conn.features.clone()))
+                        .is_err()
+                    {
                         return;
                     }
                     match pump(conn, &mut outgoing, &events).await {
@@ -114,7 +118,7 @@ async fn pump(
     outgoing: &mut UnboundedReceiver<ToDaemon>,
     events: &UnboundedSender<LinkEvent>,
 ) -> Option<String> {
-    let AsyncConn { tx, mut rx } = conn;
+    let AsyncConn { tx, mut rx, .. } = conn;
     loop {
         tokio::select! {
             msg = rx.recv() => match msg {

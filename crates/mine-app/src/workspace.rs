@@ -5,7 +5,7 @@
 //! the confirmation dialog, the folder picker, the input box) to the model.
 
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use futures::channel::mpsc::UnboundedSender;
@@ -21,7 +21,7 @@ use mine_core::launch::Choice;
 use mine_core::link::{DaemonLink, LinkEvent};
 use mine_core::paths::State;
 use mine_core::project;
-use mine_core::proto::ToDaemon;
+use mine_core::proto::{PRESENCE_HEARTBEAT, ToDaemon};
 use mine_core::session::SessionState;
 use mine_core::view;
 
@@ -36,6 +36,8 @@ use crate::{launcher, sidebar, tabs};
 
 /// At most this many events from the link thread are gathered and fed to the model at once.
 const LINK_BATCH: usize = 256;
+/// The shortest wait of the presence heartbeat task.
+const BEAT_MIN: Duration = Duration::from_secs(1);
 
 pub struct Workspace {
     pub model: Model,
@@ -60,6 +62,8 @@ pub struct Workspace {
     _closed: Subscription,
     /// The task that feeds the link thread's events to the model. It stops with the view when the view is dropped.
     _pump: Task<()>,
+    /// The presence heartbeat ([`Model::presence_deadline`]).
+    _beat: Task<()>,
 }
 
 impl Workspace {
@@ -83,6 +87,20 @@ impl Workspace {
         let closed = cx.on_window_closed(move |cx| {
             let _ = this.update(cx, |ws, _| ws.set_focused(false));
         });
+        // The presence heartbeat: sleeps until the next one is due, or a heartbeat's length while the window is inactive or there
+        // is no connection. The wait is at least `BEAT_MIN`: GPUI's `timer` of zero is ready at once, so a deadline already past
+        // would spin this loop on the main thread without yielding.
+        let beat = cx.spawn(async move |this, cx| {
+            while let Ok(due) = this.update(cx, |ws, _| {
+                ws.presence_tick();
+                ws.model.presence_deadline()
+            }) {
+                let wait = due.map_or(PRESENCE_HEARTBEAT, |d| {
+                    d.saturating_duration_since(Instant::now())
+                });
+                cx.background_executor().timer(wait.max(BEAT_MIN)).await;
+            }
+        });
         Workspace {
             model,
             tx,
@@ -95,7 +113,19 @@ impl Workspace {
             activation: None,
             _closed: closed,
             _pump: pump,
+            _beat: beat,
         }
+    }
+
+    fn presence_tick(&mut self) {
+        let effects = self.model.presence_tick(Instant::now());
+        self.apply(effects);
+    }
+
+    /// A key or click anywhere in the window, seen on the way down (capture phase), so it counts whichever element handles it.
+    fn user_input(&mut self) {
+        let effects = self.model.user_input(Instant::now());
+        self.apply(effects);
     }
 
     /// Feeds the link thread's events to the model. It redraws on every output (`Output`), but GPUI coalesces `notify`
@@ -395,9 +425,13 @@ impl Render for Workspace {
         self.close_stale_find(window);
         self.watch_activation(window, cx);
         self.fix_focus(window, cx);
+        // Every state change that can change which terminal shows (attach, launcher, a session gone) redraws.
+        self.presence_tick();
         frame()
             .track_focus(&self.focus)
             .key_context(CONTEXT)
+            .capture_key_down(cx.listener(|ws, _, _, _| ws.user_input()))
+            .capture_any_mouse_down(cx.listener(|ws, _, _, _| ws.user_input()))
             .on_action(cx.listener(Self::on_new_task))
             .on_action(cx.listener(Self::on_close))
             .on_action(cx.listener(Self::on_select_tab))

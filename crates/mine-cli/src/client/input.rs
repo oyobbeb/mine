@@ -30,6 +30,8 @@ pub enum Action {
     Paste(Vec<u8>),
     /// Hangul arrived instead of a command key after the prefix. It is discarded (not passed to the session) and the user is told to switch to English.
     Hangul,
+    /// The outer terminal's focus report (`CSI I` in, `CSI O` out; mode 1004, which `tty::ENTER` turns on).
+    Focus(bool),
 }
 
 /// The hint shown in the status line when Hangul arrives where a command key is expected.
@@ -79,6 +81,8 @@ enum Esc {
     Mouse(usize, Option<MouseEv>),
     /// The consumed length and the encoded key.
     Key(usize, Key),
+    /// A focus report: `CSI I` (in) or `CSI O` (out).
+    Focus(bool),
     /// The beginning of a marker, mouse or encoded key sequence. More must be received.
     Partial,
     /// An unknown sequence. ESC is emitted as an ordinary byte and the rest is read on.
@@ -96,6 +100,11 @@ fn classify(rest: &[u8]) -> Esc {
     let Some(body) = rest.strip_prefix(b"\x1b[") else {
         return Esc::Other;
     };
+    match body.first() {
+        Some(b'I') => return Esc::Focus(true),
+        Some(b'O') => return Esc::Focus(false),
+        _ => {}
+    }
     // SGR mouse is `CSI < b ; x ; y M|m`; an encoded key is `CSI digits[:;]… u|~`. Read through the final byte and tell them apart.
     let (mouse, params) = match body.strip_prefix(b"<") {
         Some(params) => (true, params),
@@ -340,6 +349,12 @@ impl InputParser {
                         self.key(key, &buf[i..i + len], &mut out, &mut plain);
                         i += len;
                     }
+                    // Not typed by the user, so a prefix waiting for its command key keeps waiting.
+                    Esc::Focus(focused) => {
+                        flush(&mut out, &mut plain);
+                        out.push(Action::Focus(focused));
+                        i += 3;
+                    }
                     // An ESC sequence that isn't a key releases the prefix and is interpreted as usual (paste, mouse, CSI).
                     Esc::PasteStart => {
                         self.prefix = false;
@@ -500,6 +515,24 @@ mod tests {
                 Action::Pass(b"x".to_vec())
             ]
         );
+    }
+
+    #[test]
+    fn focus_reports_parse_as_focus_events() {
+        assert_eq!(
+            p(b"a\x1b[Ib\x1b[O"),
+            vec![
+                Action::Pass(b"a".to_vec()),
+                Action::Focus(true),
+                Action::Pass(b"b".to_vec()),
+                Action::Focus(false)
+            ]
+        );
+        // Split across reads, and arriving between the prefix and its command key, which still works.
+        let mut ip = InputParser::new();
+        assert!(ip.feed(b"\x01\x1b[").is_empty());
+        assert_eq!(ip.feed(b"O"), vec![Action::Focus(false)]);
+        assert_eq!(ip.feed(b"n"), vec![Action::Cmd(Cmd::NextSession)]);
     }
 
     #[test]

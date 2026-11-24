@@ -5,10 +5,11 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use mine_core::hooks::now_ms;
 use mine_core::launch::{self, Choice};
 use mine_core::link::LinkEvent;
 use mine_core::profiles::ProfileInfo;
-use mine_core::proto::{FromDaemon, ToDaemon};
+use mine_core::proto::{FromDaemon, PresenceReport, ToDaemon};
 use mine_core::screen::Screen;
 use mine_core::session::{NewSession, SessionInfo, SessionState};
 use mine_core::view::{self, Group, STATES};
@@ -139,6 +140,9 @@ pub struct Model {
     pub profiles: Vec<ProfileInfo>,
     /// The app window is the active window ([`Model::set_focused`]).
     focused: bool,
+    /// The daemon on this connection announced `presence`: report with `Presence` instead of `Focus`.
+    presence: bool,
+    report: PresenceReport,
 }
 
 impl Model {
@@ -167,20 +171,54 @@ impl Model {
             started: false,
             profiles: Vec::new(),
             focused: false,
+            presence: false,
+            report: PresenceReport::default(),
         }
     }
 
-    /// The app window became active or inactive. The daemon shows approval notifications only while no client is focused,
-    /// so it is told on every change, and on every connect while focused.
+    /// The app window became active or inactive, which counts as input. The daemon routes notifications and "seen" by it, so it
+    /// is told on every change: with `Presence` if the daemon announced `presence`, else with `Focus` (also on every connect while
+    /// focused, since a new connection starts unfocused in the daemon).
     pub fn set_focused(&mut self, focused: bool) -> Vec<Effect> {
         if self.focused == focused {
             return Vec::new();
         }
         self.focused = focused;
+        if focused {
+            self.report.input(now_ms());
+        }
         if !self.connected {
             return Vec::new();
         }
+        if self.presence {
+            return self.presence_tick(Instant::now());
+        }
         vec![Effect::Send(ToDaemon::Focus { focused })]
+    }
+
+    /// A key or click anywhere in the window.
+    pub fn user_input(&mut self, now: Instant) -> Vec<Effect> {
+        self.report.input(now_ms());
+        self.presence_tick(now)
+    }
+
+    /// The `Presence` due at `now` ([`PresenceReport::due`]). Visible is the window being active, and the attached session counts
+    /// as viewed while its terminal pane shows (no launcher over it). Called after anything that can change those and on the
+    /// heartbeat ([`Model::presence_deadline`]).
+    pub fn presence_tick(&mut self, now: Instant) -> Vec<Effect> {
+        if !(self.connected && self.presence) {
+            return Vec::new();
+        }
+        let viewing = self.attached.as_deref().filter(|_| !self.launcher);
+        let due = self.report.due(now, self.focused, viewing);
+        due.map(Effect::Send).into_iter().collect()
+    }
+
+    /// When the next heartbeat is due: only while connected to a daemon that knows `Presence` and the window is active.
+    pub fn presence_deadline(&self) -> Option<Instant> {
+        self.report
+            .deadline()
+            .filter(|_| self.connected && self.presence)
     }
 
     /// Takes the daemon link's events.
@@ -191,10 +229,12 @@ impl Model {
     /// once a new list and `Snapshot` arrive.
     pub fn on_link(&mut self, ev: LinkEvent) -> Vec<Effect> {
         match ev {
-            LinkEvent::Connected => {
+            LinkEvent::Connected(features) => {
                 self.connected = true;
                 self.offline = None;
                 self.listed = false;
+                self.presence = features.iter().any(|f| f == "presence");
+                self.report.reset();
                 let mut effects = vec![
                     Effect::Send(ToDaemon::List),
                     Effect::Send(ToDaemon::Colors {
@@ -203,7 +243,9 @@ impl Model {
                     }),
                 ];
                 // A new connection starts unfocused in the daemon.
-                if self.focused {
+                if self.presence {
+                    effects.extend(self.presence_tick(Instant::now()));
+                } else if self.focused {
                     effects.push(Effect::Send(ToDaemon::Focus { focused: true }));
                 }
                 effects
@@ -211,6 +253,8 @@ impl Model {
             LinkEvent::Disconnected(reason) => {
                 self.connected = false;
                 self.offline = Some(reason);
+                // Nothing was sent on the next connection yet. A heartbeat left armed would come due during the outage.
+                self.report.reset();
                 // The new daemon doesn't know which session this connection was attached to. Send `Attach` anew when reattaching.
                 self.attach_sent = false;
                 // There is no way to know whether a sent `New` reached the daemon before the drop. Let the user pick again without
@@ -852,7 +896,7 @@ pub(crate) mod tests {
     /// empty, so it doesn't attach to any session on its own.
     fn connected(project: &str) -> Model {
         let mut m = Model::new(PathBuf::from(project));
-        m.on_link(LinkEvent::Connected);
+        m.on_link(LinkEvent::Connected(vec![]));
         m.on_link(LinkEvent::Msg(FromDaemon::Profiles {
             profiles: builtin(),
         }));
@@ -910,7 +954,7 @@ pub(crate) mod tests {
     #[test]
     fn first_attach_waits_for_the_pane_size() {
         let mut m = Model::new(PathBuf::from("/p"));
-        m.on_link(LinkEvent::Connected);
+        m.on_link(LinkEvent::Connected(vec![]));
         // The pane hasn't been drawn yet, so the size is unknown. It chooses the session to attach to but defers `Attach`.
         // Attaching with a wrong size would change the PTY size of the running session and garble its screen.
         assert!(listed(&mut m, vec![s("/p", "t1", SessionState::Idle)]).is_empty());
@@ -947,7 +991,7 @@ pub(crate) mod tests {
         assert!(m.set_grid(100, 30).is_empty());
         // On reconnect, it subscribes and reports colors. Once the list shows the session is still there, it reattaches
         // to it at the current size.
-        let effects = m.on_link(LinkEvent::Connected);
+        let effects = m.on_link(LinkEvent::Connected(vec![]));
         assert_eq!(effects.len(), 2);
         assert_eq!(effects[0], Effect::Send(ToDaemon::List));
         assert!(matches!(effects[1], Effect::Send(ToDaemon::Colors { .. })));
@@ -960,7 +1004,7 @@ pub(crate) mod tests {
         // With no attached session there is nothing to reattach.
         let mut m = connected("/p");
         m.on_link(LinkEvent::Disconnected("disconnected".into()));
-        assert_eq!(m.on_link(LinkEvent::Connected).len(), 2);
+        assert_eq!(m.on_link(LinkEvent::Connected(vec![])).len(), 2);
     }
 
     #[test]
@@ -981,7 +1025,7 @@ pub(crate) mod tests {
         let mut m = Model::new(PathBuf::from("/p"));
         assert!(m.set_grid(GRID.0, GRID.1).is_empty());
         assert!(m.attach("k-t1").is_empty());
-        assert_eq!(m.on_link(LinkEvent::Connected).len(), 2);
+        assert_eq!(m.on_link(LinkEvent::Connected(vec![])).len(), 2);
         assert_eq!(
             listed(&mut m, vec![s("/p", "t1", SessionState::Idle)]),
             [attach_msg("k-t1")]
@@ -1087,13 +1131,110 @@ pub(crate) mod tests {
         let mut m = Model::new(PathBuf::from("/p"));
         // With no connection there is no one to tell. The connect reports it.
         assert!(m.set_focused(true).is_empty());
-        assert!(m.on_link(LinkEvent::Connected).contains(&focus(true)));
+        assert!(
+            m.on_link(LinkEvent::Connected(vec![]))
+                .contains(&focus(true))
+        );
         assert_eq!(m.set_focused(false), [focus(false)]);
         assert_eq!(m.set_focused(true), [focus(true)]);
         assert!(m.set_focused(true).is_empty());
         // A new connection starts unfocused in the daemon, so a focused window says so again.
         m.on_link(LinkEvent::Disconnected("disconnected".into()));
-        assert!(m.on_link(LinkEvent::Connected).contains(&focus(true)));
+        assert!(
+            m.on_link(LinkEvent::Connected(vec![]))
+                .contains(&focus(true))
+        );
+    }
+
+    #[test]
+    fn presence_sent_on_activate_and_input() {
+        let presence = |effects: Vec<Effect>| -> Vec<(bool, u64, Option<String>)> {
+            effects
+                .into_iter()
+                .filter_map(|e| match e {
+                    Effect::Send(ToDaemon::Presence {
+                        visible,
+                        last_input_ms,
+                        viewing,
+                    }) => Some((visible, last_input_ms, viewing)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let t1 = || Some("k-t1".to_string());
+        let mut m = Model::new(PathBuf::from("/p"));
+        assert!(m.set_focused(true).is_empty());
+        // A daemon that announced `presence` hears `Presence` from the connect on, never `Focus`. Activating the window was input.
+        let before = mine_core::hooks::now_ms();
+        let effects = m.on_link(LinkEvent::Connected(vec!["presence".into()]));
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::Send(ToDaemon::Focus { .. }))),
+            "{effects:?}"
+        );
+        let [(true, activated, None)] = presence(effects)[..] else {
+            panic!("no Presence on connect");
+        };
+        assert!(
+            activated > 0 && activated <= before,
+            "activating counts as input"
+        );
+        // Attaching shows that session's terminal.
+        m.set_grid(GRID.0, GRID.1);
+        listed(&mut m, vec![s("/p", "t1", SessionState::Idle)]);
+        assert_eq!(
+            presence(m.presence_tick(Instant::now())),
+            [(true, activated, t1())]
+        );
+        // Deactivating and activating go out at once.
+        assert_eq!(presence(m.set_focused(false)), [(false, activated, t1())]);
+        assert_eq!(m.presence_deadline(), None);
+        let [(true, activated, _)] = presence(m.set_focused(true))[..] else {
+            panic!("no Presence on activate");
+        };
+        let sent = Instant::now();
+        // Input within 5 s of the last send waits for the next tick past it, which carries it.
+        let typed = mine_core::hooks::now_ms();
+        assert!(m.user_input(sent).is_empty());
+        assert!(m.presence_tick(sent + Duration::from_secs(1)).is_empty());
+        let [(true, input, _)] = presence(m.presence_tick(sent + Duration::from_secs(6)))[..]
+        else {
+            panic!("the input wasn't reported");
+        };
+        assert!(input >= typed && input >= activated);
+        // The launcher over the session hides its terminal.
+        m.new_task();
+        let at = sent + Duration::from_secs(7);
+        assert_eq!(presence(m.presence_tick(at)), [(true, input, None)]);
+        // While active, a heartbeat 30 s after the last send.
+        assert_eq!(
+            m.presence_deadline(),
+            Some(at + mine_core::proto::PRESENCE_HEARTBEAT)
+        );
+    }
+
+    #[test]
+    fn presence_heartbeat_stops_while_disconnected() {
+        let connect = |m: &mut Model| m.on_link(LinkEvent::Connected(vec!["presence".into()]));
+        let mut m = Model::new(PathBuf::from("/p"));
+        m.set_focused(true);
+        connect(&mut m);
+        let sent = Instant::now();
+        assert!(m.presence_deadline().is_some());
+        // A heartbeat that came due during the outage is neither due nor sent: nothing for the heartbeat task to wake for.
+        m.on_link(LinkEvent::Disconnected("disconnected".into()));
+        assert_eq!(m.presence_deadline(), None);
+        assert!(m.presence_tick(sent + Duration::from_secs(60)).is_empty());
+        // Reconnecting reports at once and arms the heartbeat again.
+        let effects = connect(&mut m);
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::Send(ToDaemon::Presence { visible: true, .. }))),
+            "{effects:?}"
+        );
+        assert!(m.presence_deadline().is_some_and(|d| d > sent));
     }
 
     #[test]
@@ -1101,7 +1242,7 @@ pub(crate) mod tests {
         let mut m = Model::new(PathBuf::from("/p/mine"));
         assert!(!m.connected);
         assert_eq!(
-            m.on_link(LinkEvent::Connected),
+            m.on_link(LinkEvent::Connected(vec![])),
             vec![
                 Effect::Send(ToDaemon::List),
                 Effect::Send(ToDaemon::Colors {
@@ -1188,7 +1329,7 @@ pub(crate) mod tests {
         assert_eq!(m.visible_groups().len(), 1);
         // On reconnect, the strip is taken away and it subscribes again.
         assert_eq!(
-            m.on_link(LinkEvent::Connected)[0],
+            m.on_link(LinkEvent::Connected(vec![]))[0],
             Effect::Send(ToDaemon::List)
         );
         assert!(m.connected);
@@ -1279,11 +1420,11 @@ pub(crate) mod tests {
         assert!(m.pending.is_none());
         assert!(m.message.as_deref().unwrap().contains("daemon"));
         // If the connection drops after sending `New`, no answer may ever come. Release the wait so you can pick again.
-        m.on_link(LinkEvent::Connected);
+        m.on_link(LinkEvent::Connected(vec![]));
         assert_eq!(m.launch(Choice::Shell).len(), 1);
         m.on_link(LinkEvent::Disconnected("disconnected".into()));
         assert!(m.pending.is_none());
-        m.on_link(LinkEvent::Connected);
+        m.on_link(LinkEvent::Connected(vec![]));
         assert_eq!(
             m.launch(Choice::Shell),
             [new_msg("/p", "t1", Kind::Shell, None)]
@@ -1435,7 +1576,7 @@ pub(crate) mod tests {
     #[test]
     fn step_session_wraps() {
         let mut m = Model::new(PathBuf::from("/p"));
-        m.on_link(LinkEvent::Connected);
+        m.on_link(LinkEvent::Connected(vec![]));
         m.set_grid(GRID.0, GRID.1);
         // For the first list received, it attaches to the first visible session (Needs approval comes first).
         assert_eq!(
@@ -1529,7 +1670,7 @@ pub(crate) mod tests {
         assert_eq!(m.message.as_deref(), Some(CLOSE_OFFLINE));
         assert!(m.closing.is_none());
         // Once it reconnects, closing works again.
-        m.on_link(LinkEvent::Connected);
+        m.on_link(LinkEvent::Connected(vec![]));
         assert_eq!(m.close(), Close::Confirm("t1".into()));
         assert_eq!(
             m.confirm_close(true),
@@ -1542,7 +1683,7 @@ pub(crate) mod tests {
         let mut m = attached_t1();
         m.on_link(LinkEvent::Disconnected("disconnected".into()));
         // `Attach` waits for the first list: the session may have ended while the daemon was down.
-        let effects = m.on_link(LinkEvent::Connected);
+        let effects = m.on_link(LinkEvent::Connected(vec![]));
         assert!(
             !effects
                 .iter()
@@ -1556,7 +1697,7 @@ pub(crate) mod tests {
         assert_eq!(m.message, None);
         // With nothing left, the launcher shows and nothing is sent.
         m.on_link(LinkEvent::Disconnected("disconnected".into()));
-        m.on_link(LinkEvent::Connected);
+        m.on_link(LinkEvent::Connected(vec![]));
         assert!(listed(&mut m, Vec::new()).is_empty());
         assert!(m.attached.is_none() && m.launcher_open());
     }
@@ -1565,7 +1706,7 @@ pub(crate) mod tests {
     fn no_session_shows_launcher() {
         let mut m = Model::new(PathBuf::from("/p"));
         assert!(m.launcher_open());
-        m.on_link(LinkEvent::Connected);
+        m.on_link(LinkEvent::Connected(vec![]));
         assert!(listed(&mut m, Vec::new()).is_empty());
         assert!(m.launcher_open() && m.attached.is_none());
         // A session that appears after the first list isn't attached to on its own.

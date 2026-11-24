@@ -35,6 +35,8 @@ pub struct Conn {
 pub struct AsyncConn {
     pub tx: mpsc::UnboundedSender<ToDaemon>,
     pub rx: mpsc::UnboundedReceiver<FromDaemon>,
+    /// The features the daemon's hello announced.
+    pub features: Vec<String>,
 }
 
 impl Conn {
@@ -151,7 +153,7 @@ pub async fn connect_or_spawn_async_with(
         .await
         .map_err(|_| no_reply())?
         .context("Couldn't read the daemon's response")?;
-    check_hello(hello, state)?;
+    let features = check_hello(hello, state)?;
     let (tx, mut outgoing) = mpsc::unbounded_channel::<ToDaemon>();
     tokio::spawn(async move {
         while let Some(msg) = outgoing.recv().await {
@@ -175,7 +177,7 @@ pub async fn connect_or_spawn_async_with(
             }
         }
     });
-    Ok(AsyncConn { tx, rx })
+    Ok(AsyncConn { tx, rx, features })
 }
 
 /// Notes, once per connection, that the daemon sent a message type this client doesn't know. The message itself is skipped. The note goes
@@ -230,10 +232,12 @@ pub fn restart_hint(state: &State) -> String {
     )
 }
 
-/// Checks that the daemon's first message is a `Hello` of the same version.
-fn check_hello(msg: Option<FromDaemon>, state: &State) -> Result<()> {
+/// Checks that the daemon's first message is a `Hello` of the same version, and returns the features it announced.
+fn check_hello(msg: Option<FromDaemon>, state: &State) -> Result<Vec<String>> {
     match msg {
-        Some(FromDaemon::Hello { version, .. }) if version == VERSION => Ok(()),
+        Some(FromDaemon::Hello {
+            version, features, ..
+        }) if version == VERSION => Ok(features),
         Some(FromDaemon::Hello { version, .. }) => {
             bail!(
                 "Daemon protocol version mismatch (daemon {version}, this command {VERSION}). {}",

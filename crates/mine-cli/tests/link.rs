@@ -99,7 +99,7 @@ fn link_reconnects_after_daemon_restart() {
     let mut link = link::start(state, PathBuf::from(env!("CARGO_BIN_EXE_mine")), Some(env));
     let deadline = Instant::now() + WAIT;
     wait_for(&mut link, deadline, "Connected", |ev| {
-        *ev == LinkEvent::Connected
+        matches!(ev, LinkEvent::Connected(_))
     });
     link.tx.unbounded_send(ToDaemon::List).unwrap();
     wait_for(&mut link, deadline, "first Sessions", sessions);
@@ -110,7 +110,7 @@ fn link_reconnects_after_daemon_restart() {
         matches!(ev, LinkEvent::Disconnected(_))
     });
     wait_for(&mut link, deadline, "Connected again", |ev| {
-        *ev == LinkEvent::Connected
+        matches!(ev, LinkEvent::Connected(_))
     });
     link.tx.unbounded_send(ToDaemon::List).unwrap();
     wait_for(&mut link, deadline, "Sessions after reconnecting", sessions);

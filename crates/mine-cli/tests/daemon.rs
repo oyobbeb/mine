@@ -746,34 +746,103 @@ fn notify_on_approval_when_unfocused() {
     assert_eq!(notify_calls(&calls).len(), 1);
 }
 
-#[test]
-fn no_notify_when_a_client_is_focused() {
+/// Sessions `a` and `b` on a daemon whose notifications land in the returned calls file (kept by the returned directory).
+fn notifying() -> (St, PathBuf, tempfile::TempDir) {
     let bin = tmp();
     let (notify, calls) = fake_notify(bin.path());
     let mut st = state();
     st.env.push(("MINE_NOTIFY", notify.into_os_string()));
     mine(&st, &["new", "a"]);
     mine(&st, &["new", "b"]);
-    let mut c = client(&st);
-    // Messages on one connection are handled in order: once List is answered, Focus has been handled too.
-    c.send(&ToDaemon::Focus { focused: true });
+    (st, calls, bin)
+}
+
+/// Waits until the daemon handled everything `c` sent: messages on one connection are handled in order, so once `List` is answered,
+/// the rest was too.
+fn sync(c: &mut Client) {
     c.send(&ToDaemon::List);
-    assert!(matches!(c.recv(), Some(FromDaemon::Sessions { .. })));
-    ask_approval(&st, "a", "Approve a?");
+    while !matches!(
+        c.recv().expect("the connection dropped"),
+        FromDaemon::Sessions { .. }
+    ) {}
+}
+
+/// `Presence` from `c`: visible or not, last input `idle_ms` ago, viewing session `name`.
+fn presence(c: &mut Client, st: &St, visible: bool, idle_ms: u64, name: &str) {
+    c.send(&ToDaemon::Presence {
+        visible,
+        last_input_ms: mine_core::hooks::now_ms() - idle_ms,
+        viewing: Some(st.id(name)),
+    });
+    sync(c);
+}
+
+/// Asks for approval in `a`, then in `b`, which no client views, and returns the notifications once `b`'s has popped.
+fn notified_for_a_then_b(st: &St, calls: &Path) -> Vec<String> {
+    ask_approval(st, "a", "Approve a?");
     assert!(
-        ls(&st)
+        ls(st)
             .iter()
             .any(|row| row[2] == "a" && row[4] == "approval")
     );
-    // Once no client is focused, the next request pops, and it is the only call: `a` never did.
-    c.send(&ToDaemon::Focus { focused: false });
-    c.send(&ToDaemon::List);
-    assert!(matches!(c.recv(), Some(FromDaemon::Sessions { .. })));
-    ask_approval(&st, "b", "Approve b?");
-    wait_until(|| !notify_calls(&calls).is_empty());
-    let got = notify_calls(&calls);
+    ask_approval(st, "b", "Approve b?");
+    wait_until(|| notify_calls(calls).iter().any(|c| c.contains("Approve b?")));
+    // `a`'s, had it popped, started first; give its thread a moment anyway.
+    std::thread::sleep(Duration::from_millis(200));
+    notify_calls(calls)
+}
+
+#[test]
+fn present_viewer_suppresses_notification() {
+    let (st, calls, _bin) = notifying();
+    let mut c = client(&st);
+    presence(&mut c, &st, true, 0, "a");
+    let got = notified_for_a_then_b(&st, &calls);
     assert_eq!(got.len(), 1, "{got:?}");
-    assert!(got[0].contains("Approve b?"), "{got:?}");
+}
+
+#[test]
+fn idle_viewer_does_not_suppress_notification() {
+    let (st, calls, _bin) = notifying();
+    let mut c = client(&st);
+    presence(&mut c, &st, true, 200_000, "a");
+    notified_for_a_then_b(&st, &calls);
+    wait_until(|| {
+        notify_calls(&calls)
+            .iter()
+            .any(|c| c.contains("Approve a?"))
+    });
+}
+
+#[test]
+fn focus_out_client_not_visible() {
+    let (st, calls, _bin) = notifying();
+    let mut c = client(&st);
+    presence(&mut c, &st, false, 0, "a");
+    notified_for_a_then_b(&st, &calls);
+    wait_until(|| {
+        notify_calls(&calls)
+            .iter()
+            .any(|c| c.contains("Approve a?"))
+    });
+}
+
+/// A v3 client never sends `Presence`: it views the session it's attached to, and `Focus` makes it visible with input now.
+/// It no longer silences other sessions' requests.
+#[test]
+fn v3_focus_still_works() {
+    let (st, calls, _bin) = notifying();
+    let mut c = connect(&st);
+    c.send(&ToDaemon::Hello { version: 3 });
+    assert!(matches!(
+        c.recv(),
+        Some(FromDaemon::Hello { version: 3, .. })
+    ));
+    c.attach("a");
+    c.send(&ToDaemon::Focus { focused: true });
+    sync(&mut c);
+    let got = notified_for_a_then_b(&st, &calls);
+    assert_eq!(got.len(), 1, "{got:?}");
 }
 
 #[test]
@@ -891,12 +960,13 @@ fn paste_with_ctrl_c_keeps_working() {
 #[test]
 fn bare_ctrl_c_outside_working_changes_nothing() {
     let (_bin, st, mut c) = working_session("claude");
+    // The attached client is present, so the finished turn counts as read.
+    presence(&mut c, &st, true, 0, "w");
     mine_stdin(
         &st,
         &["_event", &session_dir(&st, "w")],
         r#"{"hook_event_name":"Stop"}"#,
     );
-    // The attached client is looking at it, so the finished turn counts as read.
     wait_until(|| ls(&st)[0][4] == "idle");
     input_and_sync(&mut c, b"\x03");
     let events =
@@ -942,8 +1012,8 @@ fn event_cmd_fails_open() {
     assert!(daemon_pid(&st).is_none());
 }
 
-#[test]
-fn viewing_a_done_session_makes_it_idle() {
+/// Session `d`, whose turn ended unseen.
+fn done_session() -> St {
     let st = state();
     mine(&st, &["new", "d"]);
     // Looks at the hook state only after the Working state decided by shell output has gone back to Idle.
@@ -955,7 +1025,89 @@ fn viewing_a_done_session_makes_it_idle() {
     );
     assert_eq!(ls(&st)[0][..1], ["✓"]);
     assert_eq!(ls(&st)[0][4], "done");
+    st
+}
+
+#[test]
+fn seen_requires_present_viewer() {
+    let st = done_session();
     let mut c = client(&st);
+    // Visible but idle for 200 s: attaching changes nothing for a client that reports its presence.
+    presence(&mut c, &st, true, 200_000, "d");
+    c.attach("d");
+    assert_eq!(ls(&st)[0][4], "done");
+    presence(&mut c, &st, false, 0, "d");
+    assert_eq!(ls(&st)[0][4], "done");
+    // Becoming present marks it seen at once, and subscribers hear of it without asking.
+    c.send(&ToDaemon::Presence {
+        visible: true,
+        last_input_ms: mine_core::hooks::now_ms(),
+        viewing: Some(st.id("d")),
+    });
+    loop {
+        if let FromDaemon::Sessions { sessions } = c.recv().expect("the connection dropped")
+            && sessions[0].state == SessionState::Idle
+        {
+            break;
+        }
+    }
+}
+
+/// A focus report the TUI passes on to a session that turned mode 1004 on reaches the app, but isn't typing: a session waiting
+/// for approval keeps waiting, with its text.
+#[test]
+fn forwarded_focus_report_keeps_approval() {
+    let st = state();
+    mine(&st, &["new", "a"]);
+    ask_approval(&st, "a", "Approve a?");
+    let mut c = client(&st);
+    c.attach("a");
+    c.input("\x1b[I");
+    // Messages on one connection are handled in order, so the answer to this `List` comes after the `Input` was handled.
+    c.send(&ToDaemon::List);
+    let a = loop {
+        if let FromDaemon::Sessions { sessions } = c.recv().expect("the connection dropped") {
+            break sessions.into_iter().find(|s| s.meta.name == "a").unwrap();
+        }
+    };
+    assert_eq!(
+        (a.state, a.waiting.as_deref()),
+        (SessionState::Approval, Some("Approve a?"))
+    );
+}
+
+/// An old TUI never sends `Presence` or `Focus`: it counts as visible while attached, and attaching is input, so it keeps
+/// marking sessions seen. After `Focus { focused: false }` it no longer does.
+#[test]
+fn v3_client_without_focus_marks_seen_while_attached() {
+    let st = done_session();
+    let mut c = connect(&st);
+    c.send(&ToDaemon::Hello { version: 3 });
+    assert!(matches!(
+        c.recv(),
+        Some(FromDaemon::Hello { version: 3, .. })
+    ));
+    c.attach("d");
+    assert_eq!(ls(&st)[0][4], "idle");
+    c.send(&ToDaemon::Focus { focused: false });
+    sync(&mut c);
+    mine_stdin(
+        &st,
+        &["_event", &session_dir(&st, "d")],
+        r#"{"hook_event_name":"Stop"}"#,
+    );
+    assert_eq!(ls(&st)[0][4], "done");
+}
+
+#[test]
+fn viewing_a_done_session_makes_it_idle() {
+    let st = done_session();
+    let mut c = client(&st);
+    c.send(&ToDaemon::Presence {
+        visible: true,
+        last_input_ms: mine_core::hooks::now_ms(),
+        viewing: Some(st.id("d")),
+    });
     c.attach("d");
     assert_eq!(ls(&st)[0][4], "idle");
     // A turn that ended while it was being viewed counts as already read.

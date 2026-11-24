@@ -4,6 +4,7 @@
 //! and byte fields are carried as base64 strings so no newlines get mixed in.
 
 use std::io::{self, BufRead, Write};
+use std::time::{Duration, Instant};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -21,6 +22,70 @@ pub const VERSION: u32 = 4;
 pub const MIN_CLIENT_VERSION: u32 = 3;
 /// Protocol version between daemon and holder process.
 pub const HOLD_VERSION: u32 = 1;
+
+/// A client is present when it's visible and its last input was within this long (ms). Only a present client viewing a session
+/// marks it seen and keeps its approval from notifying.
+pub const PRESENT_WINDOW_MS: u64 = 180_000;
+/// A visible client sends `Presence` at least this often.
+pub const PRESENCE_HEARTBEAT: Duration = Duration::from_secs(30);
+/// Input is reported at most this often. An input in between rides on the next send.
+const PRESENCE_INPUT_EVERY: Duration = Duration::from_secs(5);
+
+/// Decides when a client sends [`ToDaemon::Presence`]. Both clients feed it their input and state and send what [`Self::due`] returns.
+#[derive(Debug, Default)]
+pub struct PresenceReport {
+    /// What was sent last (visible, viewing) and when. `None` on a new connection.
+    sent: Option<(bool, Option<String>, Instant)>,
+    /// Input arrived after the last send.
+    input: bool,
+    last_input_ms: u64,
+}
+
+impl PresenceReport {
+    /// The user typed or clicked at `now_ms` (Unix ms).
+    pub fn input(&mut self, now_ms: u64) {
+        self.last_input_ms = now_ms;
+        self.input = true;
+    }
+
+    /// A new connection: the next [`Self::due`] sends.
+    pub fn reset(&mut self) {
+        self.sent = None;
+    }
+
+    /// The `Presence` to send at `now`, if any: the first one, on a change of `visible` or `viewing`, for input at most every
+    /// 5 s, and every heartbeat while visible.
+    pub fn due(&mut self, now: Instant, visible: bool, viewing: Option<&str>) -> Option<ToDaemon> {
+        let due = match &self.sent {
+            None => true,
+            Some((was, saw, at)) => {
+                *was != visible
+                    || saw.as_deref() != viewing
+                    || (self.input && now >= *at + PRESENCE_INPUT_EVERY)
+                    || (visible && now >= *at + PRESENCE_HEARTBEAT)
+            }
+        };
+        if !due {
+            return None;
+        }
+        let viewing = viewing.map(str::to_string);
+        self.sent = Some((visible, viewing.clone(), now));
+        self.input = false;
+        Some(ToDaemon::Presence {
+            visible,
+            last_input_ms: self.last_input_ms,
+            viewing,
+        })
+    }
+
+    /// When to call [`Self::due`] again for the heartbeat. `None` while not visible.
+    pub fn deadline(&self) -> Option<Instant> {
+        match self.sent {
+            Some((true, _, at)) => Some(at + PRESENCE_HEARTBEAT),
+            _ => None,
+        }
+    }
+}
 
 /// `serde(with)` helper that serializes byte fields as base64 strings.
 mod b64 {
@@ -107,9 +172,18 @@ pub enum ToDaemon {
         fg: String,
         bg: String,
     },
-    /// Whether this client's window is the one the user is looking at. While any client is focused, the daemon shows no approval notifications.
+    /// Whether this client's window is the one the user is looking at. Kept for v3 clients: the daemon reads it as `Presence` with
+    /// `visible = focused` and input now, keeping the `viewing` it had.
     Focus {
         focused: bool,
+    },
+    /// What the user can see of this client. `visible`: its window is on screen and in front (a terminal's focus report, the app's
+    /// active window). `last_input_ms`: when the user last typed or clicked in it (Unix ms). `viewing`: the session whose terminal
+    /// it shows. Sent only to a daemon that announced `presence`, on change, on input and every [`PRESENCE_HEARTBEAT`] while visible.
+    Presence {
+        visible: bool,
+        last_input_ms: u64,
+        viewing: Option<String>,
     },
     /// Reread the profiles in `config.toml` and send the new list to every client.
     ReloadProfiles,
@@ -318,6 +392,55 @@ mod tests {
                 features: Vec::new(),
                 daemon: None
             })
+        );
+    }
+
+    #[test]
+    fn presence_report_sends_on_change_throttles_input_and_beats_while_visible() {
+        let t0 = Instant::now();
+        let s = Duration::from_secs;
+        let presence = |visible, last_input_ms, viewing: Option<&str>| {
+            Some(ToDaemon::Presence {
+                visible,
+                last_input_ms,
+                viewing: viewing.map(str::to_string),
+            })
+        };
+        let mut r = PresenceReport::default();
+        r.input(1_000);
+        assert_eq!(r.due(t0, true, None), presence(true, 1_000, None));
+        assert_eq!(r.due(t0, true, None), None);
+        // A change goes out at once.
+        assert_eq!(
+            r.due(t0 + s(1), true, Some("a")),
+            presence(true, 1_000, Some("a"))
+        );
+        // Input within 5 s of the last send waits for the next due call past it, and carries the latest input.
+        r.input(2_000);
+        assert_eq!(r.due(t0 + s(2), true, Some("a")), None);
+        r.input(3_000);
+        assert_eq!(
+            r.due(t0 + s(6), true, Some("a")),
+            presence(true, 3_000, Some("a"))
+        );
+        // Nothing new: the heartbeat is 30 s after the last send.
+        assert_eq!(r.deadline(), Some(t0 + s(36)));
+        assert_eq!(r.due(t0 + s(35), true, Some("a")), None);
+        assert_eq!(
+            r.due(t0 + s(36), true, Some("a")),
+            presence(true, 3_000, Some("a"))
+        );
+        // No heartbeat while not visible, and a new connection sends again.
+        assert_eq!(
+            r.due(t0 + s(37), false, Some("a")),
+            presence(false, 3_000, Some("a"))
+        );
+        assert_eq!(r.deadline(), None);
+        assert_eq!(r.due(t0 + s(100), false, Some("a")), None);
+        r.reset();
+        assert_eq!(
+            r.due(t0 + s(101), false, Some("a")),
+            presence(false, 3_000, Some("a"))
         );
     }
 

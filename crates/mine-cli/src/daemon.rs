@@ -9,8 +9,10 @@
 //!   mistaking a notification about another event for the answer to its own request.
 //! - When a client reports the outer terminal's default colors with `Colors`, every session screen (including screens attached later)
 //!   answers the inner app's color queries with those colors.
-//! - A client reports with `Focus` whether its window is the one the user is looking at. When a session newly needs approval and
-//!   no client is focused, the daemon shows a macOS notification (`MINE_NOTIFY`, default `osascript`).
+//! - A client reports with `Presence` whether the user can see it, when they last typed or clicked in it, and which session's
+//!   terminal it shows (a v3 client's `Focus` stands in). A client is present when it's visible and its input is within
+//!   `PRESENT_WINDOW_MS`. Only a present client viewing a session marks it seen (Done → Idle), and when a session newly needs
+//!   approval with no present client viewing it, the daemon shows a macOS notification (`MINE_NOTIFY`, default `osascript`).
 //! - Any client from `MIN_CLIENT_VERSION` up is served, and gets only what its version knows: the profile list goes to v4+ clients
 //!   only, right after `Hello` and again to all of them after `ReloadProfiles`. A message type the daemon doesn't know is ignored.
 //! - When the daemon starts again, it scans `sessions/*/meta.json`, reattaches to the holder processes that are alive, and rebuilds
@@ -43,8 +45,8 @@ use mine_core::paths::{State, check_sock_path, ensure_dir};
 use mine_core::profiles::{self, ProfileInfo, ProfileKind, Profiles};
 use mine_core::project::{self, project_key};
 use mine_core::proto::{
-    DaemonInfo, FromDaemon, HOLD_VERSION, HoldIn, HoldOut, MIN_CLIENT_VERSION, ToDaemon, VERSION,
-    recv, send,
+    DaemonInfo, FromDaemon, HOLD_VERSION, HoldIn, HoldOut, MIN_CLIENT_VERSION, PRESENT_WINDOW_MS,
+    ToDaemon, VERSION, recv, send,
 };
 use mine_core::screen::Screen;
 use mine_core::session::{
@@ -86,7 +88,7 @@ const HOLD_READ_BUF: usize = 64 * 1024;
 // To cut it further, count the queue in bytes.
 const BATCH_MAX: usize = 16 * 1024;
 /// The features this daemon announces in its hello reply. Clients gate new behavior on these names, not on the version alone.
-const FEATURES: &[&str] = &["profiles"];
+const FEATURES: &[&str] = &["profiles", "presence"];
 /// The first client version that knows `FromDaemon::Profiles`.
 const PROFILES_SINCE: u32 = 4;
 
@@ -170,12 +172,38 @@ struct Client {
     attached: Option<String>,
     /// The size this client last reported (design 5.1: the session size follows the client that typed last).
     size: Option<(u16, u16)>,
-    /// Reported with `Focus`: this client's window is the one the user is looking at. It goes away with the client.
-    focused: bool,
+    /// From `Presence` or `Focus`: the user can see this client. `None` until it says either: an old TUI never does, and counts as
+    /// visible while attached (spec 11, ruling P-R3). It views a session only while attached, so `None` reads as visible.
+    visible: Option<bool>,
+    /// From `Presence`: when the user last typed or clicked in this client (Unix ms).
+    last_input_ms: u64,
+    /// From `Presence`: the session whose terminal this client shows.
+    viewing: Option<String>,
+    /// Sent `Presence` at least once. Until then (a v3 client) it views the session it's attached to, and its `Focus`, `Input`
+    /// and `Attach` count as input (ruling P-R3).
+    reports: bool,
     /// The protocol version from the client's `Hello` (0 until then). Decides which messages it gets.
     version: u32,
     /// An unknown message type from this client was logged already.
     noted_unknown: bool,
+}
+
+impl Client {
+    fn viewing(&self) -> Option<&str> {
+        match self.reports {
+            true => self.viewing.as_deref(),
+            false => self.attached.as_deref(),
+        }
+    }
+
+    fn visible(&self) -> bool {
+        self.visible.unwrap_or(true)
+    }
+
+    /// Visible, and typed or clicked within `PRESENT_WINDOW_MS` of `now_ms`.
+    fn present(&self, now_ms: u64) -> bool {
+        self.visible() && now_ms.saturating_sub(self.last_input_ms) <= PRESENT_WINDOW_MS
+    }
 }
 
 /// A just-attached holder process connection. It has read through `Hello` and the output buffer.
@@ -433,10 +461,19 @@ async fn handle(shared: &Shared, client: u64, msg: ToDaemon) -> bool {
         }
         ToDaemon::Colors { fg, bg } => shared.lock().await.set_colors(&fg, &bg),
         ToDaemon::Focus { focused } => {
-            if let Some(c) = shared.lock().await.clients.get_mut(&client) {
-                c.focused = focused;
-            }
+            shared
+                .lock()
+                .await
+                .presence(client, focused, now_ms(), None)
         }
+        ToDaemon::Presence {
+            visible,
+            last_input_ms,
+            viewing,
+        } => shared
+            .lock()
+            .await
+            .presence(client, visible, last_input_ms, Some(viewing)),
     }
     shared.lock().await.clients.contains_key(&client)
 }
@@ -1101,7 +1138,10 @@ impl Daemon {
                 subscribed: false,
                 attached: None,
                 size: None,
-                focused: false,
+                visible: None,
+                last_input_ms: 0,
+                viewing: None,
+                reports: false,
                 version: 0,
                 noted_unknown: false,
             },
@@ -1197,10 +1237,42 @@ impl Daemon {
         }
     }
 
-    fn viewed_by_someone(&self, id: &str) -> bool {
+    /// The clients showing the session's terminal on a visible screen, typing or not. Spec 9's viewing rule for holding an approval
+    /// is `visible_viewers(id).next().is_some()`; seen and notifications also want recent input ([`Daemon::watched`]).
+    fn visible_viewers<'a>(&'a self, id: &'a str) -> impl Iterator<Item = &'a Client> {
         self.clients
             .values()
-            .any(|c| c.attached.as_deref() == Some(id))
+            .filter(move |c| c.visible() && c.viewing() == Some(id))
+    }
+
+    /// A present client views the session: it counts as seen, and its approval needs no notification.
+    fn watched(&self, id: &str) -> bool {
+        let now = now_ms();
+        self.visible_viewers(id).any(|c| c.present(now))
+    }
+
+    /// `Presence`, or a v3 client's `Focus` (`viewing: None` keeps what it had). The session it now views is refreshed, so one the
+    /// user came back to is marked seen at once.
+    fn presence(
+        &mut self,
+        client: u64,
+        visible: bool,
+        last_input_ms: u64,
+        viewing: Option<Option<String>>,
+    ) {
+        let Some(c) = self.clients.get_mut(&client) else {
+            return;
+        };
+        c.visible = Some(visible);
+        c.last_input_ms = last_input_ms;
+        if let Some(viewing) = viewing {
+            c.viewing = viewing;
+            c.reports = true;
+        }
+        if let Some(id) = c.viewing().map(str::to_string) {
+            self.refresh(&id);
+            self.publish();
+        }
     }
 
     /// Project path, list sorted by name.
@@ -1238,16 +1310,15 @@ impl Daemon {
         self.send(client, FromDaemon::Sessions { sessions });
     }
 
-    /// Rereads the event log and computes the state. If someone is viewing it, records it as seen now.
+    /// Rereads the event log and computes the state. If a present client views it, records it as seen now.
     /// Only events after the creation time are looked at, so a session recreated with the same id doesn't inherit the previous session's events.
     fn refresh(&mut self, id: &str) {
-        let viewed = self.viewed_by_someone(id);
-        let focused = self.clients.values().any(|c| c.focused);
+        let watched = self.watched(id);
         let dir = self.state.session_dir(id);
         let Some(s) = self.sessions.get_mut(id) else {
             return;
         };
-        if viewed {
+        if watched {
             let now = now_ms();
             s.viewed_ms = Some(now);
             if let Err(e) = fs::write(dir.join(VIEWED_FILE), now.to_string()) {
@@ -1268,7 +1339,7 @@ impl Daemon {
         if s.active.is_some() && state == SessionState::Idle {
             state = SessionState::Working;
         }
-        // Only the step into Needs approval pops a notification, and only while the user isn't looking at a mine window.
+        // Only the step into Needs approval pops a notification, and only while no present client views the session.
         let asking = state == SessionState::Approval;
         let new_request = asking && !s.asking;
         s.asking = asking;
@@ -1278,7 +1349,7 @@ impl Daemon {
         } else {
             (SessionState::Ended, None)
         };
-        if new_request && !focused && s.state == SessionState::Approval {
+        if new_request && !watched && s.state == SessionState::Approval {
             notify(&s.meta, s.waiting.as_deref());
         }
     }
@@ -1346,6 +1417,9 @@ impl Daemon {
         if let Some(c) = self.clients.get_mut(&client) {
             c.attached = Some(id.to_string());
             c.size = Some(size);
+            if !c.reports {
+                c.last_input_ms = now_ms();
+            }
         }
         self.send(
             client,
@@ -1361,11 +1435,21 @@ impl Daemon {
     /// `Input`: sends it to the holder process. If it was waiting for approval, records an `Input` event. If a claude or codex session
     /// was Working and the input is exactly one ⌃C or one Esc, records an `Interrupt`: neither CLI fires a `Stop` for that, so the
     /// session would stay Working forever. An arrow key (`\x1b[A`) or a paste that contains a ⌃C is longer than one byte and is no interrupt.
+    ///
+    /// A focus report (exactly `\x1b[I` or `\x1b[O`), which the TUI passes on to a session that turned mode 1004 on, isn't typing:
+    /// it reaches the app, but records no event, takes no size and isn't input. Typed keys never arrive as these bytes: the TUI
+    /// parses them as its own focus reports, and no key encoding produces them.
     fn input(&mut self, client: u64, id: &str, data: Vec<u8>) {
-        let Some(c) = self.clients.get(&client) else {
+        let typed = !matches!(data.as_slice(), b"\x1b[I" | b"\x1b[O");
+        let Some(c) = self.clients.get_mut(&client) else {
             return;
         };
-        let size = c.size.filter(|_| c.attached.as_deref() == Some(id));
+        if typed && !c.reports {
+            c.last_input_ms = now_ms();
+        }
+        let size = c
+            .size
+            .filter(|_| typed && c.attached.as_deref() == Some(id));
         let dir = self.state.session_dir(id);
         let Some(s) = self.sessions.get_mut(id) else {
             return;
@@ -1379,6 +1463,7 @@ impl Daemon {
         let bare_interrupt = matches!(data.as_slice(), [0x03] | [0x1b]);
         s.send_hold(HoldIn::Input { data });
         let kind = match s.state {
+            _ if !typed => return,
             SessionState::Approval => EventKind::Input,
             SessionState::Working if bare_interrupt && s.meta.kind != Kind::Shell => {
                 EventKind::Interrupt
