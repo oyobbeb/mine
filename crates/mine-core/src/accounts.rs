@@ -10,12 +10,6 @@ use std::path::Path;
 
 use serde::Deserialize;
 
-/// The part before `@` in `.claude.json`'s `oauthAccount.emailAddress`. `None` if there is no account info or no email.
-pub fn auto_label(claude_json: &serde_json::Value) -> Option<String> {
-    let claude = ClaudeJson::deserialize(claude_json).ok()?;
-    identity(claude).map(|identity| identity.local)
-}
-
 /// The part read from `.claude.json`. Fields other than the email are neither read nor remembered.
 #[derive(Deserialize)]
 struct ClaudeJson {
@@ -119,6 +113,11 @@ mod tests {
     use super::*;
     use crate::paths::State;
     use crate::profiles::Profiles;
+
+    /// The auto name `.claude.json` content `v` gives: the part before `@` of `oauthAccount.emailAddress`.
+    fn auto_label(v: &serde_json::Value) -> Option<String> {
+        identity(ClaudeJson::deserialize(v).ok()?).map(|identity| identity.local)
+    }
 
     #[test]
     fn auto_label_takes_email_local_part() {
