@@ -43,11 +43,7 @@ cargo install --path crates/mine-cli
 
 `~/.cargo/bin`이 `PATH`에 있어야 해요(`command -v mine`으로 확인).
 
-데스크톱 앱은 개발 중이에요. 써 보려면:
-
-```sh
-cargo run --release -p mine-app
-```
+데스크톱 앱은 따로 빌드해요. [데스크톱 앱](#데스크톱-앱)을 보세요.
 
 ## 빠른 시작
 
@@ -60,6 +56,45 @@ mine ls         # 세션 목록
 ```
 
 터미널 UI에서는 접두 키 `⌃a`(Control+a)를 눌렀다 뗀 다음 명령 키를 눌러요. `⌃a d`는 화면에서 나가요. 화면만 닫히고 세션은 모두 계속 돌아요. `mine`을 다시 실행하면 돌아와요.
+
+## 데스크톱 앱
+
+데스크톱 앱은 터미널 UI와 같은 세션을 창으로 보여 줘요. 같은 데몬에 붙고, 데몬이 없으면 띄워요.
+
+### 빌드
+
+```sh
+scripts/bundle-app.sh                  # ~/Applications/mine.app을 만들어요
+scripts/bundle-app.sh --dest ./out     # 또는 ./out/mine.app을 만들어요
+```
+
+스크립트는 릴리스 빌드를 하고 `mine-app`과 `mine`을 `mine.app/Contents/MacOS`에 넣어요. 그래서 앱은 옆에 있는 `mine`으로 데몬을 띄워요. 묶음에는 아이콘이 없고 서명도 하지 않아요. 묶음 없이 쓰려면 `cargo install --path crates/mine-app`으로 `mine-app` 실행 파일만 설치해요.
+
+### 실행
+
+```sh
+mine app
+```
+
+`mine app`은 `~/Applications/mine.app`을 먼저, 없으면 `/Applications/mine.app`을 열어요. 둘 다 없으면 `mine` 옆이나 `PATH`에 있는 `mine-app`을 띄워요. Finder나 Spotlight에서 묶음을 열어도 돼요. 프로젝트 폴더에서 실행 파일로 띄우면 그 프로젝트를 열고, Dock이나 Finder에서 띄우면 홈 폴더를 써요.
+
+창을 닫아도 앱은 Dock에 남고, Dock 아이콘을 누르면 창이 돌아와요. ⌘Q는 앱만 끝내고, 데몬과 세션은 계속 돌아요.
+
+### 단축키
+
+터미널 칸에 포커스가 있으면 ⌘ 없는 키는 모두 세션으로 가요.
+
+| 키 | 동작 |
+|---|---|
+| ⌘N | 새 작업(시작 화면) |
+| ⌘W | 세션 닫기(먼저 물어봐요) |
+| ⌘1–⌘9 | 탭 고르기 |
+| ⌘[ / ⌘] | 이전 / 다음 세션 |
+| ⌘⇧[ / ⌘⇧] | 이전 / 다음 프로젝트 |
+| ⌘B | 작업 목록 접기 / 펴기 |
+| ⌘C / ⌘V | 복사 / 붙여넣기 |
+| ⌘F | 스크롤백에서 찾기(Enter 다음, ⇧Enter 이전, Esc 닫기) |
+| ⌘Q | 앱 끝내기 |
 
 ## 사용법
 
@@ -183,6 +218,8 @@ cargo install --path crates/mine-cli
 kill "$(cat ~/.mine/daemon.pid)"
 mine
 ```
+
+이름이 `mine`이던 예전 패키지로 설치한 빌드가 있다면, 처음 다시 설치할 때는 `cargo install --path crates/mine-cli --force`가 필요해요(패키지 이름이 이제 `mine-cli`예요).
 
 ## 동작 방식
 

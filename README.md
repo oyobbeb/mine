@@ -43,11 +43,7 @@ cargo install --path crates/mine-cli
 
 Make sure `~/.cargo/bin` is on your `PATH` (`command -v mine`).
 
-The desktop app is in development. To try it:
-
-```sh
-cargo run --release -p mine-app
-```
+The desktop app is built separately. See [Desktop app](#desktop-app).
 
 ## Quick start
 
@@ -60,6 +56,45 @@ mine ls         # list sessions
 ```
 
 Inside the terminal UI, press the prefix `⌃a` (Control+a), release it, then press a command key. `⌃a d` detaches: the UI closes and every session keeps running. Run `mine` again to get back.
+
+## Desktop app
+
+The desktop app shows the same sessions as the terminal UI in a window. It attaches to the same daemon and starts it if needed.
+
+### Build
+
+```sh
+scripts/bundle-app.sh                  # builds ~/Applications/mine.app
+scripts/bundle-app.sh --dest ./out     # or builds ./out/mine.app
+```
+
+The script makes a release build and puts `mine-app` and `mine` in `mine.app/Contents/MacOS`, so the app starts the daemon with the `mine` next to it. The bundle has no icon and isn't signed. To skip the bundle, `cargo install --path crates/mine-app` installs just the `mine-app` binary.
+
+### Run
+
+```sh
+mine app
+```
+
+`mine app` opens `~/Applications/mine.app`, then `/Applications/mine.app`. If neither exists, it starts a `mine-app` next to `mine` or on your `PATH`. You can also open the bundle from Finder or Spotlight. Started as a binary from a project folder, the app opens that project; started from the Dock or Finder, it uses your home folder.
+
+Closing the window keeps the app in the Dock, and clicking the Dock icon brings the window back. ⌘Q quits only the app; the daemon and your sessions keep running.
+
+### Shortcuts
+
+When the terminal pane has focus, every key without ⌘ goes to the session.
+
+| Key | Action |
+|---|---|
+| ⌘N | New task (launcher) |
+| ⌘W | Close the session (asks first) |
+| ⌘1–⌘9 | Select a tab |
+| ⌘[ / ⌘] | Previous / next session |
+| ⌘⇧[ / ⌘⇧] | Previous / next project |
+| ⌘B | Collapse / expand the task list |
+| ⌘C / ⌘V | Copy / paste |
+| ⌘F | Find in the scrollback (Enter next, ⇧Enter previous, Esc close) |
+| ⌘Q | Quit the app |
 
 ## Usage
 
@@ -183,6 +218,8 @@ cargo install --path crates/mine-cli
 kill "$(cat ~/.mine/daemon.pid)"
 mine
 ```
+
+If you installed an earlier build whose package was named `mine`, the first reinstall needs `cargo install --path crates/mine-cli --force` (the package is now `mine-cli`).
 
 ## How it works
 

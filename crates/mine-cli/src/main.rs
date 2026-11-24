@@ -1,4 +1,6 @@
-use std::path::PathBuf;
+use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -48,6 +50,8 @@ enum Cmd {
         /// Session name.
         name: String,
     },
+    /// Open the desktop app: the installed mine.app, else a `mine-app` next to `mine` or on PATH.
+    App,
     /// Holder process that owns a session's PTY. The daemon starts it.
     #[command(hide = true)]
     Hold {
@@ -160,6 +164,7 @@ fn main() -> Result<()> {
             let _ = paths::State::from_env()
                 .and_then(|state| hooks::run_event_cmd(&state, &dir, std::io::stdin().lock()));
         }
+        Some(Cmd::App) => run_app()?,
         Some(Cmd::Projects) => {
             let state = paths::State::from_env()?;
             for p in project::registered(&state)? {
@@ -208,4 +213,132 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The desktop app's executable, inside `mine.app/Contents/MacOS` and when installed with cargo.
+const APP_BIN: &str = "mine-app";
+
+/// How `mine app` starts the desktop app.
+#[derive(Debug, PartialEq)]
+enum AppLaunch {
+    /// The `.app` bundle, started with `open`.
+    Open(PathBuf),
+    /// The `mine-app` binary, started detached.
+    Exec(PathBuf),
+    Missing,
+}
+
+/// Picks how to start the desktop app: the first existing bundle, then `mine-app` next to this executable, then the
+/// `mine-app` found on PATH (`path_lookup`, already resolved by the caller).
+fn app_launch(
+    bundles: &[PathBuf],
+    exe_dir: Option<&Path>,
+    path_lookup: Option<PathBuf>,
+) -> AppLaunch {
+    if let Some(bundle) = bundles.iter().find(|b| b.is_dir()) {
+        return AppLaunch::Open(bundle.clone());
+    }
+    exe_dir
+        .map(|dir| dir.join(APP_BIN))
+        .filter(|bin| bin.is_file())
+        .or(path_lookup)
+        .map_or(AppLaunch::Missing, AppLaunch::Exec)
+}
+
+/// Starts the desktop app and returns right away.
+fn run_app() -> Result<()> {
+    let bundles: Vec<PathBuf> = std::env::home_dir()
+        .into_iter()
+        .map(|home| home.join("Applications/mine.app"))
+        .chain([PathBuf::from("/Applications/mine.app")])
+        .collect();
+    // Look next to the real file, not next to a symlink to it.
+    let exe_dir = std::env::current_exe()
+        .and_then(|exe| exe.canonicalize())
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf));
+    let on_path = std::env::var_os("PATH").and_then(|path| {
+        std::env::split_paths(&path)
+            .map(|dir| dir.join(APP_BIN))
+            .find(|bin| bin.is_file())
+    });
+    match app_launch(&bundles, exe_dir.as_deref(), on_path) {
+        AppLaunch::Open(app) => {
+            let status = Command::new("open")
+                .arg(&app)
+                .status()
+                .context("Couldn't run open")?;
+            if !status.success() {
+                bail!("Couldn't open {}: {status}", app.display());
+            }
+        }
+        AppLaunch::Exec(bin) => {
+            let mut cmd = Command::new(&bin);
+            cmd.stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            // SAFETY: after fork and before exec, only setsid, which is async-signal-safe, is called.
+            unsafe {
+                cmd.pre_exec(|| match libc::setsid() {
+                    -1 => Err(std::io::Error::last_os_error()),
+                    _ => Ok(()),
+                });
+            }
+            // Not waited on: the app outlives this command and launchd adopts it.
+            cmd.spawn()
+                .with_context(|| format!("Couldn't start {}", bin.display()))?;
+        }
+        AppLaunch::Missing => {
+            eprintln!(
+                "Couldn't find mine-app. Build it with scripts/bundle-app.sh or run cargo install --path crates/mine-app"
+            );
+            std::process::exit(1);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn app_launch_prefers_bundle_then_sibling_then_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let bundles = [
+            root.join("home/Applications/mine.app"),
+            root.join("Applications/mine.app"),
+        ];
+        let exe_dir = root.join("bin");
+        let sibling = exe_dir.join("mine-app");
+        let on_path = root.join("path/mine-app");
+        let launch = |path| app_launch(&bundles, Some(&exe_dir), path);
+
+        // Nothing exists.
+        assert_eq!(launch(None), AppLaunch::Missing);
+        assert_eq!(app_launch(&bundles, None, None), AppLaunch::Missing);
+        // Only on PATH.
+        assert_eq!(
+            launch(Some(on_path.clone())),
+            AppLaunch::Exec(on_path.clone())
+        );
+        // Next to this executable beats PATH.
+        fs::create_dir_all(&exe_dir).unwrap();
+        fs::write(&sibling, "").unwrap();
+        assert_eq!(
+            launch(Some(on_path.clone())),
+            AppLaunch::Exec(sibling.clone())
+        );
+        assert_eq!(app_launch(&bundles, None, None), AppLaunch::Missing);
+        // Any bundle beats the sibling, and the earlier bundle wins.
+        fs::create_dir_all(&bundles[1]).unwrap();
+        assert_eq!(
+            launch(Some(on_path.clone())),
+            AppLaunch::Open(bundles[1].clone())
+        );
+        fs::create_dir_all(&bundles[0]).unwrap();
+        assert_eq!(launch(Some(on_path)), AppLaunch::Open(bundles[0].clone()));
+    }
 }
