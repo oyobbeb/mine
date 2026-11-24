@@ -191,9 +191,13 @@ fn read_doc(state: &State) -> Result<DocumentMut> {
     })
 }
 
+/// Writes `config.toml` atomically. A symlinked one (a dotfiles setup) is written at its target, so the link stays a link.
+// ponytail: a dangling link can't be resolved and is replaced by a file; nothing is lost but the link.
 fn write_doc(state: &State, doc: &DocumentMut) -> Result<()> {
     ensure_dir(&state.root).with_context(|| format!("Couldn't create {}", state.root.display()))?;
-    write_atomic(&config_path(state), doc.to_string().as_bytes())
+    let path = config_path(state);
+    let target = std::fs::canonicalize(&path).unwrap_or(path);
+    write_atomic(&target, doc.to_string().as_bytes())
 }
 
 /// The `[profiles]` table of `doc`. When the list in use is the built-in one (no table, an empty one, or one with no usable

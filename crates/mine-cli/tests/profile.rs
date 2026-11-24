@@ -498,3 +498,22 @@ fn profile_add_refuses_a_broken_entry_with_a_builtin_id() {
         assert_eq!(env.config(), before);
     }
 }
+
+#[test]
+fn profile_add_writes_through_a_symlinked_config() {
+    // A dotfiles setup: config.toml links to the real file. The link stays a link, and the real file gets the change.
+    let env = Env::new();
+    let dotfiles = env.home.join("dotfiles");
+    let real = dotfiles.join("mine.toml");
+    fs::create_dir(&dotfiles).unwrap();
+    fs::write(&real, "# mine\n").unwrap();
+    std::os::unix::fs::symlink(&real, env.config_path()).unwrap();
+    env.ok(&["add", "team", "--kind", "claude"]);
+    let link = fs::symlink_metadata(env.config_path()).unwrap();
+    assert!(link.file_type().is_symlink());
+    let text = fs::read_to_string(&real).unwrap();
+    assert!(text.contains("# mine\n"), "{text}");
+    assert!(text.contains("[profiles.team]"), "{text}");
+    // The temp file was renamed into place, beside the target.
+    assert_eq!(fs::read_dir(&dotfiles).unwrap().count(), 1);
+}
