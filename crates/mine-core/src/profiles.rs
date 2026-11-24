@@ -5,7 +5,8 @@
 //! Old `[accounts.<id>] label` entries still apply to profiles that have no label of their own.
 //!
 //! A config that is broken or half-written never strands the user: they get the built-in list and a warning. Warnings give the
-//! line number and the reason (or the profile id and the key name), and never quote the file's values.
+//! line number and the reason (or the profile id and the key name), and never quote the file's values. That list only shows: no
+//! session or login starts on it ([`Profiles::usable`]), since the config may have moved a built-in id to another home.
 //!
 //! Credentials are never read. Whether a profile is logged in is decided by existence only: `oauthAccount` in a Claude
 //! `.claude.json`, or the existence of Codex's `auth.json`, which is checked and never opened.
@@ -179,6 +180,9 @@ pub struct Profiles {
     /// `list` is the built-in list, not the config's: there is no `[profiles]` table, or it is empty or has no usable profile, or the
     /// file couldn't be read. `mine profile add` and `rm` write the built-ins out before they change anything, so they don't disappear.
     pub builtin: bool,
+    /// Why the config couldn't be used, when `list` stands in for it (`builtin` is then set). The line and the reason, never a value.
+    /// `None` when there is simply no `[profiles]` table.
+    pub broken: Option<String>,
 }
 
 impl Profiles {
@@ -189,14 +193,10 @@ impl Profiles {
             Ok(text) => Profiles::parse(Some(&text), state),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Profiles::parse(None, state),
             Err(e) => {
-                let (profiles, mut warnings) = Profiles::parse(None, state);
-                warnings.insert(
-                    0,
-                    format!(
-                        "config.toml can't be read ({}); using the built-in profiles",
-                        e.kind()
-                    ),
-                );
+                let (mut profiles, mut warnings) = Profiles::parse(None, state);
+                let why = format!("config.toml can't be read ({})", e.kind());
+                warnings.insert(0, format!("{why}; using the built-in profiles"));
+                profiles.broken = Some(why);
                 (profiles, warnings)
             }
         }
@@ -206,6 +206,7 @@ impl Profiles {
     /// `claude-b` exists.
     pub fn parse(text: Option<&str>, state: &State) -> (Profiles, Vec<String>) {
         let mut warnings = Vec::new();
+        let mut broken = None;
         let table = match text.map(str::parse::<toml::Table>) {
             None => toml::Table::new(),
             Some(Ok(table)) => table,
@@ -217,17 +218,8 @@ impl Profiles {
                         .filter(|&&b| b == b'\n')
                         .count()
                 });
-                warnings.push(format!(
-                    "config.toml line {line}: {}; using the built-in profiles",
-                    e.message()
-                ));
-                return (
-                    Profiles {
-                        list: builtin(state),
-                        builtin: true,
-                    },
-                    warnings,
-                );
+                broken = Some(format!("config.toml line {line}: {}", e.message()));
+                toml::Table::new()
             }
         };
         let (mut list, is_builtin) = match table.get("profiles") {
@@ -263,22 +255,20 @@ impl Profiles {
                     list.push(profile);
                 }
                 if list.is_empty() {
-                    warnings.push(
-                        "[profiles] has no usable profile; using the built-in profiles".into(),
-                    );
+                    broken = Some("[profiles] has no usable profile".into());
                     (builtin(state), true)
                 } else {
                     (list, false)
                 }
             }
             Some(_) => {
-                warnings.push(
-                    "profiles must be a table ([profiles.<id>]); using the built-in profiles"
-                        .into(),
-                );
+                broken = Some("profiles must be a table ([profiles.<id>])".into());
                 (builtin(state), true)
             }
         };
+        if let Some(why) = &broken {
+            warnings.push(format!("{why}; using the built-in profiles"));
+        }
         // Old `[accounts.<id>] label` entries fill in the profiles that have no label of their own.
         let aliases = accounts::aliases(&table);
         for profile in list.iter_mut().filter(|p| p.label.is_none()) {
@@ -288,6 +278,7 @@ impl Profiles {
             Profiles {
                 list,
                 builtin: is_builtin,
+                broken,
             },
             warnings,
         )
@@ -295,6 +286,16 @@ impl Profiles {
 
     pub fn get(&self, id: &str) -> Option<&Profile> {
         self.list.iter().find(|p| p.id == id)
+    }
+
+    /// The profile `id`, to start a session or a login on. While the config is `broken` every id is refused: the built-in list may
+    /// put an id the config moved back on its built-in home, which is another login.
+    pub fn usable(&self, id: &str) -> anyhow::Result<&Profile> {
+        if let Some(why) = &self.broken {
+            anyhow::bail!("Can't use profile {id}: {why}. Fix config.toml first");
+        }
+        self.get(id)
+            .ok_or_else(|| anyhow::anyhow!("Unknown profile: {id}"))
     }
 
     /// The default of `kind`: the profile marked `default = true`, else the one at the CLI's default home, else the first of that kind.
@@ -890,6 +891,47 @@ mod tests {
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         fs::remove_dir(env.state.root.join("config.toml")).unwrap();
         assert!(env.load().1.is_empty());
+    }
+
+    #[test]
+    fn broken_config_starts_no_profile() {
+        let env = Env::new();
+        // The built-in claude-b home exists, but the config moved claude-b elsewhere: a broken config must not start it there.
+        fs::create_dir_all(env.managed("claude-b")).unwrap();
+        for (text, why) in [
+            (
+                "[profiles.claude-b]\nkind = \"claude\"\nhome = \"~/work\n",
+                "line 3",
+            ),
+            ("profiles = 5\n", "must be a table"),
+            ("[profiles]\n", "no usable profile"),
+            (
+                "[profiles.claude-b]\nkind = \"claude\"\nhome = \"work\"\n",
+                "no usable profile",
+            ),
+        ] {
+            env.config(text);
+            let p = env.profiles();
+            assert_eq!(ids(&p), ["claude-a", "claude-b", "codex"], "{text:?}");
+            for id in ["claude-a", "claude-b", "codex"] {
+                let e = p.usable(id).unwrap_err().to_string();
+                assert!(e.contains("config.toml") && e.contains(why), "{e}");
+                assert!(!e.contains("work"), "the error quotes the file: {e}");
+            }
+        }
+        fs::remove_file(env.state.root.join("config.toml")).unwrap();
+        fs::create_dir(env.state.root.join("config.toml")).unwrap();
+        assert!(env.profiles().usable("claude-a").is_err());
+        fs::remove_dir(env.state.root.join("config.toml")).unwrap();
+        // No file, a config without `[profiles]`, and a usable one start their profiles; an id that isn't there is unknown.
+        assert!(env.profiles().usable("claude-b").is_ok());
+        env.config("[accounts.claude-b]\nlabel = \"Work\"\n");
+        assert!(env.profiles().usable("claude-b").is_ok());
+        env.config("[profiles.w]\nkind = \"claude\"\n");
+        let p = env.profiles();
+        assert_eq!(p.usable("w").unwrap().id, "w");
+        let e = p.usable("claude-b").unwrap_err().to_string();
+        assert_eq!(e, "Unknown profile: claude-b");
     }
 
     #[test]

@@ -282,7 +282,7 @@ pub async fn run(state: State) -> Result<()> {
     fs::set_permissions(&sock, fs::Permissions::from_mode(0o600))?;
     let exe = std::env::current_exe().context("Couldn't determine the executable path")?;
     let user_home = std::env::home_dir().context("Couldn't determine the home directory")?;
-    let (profiles, profile_infos) = load_profiles(&state, &user_home);
+    let (profiles, profile_infos) = with_infos(Profiles::load(&state), &state, &user_home);
     let shared: Shared = Arc::new(Mutex::new(Daemon {
         state,
         exe,
@@ -393,9 +393,12 @@ async fn restore(shared: &Shared) {
     shared.lock().await.publish();
 }
 
-/// Reads the profiles and what clients show for them. Warnings go to `daemon.log`; they give a line and a reason, never a value.
-fn load_profiles(state: &State, user_home: &Path) -> (Profiles, Vec<ProfileInfo>) {
-    let (profiles, warnings) = Profiles::load(state);
+/// Loaded profiles (`Profiles::load`) and what clients show for them. Warnings go to `daemon.log`; they give a line and a reason, never a value.
+fn with_infos(
+    (profiles, warnings): (Profiles, Vec<String>),
+    state: &State,
+    user_home: &Path,
+) -> (Profiles, Vec<ProfileInfo>) {
     for warning in warnings {
         eprintln!("Warning: {warning}");
     }
@@ -593,11 +596,6 @@ async fn create(shared: &Shared, spec: NewSession) -> Result<()> {
                 spec.name
             );
         }
-        // Before anything is written, so a wrong profile leaves no session directory behind.
-        session::profile(spec.kind, spec.account.as_deref(), &d.profiles)?;
-        if d.sessions.contains_key(&id) || !d.starting.insert(id.clone()) {
-            bail!("A session with the same name already exists: {}", spec.name);
-        }
         // No profile means the default of the kind. Its id is stored now, so the session keeps that login if the default moves.
         let default = match spec.kind {
             Kind::Claude => d.profiles.default_of(ProfileKind::Claude),
@@ -605,6 +603,11 @@ async fn create(shared: &Shared, spec: NewSession) -> Result<()> {
             Kind::Shell => None,
         };
         let account = spec.account.or(default.map(|p| p.id.clone()));
+        // Before anything is written, so a wrong profile (or a broken config) leaves no session directory behind.
+        session::profile(spec.kind, account.as_deref(), &d.profiles)?;
+        if d.sessions.contains_key(&id) || !d.starting.insert(id.clone()) {
+            bail!("A session with the same name already exists: {}", spec.name);
+        }
         (d.start(), account)
     };
     let restore = match spec.kind {
@@ -1295,9 +1298,15 @@ impl Daemon {
         true
     }
 
-    /// `ReloadProfiles`: rereads the profiles and sends the new list to every client that knows it.
+    /// `ReloadProfiles`: rereads the profiles and sends the new list to every client that knows it. A config that broke since the
+    /// last good load keeps that list: the built-in stand-in could put an id the config moved back on another login.
     fn reload_profiles(&mut self) {
-        (self.profiles, self.profile_infos) = load_profiles(&self.state, &self.user_home);
+        let loaded = Profiles::load(&self.state);
+        if let (Some(why), None) = (&loaded.0.broken, &self.profiles.broken) {
+            eprintln!("Warning: {why}; keeping the profiles loaded before");
+            return;
+        }
+        (self.profiles, self.profile_infos) = with_infos(loaded, &self.state, &self.user_home);
         let knows: Vec<u64> = self
             .clients
             .iter()

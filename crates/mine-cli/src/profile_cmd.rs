@@ -393,7 +393,7 @@ fn rm(state: &State, id: &str) -> Result<()> {
 
 fn relink(state: &State, user_home: &Path, id: &str, item: Option<&str>) -> Result<()> {
     let profiles = load(state);
-    let profile = find(&profiles, id)?;
+    let profile = profiles.usable(id)?;
     let done = share::relink(profile, &profiles, state, user_home, item)?;
     if done.is_empty() {
         println!("Nothing to relink for {id}");
@@ -413,7 +413,7 @@ fn relink(state: &State, user_home: &Path, id: &str, item: Option<&str>) -> Resu
 /// for another login (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, an API key) is dropped, and the profile's own home is set.
 fn login(state: &State, user_home: &Path, id: &str) -> Result<()> {
     let profiles = load(state);
-    let profile = find(&profiles, id)?;
+    let profile = profiles.usable(id)?;
     let (program, args): (&str, &[&str]) = match profile.kind {
         ProfileKind::Claude => ("claude", &["auth", "login"]),
         ProfileKind::Codex => ("codex", &["login"]),

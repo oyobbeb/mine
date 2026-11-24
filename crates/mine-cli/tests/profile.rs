@@ -437,6 +437,20 @@ fn profile_login_passes_on_the_cli_exit_status() {
 }
 
 #[test]
+fn profile_login_and_relink_refuse_on_a_broken_config() {
+    // The config moved claude-b to `~/work`, then broke: nothing may log in or link at the built-in claude-b home.
+    let env = Env::new();
+    env.fake_cli("claude", 0);
+    fs::create_dir_all(env.profiles_dir().join("claude-b")).unwrap();
+    env.set_config("[profiles.claude-b]\nkind = \"claude\"\nhome = \"~/work\n");
+    for args in [&["login", "claude-b"][..], &["relink", "claude-b"]] {
+        let why = env.fails(args);
+        assert!(why.contains("config.toml line 3"), "{why}");
+    }
+    assert!(!env.bin.join("claude.argv").exists());
+}
+
+#[test]
 fn profile_add_materializes_builtins_for_an_empty_table() {
     // `[profiles]` with nothing in it still means the built-in list. Adding to it must not leave `team` alone in the file.
     let env = Env::new();

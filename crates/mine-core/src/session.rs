@@ -259,7 +259,8 @@ fn hook_command(exe: &Path, session_dir: &Path) -> String {
 }
 
 /// The profile a session runs on: `account` holds its id. `None` for a session without one, which runs at the CLI's own home.
-/// An id that isn't in `profiles`, or one of another kind, is an error: a session never falls back to another login.
+/// An id that isn't in `profiles`, one of another kind, or any id while the config is broken ([`Profiles::usable`]) is an error:
+/// a session never falls back to another login.
 pub fn profile<'a>(
     kind: Kind,
     account: Option<&str>,
@@ -268,9 +269,7 @@ pub fn profile<'a>(
     let Some(id) = account else {
         return Ok(None);
     };
-    let Some(profile) = profiles.get(id) else {
-        bail!("Unknown profile: {id}");
-    };
+    let profile = profiles.usable(id)?;
     if Kind::from(profile.kind) != kind {
         bail!("Profile {id} is a {} profile", profile.kind.word());
     }

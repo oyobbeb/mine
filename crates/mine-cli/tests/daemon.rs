@@ -1581,6 +1581,45 @@ fn creating_a_managed_profile_session_links_shared_items() {
     assert_eq!(ls(&st)[0][3], "team");
 }
 
+/// Writes the `meta.json` of an ended Claude session `name` on profile `account`, as a daemon that has gone left it. Returns its id.
+fn saved_claude(st: &St, name: &str, account: &str) -> String {
+    let id = st.id(name);
+    let dir = st.root.join("sessions").join(&id);
+    fs::create_dir_all(&dir).unwrap();
+    Meta {
+        id: id.clone(),
+        project: st.project.clone(),
+        name: name.into(),
+        kind: Kind::Claude,
+        account: Some(account.into()),
+        model: None,
+        restore: Restore::Resume,
+        created_ms: 1,
+        resume_id: Some("s1".into()),
+        closed: false,
+    }
+    .save(&dir)
+    .unwrap();
+    id
+}
+
+/// Attaches to `id`, which starts it again if it isn't running, and returns the error sent before the snapshot, if any.
+fn attach_error(c: &mut Client, id: &str) -> Option<String> {
+    c.send(&ToDaemon::Attach {
+        id: id.to_string(),
+        cols: 80,
+        rows: 24,
+    });
+    let mut error = None;
+    loop {
+        match c.recv().expect("the connection dropped") {
+            FromDaemon::Snapshot { .. } => return error,
+            FromDaemon::Error { message } => error = Some(message),
+            _ => {}
+        }
+    }
+}
+
 #[test]
 fn unknown_profile_refuses_to_start() {
     // A session whose profile was removed from the config must not start on any other login.
@@ -1590,40 +1629,11 @@ fn unknown_profile_refuses_to_start() {
     let paths = State {
         root: st.root.clone(),
     };
-    let id = st.id("c");
-    let dir = paths.session_dir(&id);
-    fs::create_dir_all(&dir).unwrap();
-    Meta {
-        id: id.clone(),
-        project: st.project.clone(),
-        name: "c".into(),
-        kind: Kind::Claude,
-        account: Some("gone".into()),
-        model: None,
-        restore: Restore::Resume,
-        created_ms: 1,
-        resume_id: Some("s1".into()),
-        closed: false,
-    }
-    .save(&dir)
-    .unwrap();
+    let id = saved_claude(&st, "c", "gone");
     // Starting the daemon finds it not running. Attaching is what would start it again.
     assert_eq!(ls(&st)[0][3], "gone");
     let mut c = client(&st);
-    c.send(&ToDaemon::Attach {
-        id: id.clone(),
-        cols: 80,
-        rows: 24,
-    });
-    let mut error = None;
-    loop {
-        match c.recv().expect("the connection dropped") {
-            FromDaemon::Snapshot { .. } => break,
-            FromDaemon::Error { message } => error = Some(message),
-            _ => {}
-        }
-    }
-    let error = error.expect("no error for the refused start");
+    let error = attach_error(&mut c, &id).expect("no error for the refused start");
     assert!(error.contains("Unknown profile: gone"), "{error}");
     let log = fs::read_to_string(paths.log_dir().join("daemon.log")).unwrap();
     assert!(log.contains("Unknown profile: gone"), "{log}");
@@ -1637,6 +1647,111 @@ fn unknown_profile_refuses_to_start() {
     };
     assert_eq!(alive, Some(false));
     assert_eq!(ls(&st)[0][4], "ended");
+}
+
+/// The next message `pick` takes, skipping the others.
+fn recv_until<T>(c: &mut Client, mut pick: impl FnMut(FromDaemon) -> Option<T>) -> T {
+    loop {
+        if let Some(found) = pick(c.recv().expect("the connection dropped")) {
+            return found;
+        }
+    }
+}
+
+#[test]
+fn broken_config_at_start_starts_no_profile_session() {
+    // The config moved claude-b to `~/work`, then broke. The built-in claude-b home is there too, and must not be used.
+    let bin = tmp();
+    let trace = fake_claude(bin.path());
+    let st = state_with_path(bin.path());
+    let paths = State {
+        root: st.root.clone(),
+    };
+    fs::create_dir_all(paths.profiles_dir().join("claude-b")).unwrap();
+    let config = st.root.join("config.toml");
+    fs::write(
+        &config,
+        "[profiles.claude-b]\nkind = \"claude\"\nhome = \"~/work\n",
+    )
+    .unwrap();
+    let id = saved_claude(&st, "c", "claude-b");
+    assert_eq!(ls(&st)[0][3], "claude-b");
+    let mut c = client(&st);
+    let error = attach_error(&mut c, &id).expect("no error for the refused start");
+    assert!(error.contains("config.toml line 3"), "{error}");
+    // A new session, which would get the built-in default, is refused too and leaves nothing behind.
+    c.send(&ToDaemon::New {
+        spec: NewSession {
+            project: st.project.clone(),
+            name: "n".into(),
+            kind: Kind::Claude,
+            account: None,
+            model: None,
+        },
+    });
+    let error = recv_until(&mut c, |m| match m {
+        FromDaemon::Error { message } => Some(message),
+        _ => None,
+    });
+    assert!(error.contains("config.toml line 3"), "{error}");
+    assert!(!paths.session_dir(&st.id("n")).exists());
+    assert!(!trace.exists());
+    // Once the config is fixed and reloaded, the session starts on the home it names.
+    fs::create_dir_all(st.home.join("work")).unwrap();
+    fs::write(
+        &config,
+        "[profiles.claude-b]\nkind = \"claude\"\nhome = \"~/work\"\n",
+    )
+    .unwrap();
+    c.send(&ToDaemon::ReloadProfiles);
+    recv_until(&mut c, |m| {
+        matches!(m, FromDaemon::Profiles { .. }).then_some(())
+    });
+    assert_eq!(attach_error(&mut c, &id), None);
+    wait_until(|| trace.exists());
+}
+
+#[test]
+fn reload_keeps_the_last_good_profiles_on_a_broken_config() {
+    let bin = tmp();
+    let trace = fake_claude(bin.path());
+    let st = state_with_path(bin.path());
+    fs::create_dir_all(&st.root).unwrap();
+    let config = st.root.join("config.toml");
+    fs::write(&config, "[profiles.work]\nkind = \"claude\"\n").unwrap();
+    ls(&st); // Starts the daemon.
+    let mut c = client(&st);
+    fs::write(
+        &config,
+        "[profiles.work]\nkind = \"claude\"\nlabel = \"yb@gmail.com\n",
+    )
+    .unwrap();
+    c.send(&ToDaemon::ReloadProfiles);
+    // No new list goes out, and sessions still start on `work`.
+    assert_eq!(profile_ids_after_list(&mut c), Vec::<Vec<String>>::new());
+    c.send(&ToDaemon::New {
+        spec: NewSession {
+            project: st.project.clone(),
+            name: "w".into(),
+            kind: Kind::Claude,
+            account: None,
+            model: None,
+        },
+    });
+    recv_until(&mut c, |m| match m {
+        FromDaemon::Error { message } => panic!("{message}"),
+        FromDaemon::Sessions { sessions } => {
+            sessions.iter().any(|s| s.meta.name == "w").then_some(())
+        }
+        _ => None,
+    });
+    wait_until(|| trace.exists());
+    assert_eq!(ls(&st)[0][3], "work");
+    // The warning gives the line and the reason, never the file's values.
+    let log = fs::read_to_string(st.root.join("logs").join("daemon.log")).unwrap();
+    assert!(log.contains("config.toml line 3"), "{log}");
+    assert!(log.contains("keeping the profiles"), "{log}");
+    assert!(!log.contains("gmail"), "{log}");
 }
 
 #[test]
