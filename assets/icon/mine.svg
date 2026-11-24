@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#2c3039"/><stop offset="1" stop-color="#15171c"/></linearGradient>
+    <radialGradient id="glow" cx="512" cy="590" r="300" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#e5c07b" stop-opacity=".35"/><stop offset="1" stop-color="#e5c07b" stop-opacity="0"/></radialGradient>
+    <linearGradient id="flame" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#ffe7b0"/><stop offset=".55" stop-color="#f0bd62"/><stop offset="1" stop-color="#d98f2b"/></linearGradient>
+    <linearGradient id="core" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#fff6dc" stop-opacity=".0"/><stop offset="1" stop-color="#fff6dc" stop-opacity=".55"/></linearGradient>
+    <filter id="sh" x="-10%" y="-10%" width="120%" height="125%"><feDropShadow dx="0" dy="14" stdDeviation="18" flood-color="#000" flood-opacity=".28"/></filter>
+  </defs>
+  <rect x="100" y="100" width="824" height="824" rx="186" fill="url(#tile)" filter="url(#sh)"/>
+  <rect x="101.5" y="101.5" width="821" height="821" rx="184.5" fill="none" stroke="#fff" stroke-opacity=".07" stroke-width="3"/>
+  <circle cx="512" cy="590" r="300" fill="url(#glow)"/>
+  <path d="M528 262 C548 338 610 388 656 458 C690 510 700 562 690 614 C674 704 600 768 512 768 C420 768 344 704 336 616 C330 546 360 486 412 444 C420 506 448 534 478 544 C466 462 482 352 528 262 Z" fill="url(#flame)"/>
+  <ellipse cx="470" cy="636" rx="20" ry="30" fill="#1e2128"/>
+  <ellipse cx="556" cy="636" rx="20" ry="30" fill="#1e2128"/>
+</svg>

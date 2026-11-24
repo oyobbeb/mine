@@ -2,7 +2,8 @@
 # Builds mine.app: a release build of the desktop app, with `mine` next to it in Contents/MacOS so the
 # app starts the daemon with that `mine` (the second place `find_mine` looks).
 # usage: scripts/bundle-app.sh [--dest DIR]   (default: $HOME/Applications)
-# ponytail: no icon and no code signing yet (stage 8, with the Homebrew install).
+# The icon is assets/icon/mine.icns, generated from assets/icon/mine.svg (see assets/icon/README.md).
+# ponytail: no code signing yet (stage 8, with the Homebrew install).
 set -euo pipefail
 
 usage() { echo "usage: scripts/bundle-app.sh [--dest DIR]" >&2; exit 2; }
@@ -31,8 +32,9 @@ app="$dest/mine.app"
 tmp=$(mktemp -d "$dest/.mine.app.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT
 new="$tmp/mine.app"
-mkdir -p "$new/Contents/MacOS"
+mkdir -p "$new/Contents/MacOS" "$new/Contents/Resources"
 cp "$bin/mine-app" "$bin/mine" "$new/Contents/MacOS/"
+cp "$root/assets/icon/mine.icns" "$new/Contents/Resources/mine.icns"
 for f in mine-app mine; do
   [ -x "$new/Contents/MacOS/$f" ] || { echo "Couldn't copy $f into the bundle" >&2; exit 1; }
 done
@@ -45,6 +47,7 @@ cat > "$new/Contents/Info.plist" <<PLIST
   <key>CFBundleName</key><string>mine</string>
   <key>CFBundleIdentifier</key><string>dev.mine.app</string>
   <key>CFBundleExecutable</key><string>mine-app</string>
+  <key>CFBundleIconFile</key><string>mine</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>$version</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>

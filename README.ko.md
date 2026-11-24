@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="assets/icon/mine.svg" alt="mine icon" width="128">
+
 # mine
 
 **끊기지 않는 코딩 에이전트 세션.**

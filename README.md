@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="assets/icon/mine.svg" alt="mine icon" width="128">
+
 # mine
 
 **Your coding-agent sessions, never interrupted.**
