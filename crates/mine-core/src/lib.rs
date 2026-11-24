@@ -9,6 +9,7 @@ pub mod keys;
 pub mod launch;
 pub mod link;
 pub mod paths;
+pub mod profiles;
 pub mod project;
 pub mod proto;
 pub mod screen;

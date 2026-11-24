@@ -1,7 +1,7 @@
-//! Turns an account id (`claude-a`, `claude-b`, `codex`) into a short name to show on screen.
+//! Turns a profile id (`claude-a`, `claude-b`, `codex`, or any id in `[profiles]`) into a short name to show on screen.
 //!
-//! The name is chosen by label (`<state>/config.toml`) > auto (login info) > id. The account id a session uses stays the same;
-//! only the places where it is shown as text use this name.
+//! The name is chosen by label (`<state>/config.toml`) > auto (login info) > id; [`crate::profiles::infos`] decides it and [`Labels`]
+//! is a lookup over the result. The profile id a session uses stays the same; only the places where it is shown as text use this name.
 //!
 //! Credentials are never read or stored. For Claude's auto name, only `oauthAccount.emailAddress` is read from `.claude.json`,
 //! and only the part before `@` and the first label of the domain are remembered. `.credentials.json`, the keychain and Codex auth files are never opened.
@@ -13,43 +13,51 @@ use std::path::Path;
 use serde::Deserialize;
 
 use crate::paths::State;
+use crate::profiles::{self, ProfileInfo, Profiles};
 
-const CLAUDE_A: &str = "claude-a";
-const CLAUDE_B: &str = "claude-b";
-const CODEX: &str = "codex";
-
-/// Account id → name to show on screen. Read with [`Labels::load`]; an unknown id comes back as the id itself.
+/// Profile id → name to show on screen. Read with [`Labels::load`] or built from [`profiles::infos`] with [`Labels::from_infos`];
+/// an unknown id comes back as the id itself.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Labels {
     names: HashMap<String, String>,
 }
 
 impl Labels {
-    /// Reads names in the order label > auto > id. A file that can't be read counts as missing.
+    /// Reads names in the order label > auto > id, through [`Profiles::load`] and [`profiles::infos`].
+    /// A config that is broken or can't be read falls back to the built-in profiles, and each warning is printed.
     ///
-    /// `home` is the directory (`~`) that has claude-a's `.claude.json`; without it, claude-a has no auto name.
+    /// `home` is the directory (`~`) that has the default Claude profile's `.claude.json`; without it, that profile has no auto name.
     /// Call it once when the client starts (and for the app, also when the window is activated again).
     ///
     /// ponytail: no file watching. After switching accounts or editing a label, restart the client or
     /// (for the app) activate the window again.
     pub fn load(state: &State, home: Option<&Path>) -> Labels {
-        let mut names = HashMap::from([(CODEX.to_string(), "Codex".to_string())]);
-        let a = home.and_then(|home| read_identity(&home.join(".claude.json")));
-        let b = read_identity(&state.profiles_dir().join(CLAUDE_B).join(".claude.json"));
-        // If the two accounts share the same local part, both get the domain appended to tell them apart.
-        let same = matches!((&a, &b), (Some(a), Some(b)) if a.local == b.local);
-        for (id, identity) in [(CLAUDE_A, a), (CLAUDE_B, b)] {
-            if let Some(identity) = identity {
-                let name = if same {
-                    identity.with_domain()
-                } else {
-                    identity.local
-                };
-                names.insert(id.to_string(), name);
-            }
+        let (profiles, warnings) = Profiles::load(state);
+        for warning in warnings {
+            eprintln!("Warning: {warning}");
         }
-        names.extend(read_aliases(state));
-        Labels { names }
+        let mut labels = Labels::from_infos(&profiles::infos(&profiles, state, home));
+        // Until the clients read profile infos, they ask for fixed ids: the claude-b row asks for `claude-b` even before its
+        // directory exists. Keep a label for an id that isn't a profile, as before. A profile's own name always wins.
+        let config = fs::read_to_string(state.root.join("config.toml")).unwrap_or_default();
+        for (id, label) in config
+            .parse::<toml::Table>()
+            .map(|t| aliases(&t))
+            .unwrap_or_default()
+        {
+            labels.names.entry(id).or_insert(label);
+        }
+        labels
+    }
+
+    /// The names of `infos`, which the daemon sends to clients.
+    pub fn from_infos(infos: &[ProfileInfo]) -> Labels {
+        Labels {
+            names: infos
+                .iter()
+                .map(|info| (info.id.clone(), info.label.clone()))
+                .collect(),
+        }
     }
 
     /// The on-screen name of `account`. An unknown id comes back as the id.
@@ -78,7 +86,8 @@ struct OauthAccount {
 }
 
 /// The two pieces kept from the email. The full email is not held.
-struct Identity {
+#[derive(Clone)]
+pub(crate) struct Identity {
     /// The part before `@`.
     local: String,
     /// The first label of the domain (`gmail` for `gmail.com`). Empty if there is none.
@@ -87,9 +96,9 @@ struct Identity {
 
 impl Identity {
     /// `local@first-domain-label`, which tells same local parts apart. Just the local part if there is no domain.
-    fn with_domain(self) -> String {
+    fn with_domain(&self) -> String {
         if self.domain.is_empty() {
-            self.local
+            self.local.clone()
         } else {
             format!("{}@{}", self.local, self.domain)
         }
@@ -105,56 +114,58 @@ fn identity(claude: ClaudeJson) -> Option<Identity> {
     })
 }
 
-/// Reads only the email pieces from the `.claude.json` at `path`. `None` if it is missing or broken.
-fn read_identity(path: &Path) -> Option<Identity> {
-    let bytes = fs::read(path).ok()?;
-    let claude = serde_json::from_slice::<ClaudeJson>(&bytes).ok()?;
-    identity(claude)
+/// What a profile's login files say. Only existence and the email pieces are kept, never a credential.
+pub(crate) struct Login {
+    pub logged_in: bool,
+    pub identity: Option<Identity>,
+}
+
+/// Reads the `.claude.json` at `path`. A missing or broken file is not logged in. Logged in means it has an `oauthAccount`.
+pub(crate) fn read_login(path: &Path) -> Login {
+    let claude = fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<ClaudeJson>(&bytes).ok());
+    Login {
+        logged_in: claude.as_ref().is_some_and(|c| c.oauth_account.is_some()),
+        identity: claude.and_then(identity),
+    }
+}
+
+/// The auto names for these logins, in order. If two share the same local part, both get the domain appended to tell them apart.
+pub(crate) fn auto_names(identities: &[Option<Identity>]) -> Vec<Option<String>> {
+    identities
+        .iter()
+        .map(|identity| {
+            let identity = identity.as_ref()?;
+            let shared = identities
+                .iter()
+                .flatten()
+                .filter(|other| other.local == identity.local)
+                .count()
+                > 1;
+            Some(if shared {
+                identity.with_domain()
+            } else {
+                identity.local.clone()
+            })
+        })
+        .collect()
+}
+
+/// The `[accounts.<id>] label` entries of a parsed `config.toml`. Entries that aren't strings or can't be used are skipped.
+pub(crate) fn aliases(config: &toml::Table) -> HashMap<String, String> {
+    let accounts = config.get("accounts").and_then(toml::Value::as_table);
+    accounts
+        .into_iter()
+        .flatten()
+        .filter_map(|(id, entry)| Some((id.clone(), clean(entry.get("label")?.as_str()?)?)))
+        .collect()
 }
 
 /// Text to show on screen. Trims surrounding whitespace; if it is empty or has control characters it could break the display, so it isn't used.
-fn clean(text: &str) -> Option<String> {
+pub(crate) fn clean(text: &str) -> Option<String> {
     let text = text.trim();
     (!text.is_empty() && !text.chars().any(char::is_control)).then(|| text.to_string())
-}
-
-/// Labels from `<state>/config.toml`. A missing or unreadable file counts as none, and a syntax error logs a warning and counts as none.
-fn read_aliases(state: &State) -> HashMap<String, String> {
-    let path = state.root.join("config.toml");
-    let Ok(text) = fs::read_to_string(&path) else {
-        return HashMap::new();
-    };
-    parse_aliases(&text).unwrap_or_else(|why| {
-        eprintln!(
-            "Warning: couldn't read {}, so no labels are used: {why}",
-            path.display()
-        );
-        HashMap::new()
-    })
-}
-
-/// The `[accounts.<id>] label` entries of `config.toml`. Entries that aren't strings or can't be used are skipped.
-/// On a syntax error, gives a reason to log (line number and error kind). The file contents are not included.
-fn parse_aliases(text: &str) -> Result<HashMap<String, String>, String> {
-    let table: toml::Table = text.parse().map_err(|e: toml::de::Error| {
-        let line = e.span().map_or(0, |span| {
-            let upto = span.start.min(text.len());
-            1 + text.as_bytes()[..upto]
-                .iter()
-                .filter(|&&b| b == b'\n')
-                .count()
-        });
-        format!("line {line}: {}", e.message())
-    })?;
-    let accounts = table.get("accounts").and_then(toml::Value::as_table);
-    Ok(accounts
-        .into_iter()
-        .flatten()
-        .filter_map(|(id, entry)| {
-            let label = entry.get("label")?.as_str()?;
-            Some((id.clone(), clean(label)?))
-        })
-        .collect())
 }
 
 #[cfg(test)]
@@ -320,12 +331,14 @@ mod tests {
     #[test]
     fn bad_config_warning_never_quotes_the_file() {
         // The warning goes to the log. Even if the broken line has an email, the file contents are not included.
+        let env = Env::new();
         let text = "[accounts.claude-a]\nlabel = \"yb@gmail.com\n";
-        let warning = parse_aliases(text).unwrap_err();
-        assert!(warning.contains("line 2"), "{warning}");
+        let (_, warnings) = Profiles::parse(Some(text), &env.state);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("line 2"), "{warnings:?}");
         assert!(
-            !warning.contains("yb") && !warning.contains("gmail"),
-            "{warning}"
+            !warnings[0].contains("yb") && !warnings[0].contains("gmail"),
+            "{warnings:?}"
         );
     }
 
@@ -359,6 +372,21 @@ mod tests {
         assert_eq!(labels.get("bad"), "bad");
         // Labels for other account ids are accepted too.
         assert_eq!(labels.get("work"), "office");
+    }
+
+    #[test]
+    fn labels_follow_infos() {
+        let env = Env::new();
+        env.claude_a("yb@gmail.com");
+        env.config("[profiles.team]\nkind = \"claude\"\nlabel = \"work\"\n[profiles.claude-a]\nkind = \"claude\"\nhome = \"default\"\n");
+        let (profiles, _) = Profiles::load(&env.state);
+        let infos = profiles::infos(&profiles, &env.state, Some(&env.home));
+        let labels = Labels::from_infos(&infos);
+        assert_eq!(labels.get("team"), "work");
+        assert_eq!(labels.get("claude-a"), "yb");
+        // Not a profile: shown as the id.
+        assert_eq!(labels.get("shell"), "shell");
+        assert_eq!(labels, env.load());
     }
 
     #[test]
