@@ -403,7 +403,7 @@
   ToDaemon::Focus { focused: bool }
   // env.rs
   pub fn parse_env0(bytes: &[u8]) -> Vec<(String, String)>
-  pub fn login_env(shell: &str, timeout: std::time::Duration) -> Option<Vec<(String, String)>>   // `$shell -l -c 'env -0'`
+  pub fn login_env(shell: &str, timeout: std::time::Duration) -> Option<Vec<(String, String)>>   // `$shell -i -l -c '<NUL marker>; env -0'`, setsid, stdin /dev/null; parses after the marker (D-R13)
   // conn.rs: uses Task 2's connect_or_spawn_async_with(state, daemon_exe, spawn_env) as it is. This task fills in spawn_env.
   ```
 
@@ -425,7 +425,7 @@
     - Launch it outside the global lock, and do not wait for it. A thread reaps the child.
     - Do not launch it twice for the same transition.
   - **App-side Focus:** the app sends `Focus` when the app window is activated or deactivated.
-  - **App launching the daemon:** at startup the app reads `login_env($SHELL or /bin/zsh, 3 seconds)` once and passes it as `link::start`'s `spawn_env`. On failure it is `None`, meaning the app's own environment. `find_mine`'s PATH also uses this environment's PATH first.
+  - **App launching the daemon:** at startup the app reads `login_env($SHELL or /bin/zsh, 3 seconds)` once and passes it as `link::start`'s `spawn_env`. On failure (the shell fails, times out, or never prints the marker) it is `None`, meaning the app's own environment. `find_mine`'s PATH also uses this environment's PATH first.
   - **Environment of the launched daemon:** after `env_clear`, add only `MINE_STATE_DIR` to the given environment. The holder process's rules for cleaning runtime variables still apply.
   - **TUI:** keeps using `None`.
   - **Version mismatch:** the error text uses the existing `restart_hint`.

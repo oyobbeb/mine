@@ -252,7 +252,7 @@ flowchart LR
 | Stage | What | Status |
 |---|---|---|
 | 1 | Daemon, holders, terminal UI, status-grouped list, copy mode | ✅ Done |
-| D1 | Desktop app shell: task list, session tabs, launcher, terminal pane | 🚧 In progress (input, mouse, notifications, `.app` bundle left) |
+| D1 | Desktop app shell: task list, session tabs, launcher, terminal pane with input, IME, mouse and find, notifications, `.app` bundle | ✅ Done |
 | D2 | Chat view for Claude and Codex with approval buttons and subagent cards | Planned |
 | D3 | Changes panel: uncommitted tree and commit list | Planned |
 | 2 | Usage limits and one-key handoff of a task to another account, with context | Planned |
