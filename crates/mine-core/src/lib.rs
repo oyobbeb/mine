@@ -16,4 +16,5 @@ pub mod screen;
 pub mod search;
 pub mod select;
 pub mod session;
+pub mod share;
 pub mod view;
