@@ -126,6 +126,7 @@ mine --project ~/dev/app new dev      # pick the project explicitly
 | `⌃a )` / `⌃a (` | Next / previous project |
 | `⌃a 0` | All projects |
 | `⌃a c` | New session (launcher) |
+| `⌃a a` | Approvals panel (see Approvals below) |
 | `⌃a x` | Close the current session (`y` to confirm) |
 | `⌃a b` | Collapse / expand the list |
 | `⌃a [` | Copy mode |
@@ -176,6 +177,27 @@ Freezes the scrollback so you can move around and copy with the keyboard.
 - Click picks a project, a session, a group header (collapse / expand), or a launcher row.
 
 </details>
+
+### Approvals
+
+When a Claude session asks to run a tool and nobody is looking at its terminal, mine holds the request for up to 120 seconds and the session shows as *Needs approval*. Answer it from the app or the terminal UI instead of walking over to the session.
+
+- **App:** the session's row in the task list and its tab show **Allow** and **Deny**. Each answers that session's request only.
+- **Terminal UI:** `⌃a a` opens the **Approvals** panel. It lists every pending request across your projects, oldest first, as `project/session · summary`, and shows `No pending approvals` when there are none.
+
+  | Key | Action |
+  |---|---|
+  | ↑ / ↓ | Select a request |
+  | `y` | Allow the selected request |
+  | `n` | Deny the selected request |
+  | Esc | Close the panel |
+
+  The panel only answers the request you selected, and `⌃a n` / `⌃a p` still switch sessions.
+- **Handing it back:** the request goes to Claude's own prompt when you start viewing that session's terminal, press a key in it, 120 seconds pass, the daemon restarts, or the hook's connection drops. The panel covers the terminal, so while it's open the session counts as not viewed.
+- **What it never does:** `AskUserQuestion` and `ExitPlanMode` always go to Claude's own prompt, since they need more than yes or no. Deny tells Claude `Denied from mine`. There is no "always allow": mine doesn't change your permission rules.
+- Codex sessions only show *Needs approval*; there is nothing to answer from mine.
+
+The buttons and the panel need a daemon that holds approvals. After upgrading, restart it as described under Upgrading.
 
 ## Configuration
 
@@ -253,7 +275,7 @@ State lives in `~/.mine` (override with `MINE_STATE_DIR`).
   projects/<key>.json   registered project paths
   sessions/<id>/        meta.json, events.jsonl (hook events), exit
   run/                  holder process sockets
-  logs/                 daemon.log, hold-<id>.log
+  logs/                 daemon.log, hold-<id>.log, hooks.log
   profiles/<id>/        config home of a profile without a `home` (`claude-b` is one)
   profiles/<id>.links   the shared links mine made for that profile
 ```

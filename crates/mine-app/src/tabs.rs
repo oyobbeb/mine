@@ -10,7 +10,7 @@ use gpui_component::h_flex;
 use mine_core::view::folder_name;
 
 use crate::model;
-use crate::sidebar::{account_chip, state_color};
+use crate::sidebar::{account_chip, answer_buttons, state_color};
 use crate::theme::*;
 use crate::workspace::Workspace;
 
@@ -53,6 +53,10 @@ pub fn render(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
             })
             .child(s.meta.name.clone())
             .children(account_chip(s.meta.account.as_deref(), &m.profiles))
+            .children(
+                m.answerable(s)
+                    .map(|request| answer_buttons(&s.meta.id, request, cx)),
+            )
             .on_click(cx.listener(move |ws, _, window, cx| ws.attach(&id, window, cx)))
     });
     let plus = div()

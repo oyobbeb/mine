@@ -3,6 +3,7 @@
 //! This one task holds all the state and waits on stdin (a thread), daemon messages (read tasks), SIGWINCH and redraws with a single
 //! `select!`. Only cancellation-safe channel receives and timers go in the `select!`.
 
+mod approvals;
 pub mod copymode;
 pub mod input;
 pub mod launcher;
@@ -27,6 +28,7 @@ use ratatui::text::Span;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc::UnboundedSender;
 
+use approvals::{Key, Panel};
 use copymode::{CopyMode, CopyOut};
 use input::{Action, Cmd, InputParser};
 use mine_core::conn::Conn;
@@ -70,6 +72,7 @@ pub async fn run(state: State, project: PathBuf) -> Result<()> {
     let mut rx = conn.rx;
     let mut app = App::new(conn.tx, project, terminal.size()?);
     app.presence = conn.features.iter().any(|f| f == "presence");
+    app.ask = conn.features.iter().any(|f| f == "ask");
     // Running `mine` was the user's input.
     app.report.input(now_ms());
     if let Some((fg, bg)) = colors {
@@ -209,6 +212,8 @@ struct App {
     keys: KeyModes,
     /// The daemon announced `presence`. Without it the client reports nothing, as before.
     presence: bool,
+    /// The daemon announced `ask`: it holds permission requests and takes `Answer`. Without it `⌃a a` says so and answers nothing.
+    ask: bool,
     /// The outer terminal has focus: true until a focus-out report (a terminal without focus reporting counts as visible).
     visible: bool,
     report: PresenceReport,
@@ -230,6 +235,7 @@ impl App {
                 toggled: Vec::new(),
                 status: None,
                 launcher: false,
+                approvals: None,
                 profiles: Vec::new(),
             },
             screen: None,
@@ -246,6 +252,7 @@ impl App {
             held: false,
             keys: KeyModes::default(),
             presence: false,
+            ask: false,
             visible: true,
             report: PresenceReport::default(),
             dirty: true,
@@ -253,12 +260,14 @@ impl App {
         }
     }
 
-    /// Sends `Presence` if it's due ([`PresenceReport::due`]). The attached session counts as viewed unless the launcher covers it.
+    /// Sends `Presence` if it's due ([`PresenceReport::due`]). The attached session counts as viewed unless the launcher or the
+    /// approvals panel covers its terminal.
     fn sync_presence(&mut self, now: Instant) {
         if !self.presence {
             return;
         }
-        let viewing = self.m.attached.as_deref().filter(|_| !self.m.launcher);
+        let covered = self.m.launcher || self.m.approvals.is_some();
+        let viewing = self.m.attached.as_deref().filter(|_| !covered);
         if let Some(msg) = self.report.due(now, self.visible, viewing) {
             self.send(msg);
         }
@@ -274,7 +283,10 @@ impl App {
     /// Follows the attached session screen's modes, but uses the defaults when there's no session screen, during copy mode, status line input and the launcher where mine reads keys itself,
     /// and when exiting. In those cases keys must arrive in plain (legacy) encoding.
     fn sync_keys(&mut self) -> Vec<u8> {
-        let reading = self.copy.is_some() || self.m.prompt.is_some() || self.m.launcher;
+        let reading = self.copy.is_some()
+            || self.m.prompt.is_some()
+            || self.m.launcher
+            || self.m.approvals.is_some();
         let wanted = match &self.screen {
             Some(screen) if !reading && !self.quit => KeyModes::of(screen),
             _ => KeyModes::default(),
@@ -458,6 +470,7 @@ impl App {
             }
         }
         match action {
+            Action::Pass(bytes) if self.m.approvals.is_some() => self.approvals_keys(&bytes),
             Action::Pass(bytes) if self.m.prompt.is_some() => self.prompt_keys(&bytes),
             Action::Pass(bytes) if self.copy.is_some() => self.copy_keys(&bytes),
             Action::Pass(bytes) if self.m.launcher => self.launcher_keys(&bytes),
@@ -468,8 +481,9 @@ impl App {
                 }
             }
             Action::Paste(text) if self.m.prompt.is_some() => self.prompt_paste(&text),
-            // In copy mode and the launcher, input doesn't go to the session.
-            Action::Paste(_) if self.copy.is_some() || self.m.launcher => {}
+            // In copy mode, the launcher and the approvals panel, input doesn't go to the session.
+            Action::Paste(_)
+                if self.copy.is_some() || self.m.launcher || self.m.approvals.is_some() => {}
             Action::Paste(text) => {
                 let bracketed = self
                     .screen
@@ -553,7 +567,12 @@ impl App {
         if cmd != Cmd::CopyMode {
             self.exit_copy();
         }
+        // A command closes the approvals panel. `⌃a a` opens it again fresh.
+        if self.m.approvals.take().is_some() {
+            self.dirty = true;
+        }
         match cmd {
+            Cmd::Approvals => self.open_approvals(),
             Cmd::NextSession => self.step_session(1),
             Cmd::PrevSession => self.step_session(-1),
             Cmd::NextProject => self.step_project(1),
@@ -576,6 +595,42 @@ impl App {
             }
             Cmd::CopyMode => self.enter_copy(),
             Cmd::Detach => self.quit = true,
+        }
+    }
+
+    /// `⌃a a`: opens the approvals panel with the oldest request selected. A daemon that didn't announce `ask` holds nothing, so it only says so.
+    fn open_approvals(&mut self) {
+        if !self.ask {
+            return self.say(
+                "This daemon doesn't hold approvals. Restart the daemon, then run mine again",
+            );
+        }
+        self.m.approvals = Some(Panel::open(&approvals::entries(&self.m.sessions)));
+        self.dirty = true;
+    }
+
+    /// Keys of the approvals panel. Only the selected request is ever answered, and only by a single `y` or `n`. Everything else is
+    /// swallowed: the panel covers the session, so nothing reaches it.
+    fn approvals_keys(&mut self, bytes: &[u8]) {
+        self.dirty = true;
+        let entries = approvals::entries(&self.m.sessions);
+        let Some(panel) = &mut self.m.approvals else {
+            return;
+        };
+        match approvals::key_of(bytes) {
+            Some(Key::Close) => self.m.approvals = None,
+            Some(Key::Up) => panel.step(&entries, false),
+            Some(Key::Down) => panel.step(&entries, true),
+            Some(key @ (Key::Allow | Key::Deny)) => {
+                if let Some(entry) = panel.take(&entries) {
+                    self.send(ToDaemon::Answer {
+                        id: entry.id,
+                        request: entry.request,
+                        allow: key == Key::Allow,
+                    });
+                }
+            }
+            None => {}
         }
     }
 
@@ -1022,7 +1077,7 @@ impl App {
         let runs = self
             .screen
             .as_ref()
-            .filter(|_| !self.m.launcher)
+            .filter(|_| !self.m.launcher && self.m.approvals.is_none())
             .map(|screen| ui::link_runs(screen, term))
             .unwrap_or_default();
         let mut patches: Vec<(Option<&str>, Cells)> = self
@@ -1072,6 +1127,7 @@ impl App {
 fn ime_anchor(m: &Model, sc: &Screen, term: Rect) -> Option<Position> {
     if m.attached.is_none()
         || m.launcher
+        || m.approvals.is_some()
         || m.status.is_some()
         || m.prompt.is_some()
         || sc.mode().contains(TermMode::SHOW_CURSOR)
@@ -2538,5 +2594,161 @@ mod tests {
         app.on_input("/한".as_bytes());
         assert_eq!(app.m.status.as_deref(), Some("/한"));
         assert!(sent(&mut rx).is_empty());
+    }
+
+    /// A `shell` session of `/p` that is holding `(request, summary, since_ms)`.
+    fn held(name: &str, request: u64, summary: &str, since_ms: u64) -> SessionInfo {
+        use mine_core::session::{PendingAsk, SessionState};
+        let mut s = shell(name);
+        s.state = SessionState::Approval;
+        s.pending = Some(PendingAsk {
+            request,
+            summary: summary.into(),
+            since_ms,
+        });
+        s
+    }
+
+    fn answer(id: &str, request: u64, allow: bool) -> ToDaemon {
+        ToDaemon::Answer {
+            id: id.into(),
+            request,
+            allow,
+        }
+    }
+
+    /// A client whose daemon announced `ask`, after the first list: `t2` (request 9, held since 2 s), `t1` (request 5, since 1 s) and
+    /// a plain `t3`. It attaches to one of the held sessions, and the `Attach` sent then is drained.
+    fn asking_app() -> (App, UnboundedReceiver<ToDaemon>) {
+        let (tx, mut rx) = unbounded_channel();
+        let mut app = App::new(tx, PathBuf::from("/p"), Size::new(120, 40));
+        app.ask = true;
+        app.on_msg(FromDaemon::Profiles {
+            profiles: ui::builtin(),
+        });
+        app.on_msg(FromDaemon::Sessions {
+            sessions: vec![
+                held("t2", 9, "Edit(src/main.rs)", 2_000),
+                held("t1", 5, "Bash(npm run deploy)", 1_000),
+                shell("t3"),
+            ],
+        });
+        sent(&mut rx);
+        (app, rx)
+    }
+
+    #[test]
+    fn panel_y_answers_selected_only() {
+        let (mut app, mut rx) = asking_app();
+        app.on_input(b"\x01a");
+        assert!(app.m.approvals.is_some());
+        // Oldest first, so t1 is the first row and t2 the second. Select the second, then allow it.
+        app.on_input(b"\x1b[B");
+        app.on_input(b"y");
+        assert_eq!(sent(&mut rx), [answer("p-t2", 9, true)]);
+        // The answered request is no longer selected, so another key can't answer anything on its own.
+        app.on_input(b"y");
+        app.on_input(b"n");
+        assert!(sent(&mut rx).is_empty());
+        // Down selects the first row again (t1), and `n` denies it.
+        app.on_input(b"\x1b[B");
+        app.on_input(b"n");
+        assert_eq!(sent(&mut rx), [answer("p-t1", 5, false)]);
+        // Several keys read at once, and keys that aren't y/n, answer nothing.
+        app.on_input(b"\x1b[B");
+        app.on_input(b"yn");
+        app.on_input(b"x");
+        assert!(sent(&mut rx).is_empty());
+        // Esc closes the panel.
+        app.on_input(b"\x1b");
+        assert!(app.m.approvals.is_none());
+    }
+
+    #[test]
+    fn panel_selection_follows_the_request_when_the_list_changes() {
+        let (mut app, mut rx) = asking_app();
+        app.on_input(b"\x01a");
+        app.on_input(b"\x1b[B");
+        // t1 is answered elsewhere (the app) and drops out of the list while t2 is selected: `y` still means t2.
+        app.on_msg(FromDaemon::Sessions {
+            sessions: vec![held("t2", 9, "Edit(src/main.rs)", 2_000), shell("t3")],
+        });
+        sent(&mut rx); // The attached session left the list, so the client attaches elsewhere.
+        app.on_input(b"y");
+        assert_eq!(sent(&mut rx), [answer("p-t2", 9, true)]);
+        // A selection that went away (t2 was released) answers nothing until the user selects again.
+        let (mut app, mut rx) = asking_app();
+        app.on_input(b"\x01a\x1b[B");
+        app.on_msg(FromDaemon::Sessions {
+            sessions: vec![held("t1", 5, "Bash(npm run deploy)", 1_000), shell("t3")],
+        });
+        app.on_input(b"y");
+        assert!(sent(&mut rx).is_empty());
+        app.on_input(b"\x1b[B");
+        app.on_input(b"y");
+        assert_eq!(sent(&mut rx), [answer("p-t1", 5, true)]);
+    }
+
+    #[test]
+    fn panel_needs_a_daemon_that_announced_ask() {
+        let (mut app, mut rx) = asking_app();
+        app.ask = false;
+        app.on_input(b"\x01a");
+        assert!(app.m.approvals.is_none());
+        assert!(!app.m.message.is_empty());
+        app.on_input(b"y");
+        assert!(
+            sent(&mut rx)
+                .iter()
+                .all(|m| !matches!(m, ToDaemon::Answer { .. }))
+        );
+    }
+
+    #[test]
+    fn panel_covers_the_session_and_is_not_viewing_it() {
+        let (mut app, mut rx) = asking_app();
+        app.presence = true;
+        app.sync_presence(Instant::now());
+        assert!(matches!(
+            sent(&mut rx)[..],
+            [ToDaemon::Presence {
+                viewing: Some(_),
+                ..
+            }]
+        ));
+        app.on_input(b"\x01a");
+        // While the panel covers the terminal, other keys don't reach the session and it counts as not viewed.
+        app.on_input(b"a");
+        app.on_action(Action::Paste(b"p".to_vec()));
+        app.sync_presence(Instant::now());
+        let sent = sent(&mut rx);
+        assert!(
+            !sent.iter().any(|m| matches!(m, ToDaemon::Input { .. })),
+            "{sent:?}"
+        );
+        assert!(
+            sent.iter()
+                .any(|m| matches!(m, ToDaemon::Presence { viewing: None, .. })),
+            "{sent:?}"
+        );
+    }
+
+    #[test]
+    fn ctrl_a_n_still_next_session() {
+        let (mut app, mut rx) = started_app(&["t1", "t2"]);
+        app.ask = true;
+        assert_eq!(app.m.attached.as_deref(), Some("p-t1"));
+        // Outside the panel, `⌃a n` and `⌃a p` step through the sessions as before.
+        app.on_input(b"\x01n");
+        assert_eq!(app.m.attached.as_deref(), Some("p-t2"));
+        app.on_input(b"\x01p");
+        assert_eq!(app.m.attached.as_deref(), Some("p-t1"));
+        assert!(app.m.approvals.is_none());
+        sent(&mut rx);
+        // With the panel open, a session key closes it and switches.
+        app.on_input(b"\x01a");
+        app.on_input(b"\x01n");
+        assert!(app.m.approvals.is_none());
+        assert_eq!(app.m.attached.as_deref(), Some("p-t2"));
     }
 }

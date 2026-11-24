@@ -14,6 +14,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
+use crate::client::approvals::{self, Panel};
 use crate::client::launcher;
 use mine_core::launch::{self, Choice};
 use mine_core::profiles::ProfileInfo;
@@ -73,6 +74,8 @@ pub struct Model {
     pub status: Option<String>,
     /// Draws the launcher (`launcher`) in the terminal pane. True when no session is attached and while it's open via `⌃a c`.
     pub launcher: bool,
+    /// The approvals panel (`⌃a a`), drawn in the terminal pane over the session and the launcher while it is open.
+    pub approvals: Option<Panel>,
     /// The profiles the daemon sent last (`FromDaemon::Profiles`), in launcher order. Empty until the first list arrives.
     pub profiles: Vec<ProfileInfo>,
 }
@@ -155,7 +158,8 @@ const RAIL_W: u16 = 4;
 const LIST_W: u16 = 30;
 /// Blank space at the right end of a list row. Keeps the chip from touching the terminal pane.
 const GUTTER: usize = 1;
-const KEYS: &str = "⌃a n/p sessions · ( ) projects · c new · x close · b list · d detach";
+const KEYS: &str =
+    "⌃a n/p sessions · a approvals · ( ) projects · c new · x close · b list · d detach";
 
 const fn rgb(hex: u32) -> Color {
     Color::Rgb((hex >> 16) as u8, (hex >> 8) as u8, hex as u8)
@@ -166,7 +170,7 @@ const DARK: Color = rgb(0x1e2128);
 const ALL_BG: Color = rgb(0x3a3d45);
 const ALL_FG: Color = rgb(0xd0d3da);
 const MARK: Color = rgb(0xe6e6e6);
-const YELLOW: Color = rgb(0xe5c07b);
+pub(super) const YELLOW: Color = rgb(0xe5c07b);
 const CYAN: Color = rgb(0x56b6c2);
 const GREEN: Color = rgb(0x98c379);
 pub(super) const MUTED: Color = rgb(0x6b707a);
@@ -217,7 +221,10 @@ pub fn draw(f: &mut Frame, m: &Model, screen: Option<&Screen>) {
         f.render_widget(Paragraph::new(lines), list);
     }
     paint_edges(f.buffer_mut(), &a);
-    if m.launcher {
+    if let Some(panel) = &m.approvals {
+        let entries = approvals::entries(&m.sessions);
+        approvals::draw(f.buffer_mut(), a.term, &entries, panel.selected(&entries));
+    } else if m.launcher {
         launcher::draw(f.buffer_mut(), a.term, m.project(), &m.profiles);
     } else if let Some(sc) = screen {
         draw_term(f.buffer_mut(), a.term, sc);
@@ -252,6 +259,10 @@ pub fn hit(a: &Areas, m: &Model, col: u16, row: u16) -> Hit {
         };
     }
     if a.term.contains(pos) {
+        // The approvals panel is keys only: a click in the pane reaches neither it nor the session beneath.
+        if m.approvals.is_some() {
+            return Hit::None;
+        }
         // While the launcher covers the session pane, only the chosen rows can be clicked.
         if m.launcher {
             return launcher::hit(a.term, col, row, &m.profiles).map_or(Hit::None, Hit::Launch);
@@ -665,7 +676,9 @@ fn draw_status(f: &mut Frame, area: Rect, m: &Model) {
                 )),
             }
             if m.message.is_empty() {
-                let keys = if m.launcher {
+                let keys = if m.approvals.is_some() {
+                    approvals::KEYS.to_string()
+                } else if m.launcher {
                     launcher::keys(&m.profiles)
                 } else {
                     KEYS.to_string()
@@ -749,6 +762,7 @@ mod tests {
             toggled: Vec::new(),
             status: None,
             launcher: false,
+            approvals: None,
             profiles: builtin(),
         }
     }
@@ -1208,5 +1222,37 @@ mod tests {
         assert!(text(&buf).contains("hello") && !text(&buf).contains("personal"));
         assert!(row_text(&buf, 19).ends_with("d detach"));
         assert_eq!(hit(&a, &m, a.term.x, a.term.y), Hit::Term(0, 0));
+    }
+
+    #[test]
+    fn approvals_panel_replaces_the_term_pane_the_launcher_and_the_status_hint() {
+        use mine_core::session::PendingAsk;
+        let mut sc = Screen::new(20, 3);
+        sc.feed(b"hello");
+        let mut held = s("/p/kyoto", "billing", Approval, "claude-b", None);
+        held.pending = Some(PendingAsk {
+            request: 4,
+            summary: "Bash(npm run deploy)".into(),
+            since_ms: 1,
+        });
+        let mut m = model(vec![held]);
+        m.launcher = true;
+        m.approvals = Some(Panel::open(&approvals::entries(&m.sessions)));
+        let a = layout(Rect::new(0, 0, 100, 20), true);
+        let buf = render_with_screen(&m, &sc, 100, 20);
+        // The panel is in the terminal pane, over the session and over the launcher; clicks in the pane go nowhere.
+        assert!(text(&buf).contains("Approvals"));
+        assert!(row_of(&buf, "▸").contains("kyoto/billing · Bash(npm run deploy)"));
+        assert!(!text(&buf).contains("hello") && !text(&buf).contains("1  personal"));
+        assert!(row_text(&buf, 19).ends_with(approvals::KEYS));
+        assert_eq!(hit(&a, &m, a.term.x, a.term.y), Hit::None);
+        // Closed, the launcher is back, and the usual hints list the key that opens the panel.
+        m.approvals = None;
+        assert!(text(&render_with_screen(&m, &sc, 100, 20)).contains("1  personal"));
+        m.launcher = false;
+        m.attached = Some("k-billing".into());
+        let buf = render_with_screen(&m, &sc, 100, 20);
+        assert!(text(&buf).contains("hello"));
+        assert!(row_text(&buf, 19).contains("a approvals"));
     }
 }

@@ -255,6 +255,12 @@ impl Workspace {
         self.changed(window, cx);
     }
 
+    /// A row's or tab's Allow or Deny. The list changes when the daemon publishes the decision, so there is nothing to redraw here.
+    pub fn answer(&mut self, id: &str, request: u64, allow: bool) {
+        let effects = self.model.answer(id, request, allow);
+        self.apply(effects);
+    }
+
     pub fn new_task(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.model.new_task();
         self.changed(window, cx);

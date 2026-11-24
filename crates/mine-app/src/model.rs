@@ -142,6 +142,8 @@ pub struct Model {
     focused: bool,
     /// The daemon on this connection announced `presence`: report with `Presence` instead of `Focus`.
     presence: bool,
+    /// The daemon on this connection announced `ask`: it holds permission requests, so rows show `pending` and take `Answer`.
+    ask: bool,
     report: PresenceReport,
 }
 
@@ -172,6 +174,7 @@ impl Model {
             profiles: Vec::new(),
             focused: false,
             presence: false,
+            ask: false,
             report: PresenceReport::default(),
         }
     }
@@ -234,6 +237,7 @@ impl Model {
                 self.offline = None;
                 self.listed = false;
                 self.presence = features.iter().any(|f| f == "presence");
+                self.ask = features.iter().any(|f| f == "ask");
                 self.report.reset();
                 let mut effects = vec![
                     Effect::Send(ToDaemon::List),
@@ -690,6 +694,28 @@ impl Model {
             self.mouse.clear();
         }
         moved
+    }
+
+    /// The held request the Allow and Deny buttons of row or tab `s` answer. `None` hides them: the row holds nothing, the daemon
+    /// didn't announce `ask`, or there is no connection to answer over.
+    pub fn answerable(&self, s: &SessionInfo) -> Option<u64> {
+        s.pending
+            .as_ref()
+            .filter(|_| self.ask && self.connected)
+            .map(|p| p.request)
+    }
+
+    /// Allow (`allow`) or Deny for `request` of session `id`: the one the clicked row or tab showed, not whichever is pending now. A
+    /// request that has been decided or let go since is ignored by the daemon.
+    pub fn answer(&self, id: &str, request: u64, allow: bool) -> Vec<Effect> {
+        if !(self.ask && self.connected) {
+            return Vec::new();
+        }
+        vec![Effect::Send(ToDaemon::Answer {
+            id: id.to_string(),
+            request,
+            allow,
+        })]
     }
 
     /// Sends key input and paste to the attached session. A scrolled-back screen is returned to the bottom. With no
@@ -1760,5 +1786,67 @@ pub(crate) mod tests {
             ("Working", false)
         );
         assert_eq!(group_label(&SessionState::Ended), "Done");
+    }
+
+    /// A model on a connection whose daemon announced `ask`, listing `rows`.
+    fn asking(rows: Vec<SessionInfo>) -> Model {
+        let mut m = Model::new(PathBuf::from("/p"));
+        m.on_link(LinkEvent::Connected(vec!["ask".into()]));
+        listed(&mut m, rows);
+        m
+    }
+
+    /// A session of `/p` that is holding request `request`.
+    fn held(name: &str, request: u64) -> SessionInfo {
+        let mut row = s("/p", name, SessionState::Approval);
+        row.pending = Some(mine_core::session::PendingAsk {
+            request,
+            summary: "Bash(npm run deploy)".into(),
+            since_ms: 1_000,
+        });
+        row
+    }
+
+    fn answer_msg(id: &str, request: u64, allow: bool) -> Effect {
+        Effect::Send(ToDaemon::Answer {
+            id: id.into(),
+            request,
+            allow,
+        })
+    }
+
+    #[test]
+    fn allow_button_sends_answer_with_request_id() {
+        // Two rows hold different requests: each button answers its own row's, never the latest or the first.
+        let m = asking(vec![held("t1", 7), held("t2", 9)]);
+        let (first, second) = (m.answerable(&m.sessions[0]), m.answerable(&m.sessions[1]));
+        assert_eq!((first, second), (Some(7), Some(9)));
+        assert_eq!(m.answer("k-t2", 9, true), [answer_msg("k-t2", 9, true)]);
+        assert_eq!(m.answer("k-t1", 7, true), [answer_msg("k-t1", 7, true)]);
+    }
+
+    #[test]
+    fn deny_button_sends_deny() {
+        let m = asking(vec![held("t1", 7)]);
+        assert_eq!(m.answer("k-t1", 7, false), [answer_msg("k-t1", 7, false)]);
+    }
+
+    #[test]
+    fn buttons_only_on_pending_rows() {
+        let m = asking(vec![held("t1", 7), s("/p", "t2", SessionState::Approval)]);
+        assert_eq!(m.answerable(&m.sessions[0]), Some(7));
+        // Needs approval by hook state alone (no held request) has nothing to answer.
+        assert_eq!(m.answerable(&m.sessions[1]), None);
+        // A daemon that didn't announce `ask` never gets an answer, even if a row carries `pending`.
+        let mut old = Model::new(PathBuf::from("/p"));
+        old.on_link(LinkEvent::Connected(vec!["presence".into()]));
+        listed(&mut old, vec![held("t1", 7)]);
+        assert_eq!(old.answerable(&old.sessions[0]), None);
+        assert!(old.answer("k-t1", 7, true).is_empty());
+        // Nothing goes out while disconnected.
+        let mut m = asking(vec![held("t1", 7)]);
+        m.on_link(LinkEvent::Disconnected("gone".into()));
+        assert_eq!(m.answerable(&m.sessions[0]), None);
+        assert!(m.answer("k-t1", 7, true).is_empty());
     }
 }

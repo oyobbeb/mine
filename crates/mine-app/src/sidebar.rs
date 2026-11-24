@@ -3,8 +3,8 @@
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AnyElement, Axis, Context, FontWeight, InteractiveElement, IntoElement, ParentElement,
-    StatefulInteractiveElement, Styled, div, px, rgb,
+    AnyElement, Axis, Context, ElementId, FontWeight, InteractiveElement, IntoElement, MouseButton,
+    ParentElement, StatefulInteractiveElement, Styled, div, px, rgb,
 };
 use gpui_component::{StyledExt, h_flex, v_flex};
 use mine_core::launch;
@@ -276,6 +276,61 @@ fn session_row(m: &Model, i: usize, cx: &mut Context<Workspace>) -> impl IntoEle
                         .child(status.to_string()),
                 ),
         )
+        .children(
+            m.answerable(s)
+                .map(|request| answer_buttons(&s.meta.id, request, cx)),
+        )
+}
+
+/// The element id of the `label` button (Allow or Deny) for held request `request` of session `session`.
+///
+/// It must never be a position. gpui remembers a press in progress by the element's id path across redraws, and fires the click from
+/// the frame drawn at the release. With an id that is only the label under a positional row, a list update between press and release
+/// that moves another held row into this slot would let a press begun on one request finish on the other. Named by session, request
+/// and action, a press can only complete on the same request it began on.
+///
+/// ponytail: the id construction is unit-tested; the click path itself (gpui press state across redraws) is not, since it needs gpui's
+/// test context. Add that if the buttons grow more behavior.
+fn button_id(label: &str, session: &str, request: u64) -> ElementId {
+    ElementId::NamedInteger(format!("{label}:{session}").into(), request)
+}
+
+/// Allow and Deny for held request `request` of session `id`. Each answers exactly that request, the one the row or tab showed when it
+/// was drawn. A press on them stays on them: it doesn't also select the row or tab underneath. Tabs use it too.
+pub fn answer_buttons(id: &str, request: u64, cx: &Context<Workspace>) -> impl IntoElement {
+    let button = |label: &'static str, allow: bool| {
+        let session = id.to_string();
+        div()
+            .id(button_id(label, id, request))
+            .flex_shrink_0()
+            .px_1p5()
+            .h(px(18.))
+            .flex()
+            .items_center()
+            .rounded(px(4.))
+            .text_size(px(11.))
+            .cursor_pointer()
+            // The parent's click starts from its own mouse-down, so stopping this one keeps the row from selecting itself.
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(move |ws, _, _, _| ws.answer(&session, request, allow)))
+            .map(|this| {
+                if allow {
+                    this.bg(rgb(APPROVAL))
+                        .text_color(rgb(CHIP_FG))
+                        .font_weight(FontWeight::BOLD)
+                } else {
+                    this.border_1()
+                        .border_color(rgb(BORDER))
+                        .text_color(rgb(MUTED))
+                        .hover(|s| s.bg(rgb(SELECTED_BG)))
+                }
+            })
+            .child(label)
+    };
+    h_flex()
+        .gap_1p5()
+        .child(button("Allow", true))
+        .child(button("Deny", false))
 }
 
 /// The chip of a session's profile: its letter on its color. A shell, or a profile that isn't in the list, has none. Tabs use it too.
@@ -317,4 +372,21 @@ fn add_project(cx: &mut Context<Workspace>) -> impl IntoElement {
         .hover(|s| s.text_color(rgb(TEXT)))
         .child("＋ Add project")
         .on_click(cx.listener(|ws, _, _, cx| ws.add_project(cx)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A button's id carries the session, the request and the action, so it can't be taken over by another row that moves into the same slot.
+    #[test]
+    fn answer_button_ids_name_the_session_request_and_action() {
+        let allow = button_id("Allow", "k-t1", 5);
+        // The same button keeps its id across redraws (a press in progress must still find its element).
+        assert_eq!(allow, button_id("Allow", "k-t1", 5));
+        // Anything that differs gives another element: the other action, another session, or a newer request of the same session.
+        assert_ne!(allow, button_id("Deny", "k-t1", 5));
+        assert_ne!(allow, button_id("Allow", "k-t2", 5));
+        assert_ne!(allow, button_id("Allow", "k-t1", 6));
+    }
 }
