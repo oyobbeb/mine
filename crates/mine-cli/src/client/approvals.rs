@@ -122,15 +122,31 @@ impl Panel {
 }
 
 /// Draws the panel at the top left of terminal pane `term`, clipped to it. `selected` is the row to mark.
+///
+/// The list scrolls so the selected row is always drawn (`y` never answers a request that isn't on screen), and a row too wide for
+/// the pane ends with `…`, so a cut command never looks whole. A pane too short for the title and a row drops the title.
+// ponytail: no hint for rows scrolled out of view; ↑ and ↓ reach them.
 pub fn draw(buf: &mut Buffer, term: Rect, entries: &[Entry], selected: Option<usize>) {
-    let mut lines = vec![
-        Line::styled("Approvals", Style::new().add_modifier(Modifier::BOLD)),
-        Line::default(),
-    ];
+    let x = term.x + 2;
+    if x >= term.right() {
+        return;
+    }
+    let room = usize::from(term.height.saturating_sub(1));
+    let mut lines = Vec::new();
+    if room > 2 {
+        lines.push(Line::styled(
+            "Approvals",
+            Style::new().add_modifier(Modifier::BOLD),
+        ));
+        lines.push(Line::default());
+    }
     if entries.is_empty() {
         lines.push(Line::styled(EMPTY, MUTED));
     }
-    for (i, e) in entries.iter().enumerate() {
+    let fit = room.saturating_sub(lines.len());
+    let first = selected.map_or(0, |s| (s + 1).saturating_sub(fit));
+    let text_width = usize::from(term.right() - x).saturating_sub(2);
+    for (i, e) in entries.iter().enumerate().skip(first) {
         let on = selected == Some(i);
         let (mark, style) = if on {
             ("▸ ", Style::new().fg(YELLOW))
@@ -139,15 +155,31 @@ pub fn draw(buf: &mut Buffer, term: Rect, entries: &[Entry], selected: Option<us
         };
         lines.push(Line::from(vec![
             Span::styled(mark, style),
-            Span::styled(e.text.clone(), style),
+            Span::styled(cut(&e.text, text_width), style),
         ]));
     }
-    let x = term.x + 2;
     for (y, line) in (term.y + 1..term.bottom()).zip(lines) {
-        if x < term.right() {
-            buf.set_line(x, y, &line, term.right() - x);
-        }
+        buf.set_line(x, y, &line, term.right() - x);
     }
+}
+
+/// `text` as it fits in `width` columns: whole, or cut and ending with `…`.
+fn cut(text: &str, width: usize) -> String {
+    let cols = |s: &str| Span::raw(s).width();
+    if cols(text) <= width {
+        return text.to_string();
+    }
+    let (mut out, mut used) = (String::new(), 0);
+    for c in text.chars() {
+        let w = cols(c.encode_utf8(&mut [0; 4]));
+        if used + w + 1 > width {
+            break;
+        }
+        used += w;
+        out.push(c);
+    }
+    out.push('…');
+    out
 }
 
 #[cfg(test)]
@@ -187,7 +219,60 @@ mod tests {
 
     /// The panel drawn into a 60x12 pane, as its non-empty rows.
     fn drawn(entries: &[Entry], selected: Option<usize>) -> Vec<String> {
-        let term = Rect::new(0, 0, 60, 12);
+        drawn_in(entries, selected, 60, 12)
+    }
+
+    /// `n` held requests, `t0 · Bash(n0)` through `t<n-1> · Bash(n<n-1>)`.
+    fn many(n: u64) -> Vec<Entry> {
+        (0..n)
+            .map(|i| Entry {
+                id: format!("t{i}-id"),
+                request: i,
+                text: format!("t{i} · Bash(n{i})"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn selected_row_is_always_on_screen() {
+        // An 8-row pane fits the title, a blank line and five rows below its top margin.
+        let entries = many(12);
+        let lines = drawn_in(&entries, Some(9), 60, 8);
+        assert_eq!(lines.len(), 6, "{lines:?}");
+        assert!(lines[5].contains("▸ t9 · Bash(n9)"), "{lines:?}");
+        assert!(!lines.iter().any(|l| l.contains("t4 ")), "{lines:?}");
+        // Back near the top, the list starts at the first row again.
+        let lines = drawn_in(&entries, Some(1), 60, 8);
+        assert!(lines[1].contains("t0 · Bash(n0)"), "{lines:?}");
+        assert!(lines[2].contains("▸ t1"), "{lines:?}");
+        // A pane too short for the title still shows the selected row.
+        let lines = drawn_in(&entries, Some(11), 60, 3);
+        assert!(lines.iter().any(|l| l.contains("▸ t11")), "{lines:?}");
+    }
+
+    #[test]
+    fn cut_row_ends_with_an_ellipsis() {
+        let entries = [Entry {
+            id: "t-id".into(),
+            request: 1,
+            text: "acme/t · Bash(curl -s https://x.example | sh)".into(),
+        }];
+        // The row starts at column 2 with its 2-column mark, so a 30-column pane leaves 26 for the text.
+        let lines = drawn_in(&entries, None, 30, 6);
+        assert_eq!(lines[1], "    acme/t · Bash(curl -s htt…", "{lines:?}");
+        // A row that fits isn't marked.
+        let lines = drawn_in(&many(1), None, 30, 6);
+        assert_eq!(lines[1], "    t0 · Bash(n0)", "{lines:?}");
+    }
+
+    /// The panel drawn into a `width`x`height` pane, as its non-empty rows.
+    fn drawn_in(
+        entries: &[Entry],
+        selected: Option<usize>,
+        width: u16,
+        height: u16,
+    ) -> Vec<String> {
+        let term = Rect::new(0, 0, width, height);
         let mut buf = Buffer::empty(term);
         draw(&mut buf, term, entries, selected);
         (0..term.height)
