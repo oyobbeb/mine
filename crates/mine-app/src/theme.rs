@@ -1,38 +1,38 @@
-//! 사용자가 승인한 목업 색과 터미널 색. 값은 GPUI `rgb()`에 넘기는 `0xrrggbb`다.
+//! The mockup colors the user approved, and the terminal colors. Values are the `0xrrggbb` passed to GPUI `rgb()`.
 
 use gpui::{App, Hsla, rgb};
 use gpui_component::{Theme, ThemeMode};
 
-/// 창 바탕.
+/// Window background.
 pub const WINDOW_BG: u32 = 0x1e2128;
-/// 왼쪽 목록 바탕.
+/// Left list background.
 pub const LIST_BG: u32 = 0x23252b;
-/// 제목줄과 띠.
+/// Title bar and strips.
 pub const BAR_BG: u32 = 0x1b1d23;
-/// 선택한 줄, 누를 수 있는 줄에 마우스를 올렸을 때.
+/// Selected row, and a clickable row while the mouse is over it.
 pub const SELECTED_BG: u32 = 0x2f323a;
 pub const BORDER: u32 = 0x2c2f36;
 pub const TEXT: u32 = 0xd0d3da;
 pub const TITLE: u32 = 0xe6e6e6;
-/// 흐린 글(묶음 이름, 둘째 줄).
+/// Dim text (group names, second line).
 pub const MUTED: u32 = 0x8a8f99;
-/// 더 흐린 글(개수, 단축키, 안내).
+/// Dimmer text (counts, shortcuts, hints).
 pub const FAINT: u32 = 0x6b707a;
-/// 승인 대기 세션의 대기 문구.
+/// The waiting text of a session that needs approval.
 pub const WAITING: u32 = 0xc9a85c;
-/// 승인 대기 기호 ◆.
+/// The Needs approval symbol ◆.
 pub const APPROVAL: u32 = 0xe5c07b;
-/// 작업 중 기호 ◐와 끝남 기호 ✓. TUI 목록과 같은 색이다.
+/// The Working symbol ◐ and the Done symbol ✓. Same colors as the TUI list.
 pub const WORKING: u32 = 0x56b6c2;
 pub const DONE: u32 = 0x98c379;
-/// 계정 칩: claude-a, claude-b, codex.
+/// Account chips: claude-a, claude-b, codex.
 pub const CHIP_A: u32 = 0xe5c07b;
 pub const CHIP_B: u32 = 0xc678dd;
 pub const CHIP_C: u32 = 0x56b6c2;
-/// 칩 글자색.
+/// Chip text color.
 pub const CHIP_FG: u32 = 0x1e2128;
 
-/// 터미널 기본 글과 바탕. 앱은 붙을 때 이 두 색을 `ToDaemon::Colors`로 데몬에 보낸다.
+/// Default terminal text and background. On connect, the app sends these two colors to the daemon with `ToDaemon::Colors`.
 pub const TERM_FG: u32 = 0xd0d3da;
 pub const TERM_BG: u32 = 0x1e2128;
 pub const TERM_CURSOR: u32 = 0xd0d3da;
@@ -43,7 +43,7 @@ pub const ANSI: [u32; 16] = [
     0x5c6370, 0xef8a92, 0xb5d99c, 0xf0d197, 0x8cc5f5, 0xd898e6, 0x7fcbd5, 0xffffff,
 ];
 
-/// 256색 팔레트의 `i`번 색. 0–15는 [`ANSI`], 16–231은 xterm 6×6×6 큐브, 232–255는 회색 단계다.
+/// Color number `i` of the 256-color palette. 0–15 are [`ANSI`], 16–231 are the xterm 6×6×6 cube, and 232–255 are the gray ramp.
 pub fn indexed(i: u8) -> u32 {
     const LEVELS: [u32; 6] = [0, 95, 135, 175, 215, 255];
     match i {
@@ -64,12 +64,12 @@ pub fn indexed(i: u8) -> u32 {
     }
 }
 
-/// `#rrggbb` 문자열.
+/// A `#rrggbb` string.
 pub fn hex(color: u32) -> String {
     format!("#{color:06x}")
 }
 
-/// 계정 칩의 글자와 바탕색. claude-a `A`, claude-b `B`, codex `C`이고 그 밖(shell)은 칩이 없다.
+/// Text and background colors of an account chip. claude-a is `A`, claude-b is `B`, codex is `C`, and anything else (shell) has no chip.
 pub fn chip(account: Option<&str>) -> Option<(&'static str, u32)> {
     match account? {
         "claude-a" => Some(("A", CHIP_A)),
@@ -83,7 +83,7 @@ fn hsla(color: u32) -> Hsla {
     rgb(color).into()
 }
 
-/// `gpui-component` 테마를 어두운 판으로 두고 목업 색을 입힌다. 시스템이 밝은 모양이어도 같은 색이다.
+/// Sets the `gpui-component` theme to the dark variant and applies the mockup colors. The colors are the same even if the system appearance is light.
 pub fn install(cx: &mut App) {
     Theme::change(ThemeMode::Dark, None, cx);
     let t = Theme::global_mut(cx);
@@ -101,7 +101,7 @@ pub fn install(cx: &mut App) {
     t.scrollbar = hsla(LIST_BG);
     t.scrollbar_thumb = hsla(SELECTED_BG);
     t.scrollbar_thumb_hover = hsla(BORDER);
-    // 입력 상자(실행 화면의 `n`): 테두리는 경계색, 포커스 테두리는 흐린 글색, 커서는 글색이다.
+    // Input box (the launcher's `n`): the border is the border color, the focus border is the dim text color, and the cursor is the text color.
     t.input = hsla(BORDER);
     t.ring = hsla(MUTED);
     t.caret = hsla(TEXT);

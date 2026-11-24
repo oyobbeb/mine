@@ -1,4 +1,4 @@
-//! 시작 화면(런처)의 화면과 상관없는 부분: 고를 수 있는 것, 새 이름 정하기, 고른 줄이 만들 세션 명세, 경로 줄이기.
+//! The parts of the launcher (start screen) that don't depend on drawing: what can be picked, choosing a new name, the session spec a picked row creates, and shortening paths.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -7,8 +7,8 @@ use crate::accounts::Labels;
 use crate::session::{NewSession, SessionInfo};
 use crate::view;
 
-/// 시작 화면에서 고를 수 있는 것. `Typed`만 세션을 바로 만들지 않고, 종류·이름·모델을 직접 입력받는다
-/// ([`view::parse_new`] 형식).
+/// What can be picked on the start screen. Only `Typed` does not create a session right away; it takes the kind, name and model as typed input
+/// ([`view::parse_new`] format).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Choice {
     ClaudeA,
@@ -19,8 +19,8 @@ pub enum Choice {
 }
 
 impl Choice {
-    /// 종류 말: [`view::parse_new`]의 첫 낱말이다. shell 말고는 세션의 계정 이름(칩)과 같다. 직접 입력(`Typed`)은
-    /// `None`이다.
+    /// Kind word: the first word of [`view::parse_new`]. Except for shell, it is the same as the session's account name (chip). Custom input (`Typed`)
+    /// is `None`.
     pub const fn word(self) -> Option<&'static str> {
         match self {
             Choice::ClaudeA => Some("claude-a"),
@@ -31,8 +31,8 @@ impl Choice {
         }
     }
 
-    /// 실행 화면 줄에 글로 보일 이름. 계정이 있는 줄(claude-a, claude-b, codex)은 `labels`의 이름이고, shell은
-    /// 계정이 없어 `shell` 그대로다. 직접 입력은 설명이다. 세션을 만들 때 쓰는 말은 늘 [`Choice::word`]다.
+    /// Name shown as text on a launch-screen row. Rows with an account (claude-a, claude-b, codex) use the name from `labels`, and shell
+    /// has no account, so it stays `shell`. Custom input is a description. The word used when creating a session is always [`Choice::word`].
     pub fn label(self, labels: &Labels) -> &str {
         match self {
             Choice::ClaudeA | Choice::ClaudeB | Choice::Codex => {
@@ -44,7 +44,7 @@ impl Choice {
     }
 }
 
-/// `project`의 세션이 쓰지 않은 가장 작은 `t<N>`(N은 1부터). 끝난 세션의 이름도 쓴 것으로 센다.
+/// The smallest `t<N>` (N from 1) that no session of `project` uses. The names of ended sessions count as used too.
 pub fn next_name(sessions: &[SessionInfo], project: &Path) -> String {
     let used: HashSet<&str> = sessions
         .iter()
@@ -61,13 +61,13 @@ pub fn next_name(sessions: &[SessionInfo], project: &Path) -> String {
     }
 }
 
-/// 고른 줄이 만들 새 세션 명세. `Typed`는 명세가 아니라 입력을 여니 `None`이다.
+/// The spec of the new session a picked row creates. `Typed` opens input rather than being a spec, so it is `None`.
 pub fn new_session(choice: Choice, name: &str, project: &Path) -> Option<NewSession> {
     let word = choice.word()?;
     view::parse_new(&format!("{word} {name}"), project).ok()
 }
 
-/// 홈 아래 경로의 홈 부분을 `~`로 줄인다. 홈이 `/`나 빈 값이면 줄이지 않는다.
+/// Shortens the home part of a path under home to `~`. If home is `/` or empty, nothing is shortened.
 pub fn tilde(path: &Path, home: Option<&Path>) -> String {
     let rest = home
         .filter(|h| h.parent().is_some())
@@ -120,16 +120,16 @@ mod tests {
         use SessionState::*;
         assert_eq!(names("/p", &[]), "t1");
         assert_eq!(names("/p", &[("/p", "t1", Idle)]), "t2");
-        // 빈 자리를 채운다.
+        // Fill the gap.
         assert_eq!(names("/p", &[("/p", "t1", Idle), ("/p", "t3", Idle)]), "t2");
-        // 끝난 세션의 이름도 쓴 것으로 센다.
+        // The names of ended sessions count as used too.
         assert_eq!(
             names("/p", &[("/p", "t1", Ended), ("/p", "t2", Done)]),
             "t3"
         );
-        // 다른 프로젝트의 세션은 세지 않는다.
+        // Sessions of other projects are not counted.
         assert_eq!(names("/p", &[("/q", "t1", Idle), ("/q", "t2", Idle)]), "t1");
-        // `t<N>` 꼴이 아닌 이름과 앞에 0이 붙은 이름은 `t1`을 막지 않는다.
+        // Names that aren't of the form `t<N>` and names with a leading 0 don't block `t1`.
         assert_eq!(
             names("/p", &[("/p", "dev", Idle), ("/p", "t01", Idle)]),
             "t1"
@@ -153,7 +153,7 @@ mod tests {
                 None
             ]
         );
-        // 넷 모두 `parse_new`가 받는 말이고, 계정은 shell만 없다.
+        // All four are words `parse_new` accepts, and only shell has no account.
         for c in [ClaudeA, ClaudeB, Codex, Shell] {
             let word = c.word().unwrap();
             let spec = view::parse_new(&format!("{word} x"), Path::new("/p")).unwrap();
@@ -167,18 +167,19 @@ mod tests {
         let state = State {
             root: dir.path().to_path_buf(),
         };
-        let config = "[accounts.claude-a]\nlabel = \"개인\"\n[accounts.shell]\nlabel = \"쉘\"\n";
+        let config =
+            "[accounts.claude-a]\nlabel = \"personal\"\n[accounts.shell]\nlabel = \"terminal\"\n";
         std::fs::write(dir.path().join("config.toml"), config).unwrap();
         let labels = Labels::load(&state, None);
         let row = |c: Choice| c.label(&labels);
-        // 별칭이 있으면 별칭, 없으면 자동 이름(codex)이나 id(claude-b)다.
-        assert_eq!(row(Choice::ClaudeA), "개인");
+        // With a label, the label; without one, the auto name (codex) or the id (claude-b).
+        assert_eq!(row(Choice::ClaudeA), "personal");
         assert_eq!(row(Choice::ClaudeB), "claude-b");
         assert_eq!(row(Choice::Codex), "Codex");
-        // shell은 계정이 없어 별칭이 있어도 그대로다.
+        // Shell has no account, so it stays as is even if it has a label.
         assert_eq!(row(Choice::Shell), "shell");
         assert_eq!(row(Choice::Typed), "Custom name and model");
-        // 이름을 읽지 않은 기본값은 종류 말이다. 세션을 만드는 말은 이름과 무관하다.
+        // The default when names weren't read is the kind word. The word that creates a session is independent of the name.
         let ids = Labels::default();
         assert_eq!(Choice::ClaudeA.label(&ids), "claude-a");
         assert_eq!(Choice::ClaudeA.word(), Some("claude-a"));
@@ -223,7 +224,7 @@ mod tests {
         assert_eq!(t("/Users/me2/dev", home), "/Users/me2/dev");
         assert_eq!(t("/srv/app", home), "/srv/app");
         assert_eq!(t("/Users/me/dev", None), "/Users/me/dev");
-        // 홈이 `/`나 빈 값이면 모든 경로를 `~`로 줄이지 않는다.
+        // If home is `/` or empty, no path is shortened to `~`.
         assert_eq!(t("/srv/app", Some(Path::new("/"))), "/srv/app");
         assert_eq!(t("/srv/app", Some(Path::new(""))), "/srv/app");
     }

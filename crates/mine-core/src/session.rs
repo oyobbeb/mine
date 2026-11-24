@@ -1,4 +1,4 @@
-//! 세션 데이터 타입과 `meta.json` 저장.
+//! Session data types and `meta.json` storage.
 
 use std::fs::{self, File};
 use std::io::Write;
@@ -11,7 +11,7 @@ use serde_json::json;
 
 use crate::paths::State;
 
-/// 세션이 띄우는 프로그램 종류.
+/// Kind of program a session runs.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum Kind {
     Claude,
@@ -19,7 +19,7 @@ pub enum Kind {
     Shell,
 }
 
-/// 목록에 보이는 세션 상태.
+/// Session state shown in the list.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum SessionState {
     Approval,
@@ -29,7 +29,7 @@ pub enum SessionState {
     Ended,
 }
 
-/// 데몬이 다시 떠도 세션을 되살리는 방법. 기본값은 kind별로 정한다.
+/// How a session is brought back even after the daemon restarts. The default is chosen per kind.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum Restore {
     Resume,
@@ -37,7 +37,7 @@ pub enum Restore {
     None,
 }
 
-/// 새 세션을 만들 때 클라이언트가 보내는 명세.
+/// Spec the client sends when creating a new session.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct NewSession {
     pub project: PathBuf,
@@ -47,7 +47,7 @@ pub struct NewSession {
     pub model: Option<String>,
 }
 
-/// 세션 폴더의 `meta.json`에 저장되는 값.
+/// Value stored in the session directory's `meta.json`.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Meta {
     pub id: String,
@@ -62,7 +62,7 @@ pub struct Meta {
     pub closed: bool,
 }
 
-/// 데몬이 클라이언트에 알려 주는 세션 한 건.
+/// One session the daemon reports to clients.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct SessionInfo {
     pub meta: Meta,
@@ -73,12 +73,12 @@ pub struct SessionInfo {
 
 const META_FILE: &str = "meta.json";
 
-/// 세션 id는 `{프로젝트 키}-{이름}`이다.
+/// A session id is `{project key}-{name}`.
 pub fn session_id(project_key: &str, name: &str) -> String {
     format!("{project_key}-{name}")
 }
 
-/// 이름은 `^[A-Za-z0-9][A-Za-z0-9_~-]{0,63}$`이어야 한다.
+/// The name must match `^[A-Za-z0-9][A-Za-z0-9_~-]{0,63}$`.
 pub fn validate_name(name: &str) -> Result<()> {
     let ok = (1..=64).contains(&name.len())
         && name.starts_with(|c: char| c.is_ascii_alphanumeric())
@@ -94,7 +94,7 @@ pub fn validate_name(name: &str) -> Result<()> {
 }
 
 impl Meta {
-    /// `dir/meta.json`을 읽는다.
+    /// Reads `dir/meta.json`.
     pub fn load(dir: &Path) -> Result<Meta> {
         let path = dir.join(META_FILE);
         let bytes = fs::read(&path).with_context(|| format!("Couldn't read {}", path.display()))?;
@@ -102,7 +102,7 @@ impl Meta {
             .with_context(|| format!("Invalid meta.json format: {}", path.display()))
     }
 
-    /// `dir/meta.json`에 원자적으로 쓴다. 같은 폴더의 임시 파일에 쓴 뒤 이름을 바꾼다.
+    /// Writes `dir/meta.json` atomically: writes to a temporary file in the same directory, then renames it.
     pub fn save(&self, dir: &Path) -> Result<()> {
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let path = dir.join(META_FILE);
@@ -126,7 +126,7 @@ impl Meta {
     }
 }
 
-/// 보관 프로세스가 세션 자식으로 띄울 명령.
+/// Command the holder process starts as the session child.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Launch {
     pub argv: Vec<String>,
@@ -134,18 +134,18 @@ pub struct Launch {
     pub cwd: PathBuf,
 }
 
-/// 데몬을 띄운 셸에서 물려받았지만 세션 자식에게 넘기면 안 되는 환경 변수인가. 보관 프로세스를 띄울 때 지우고,
-/// 필요한 값은 [`launch`]가 다시 넣는다(`MINE_SESSION`, claude-b의 `CLAUDE_CONFIG_DIR`).
+/// Whether an environment variable was inherited from the shell that started the daemon but must not be passed on to the session child. It is removed when the holder process is started,
+/// and [`launch`] puts back the values that are needed (`MINE_SESSION`, claude-b's `CLAUDE_CONFIG_DIR`).
 ///
-/// tmux 안에서 띄운 데몬이면 `TMUX`가 tmux를 아는 도구를 바깥 tmux로 보내고, claude 세션 안에서 띄운 데몬이면
-/// `CLAUDECODE`가 중첩 실행을 막거나 `CLAUDE_CONFIG_DIR`가 claude-a 세션을 claude-b 계정으로 돌린다.
-/// 지우는 것은 실행 중인 Claude Code가 자식에게 설정하는 변수뿐이다. 사용자가 일부러 켠 `CLAUDE_*` 설정
-/// (`CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS`, `CLAUDE_CODE_USE_BEDROCK` 등)은 세션까지 그대로 넘긴다.
-/// 접두사로 지우는 `CLAUDE_CODE_SESSION_`은 세션 id, `CLAUDE_CODE_CHILD_`는 자식 세션 정보,
-/// `CLAUDE_CODE_MESSAGING_`은 메시징 소켓과 토큰이다. 토큰이 다른 세션으로 새면 안 된다.
-/// `MINE_STATE_DIR`는 훅(`mine _event`)이 이 데몬을 찾는 데 쓰므로 남긴다.
-// ponytail: 이 목록은 실행 중인 Claude Code 환경에서 관찰한 변수들이다. Claude Code가 새 런타임 변수를 추가하면 늘려야 한다.
-// ponytail: SSH_*(SSH_AUTH_SOCK 등)는 그대로 둔다. 원격 호스트를 다루는 5단계에서 정한다.
+/// If the daemon was started inside tmux, `TMUX` sends tmux-aware tools to the outer tmux; if it was started inside a claude session,
+/// `CLAUDECODE` blocks nested runs or `CLAUDE_CONFIG_DIR` runs a claude-a session under the claude-b account.
+/// Only the variables a running Claude Code sets for its children are removed. `CLAUDE_*` settings the user turned on on purpose
+/// (`CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS`, `CLAUDE_CODE_USE_BEDROCK`, etc.) are passed through to the session unchanged.
+/// Of the prefixes removed, `CLAUDE_CODE_SESSION_` is the session id, `CLAUDE_CODE_CHILD_` is child session info,
+/// and `CLAUDE_CODE_MESSAGING_` is the messaging socket and token. A token must not leak into another session.
+/// `MINE_STATE_DIR` is kept because the hook (`mine _event`) uses it to find this daemon.
+// ponytail: this list is the variables observed in a running Claude Code environment. Extend it if Claude Code adds new runtime variables.
+// ponytail: SSH_* (SSH_AUTH_SOCK, etc.) is left as is. It will be decided in stage 5, which handles remote hosts.
 pub fn is_leaked_env(name: &str) -> bool {
     matches!(
         name,
@@ -169,7 +169,7 @@ pub fn is_leaked_env(name: &str) -> bool {
     .any(|prefix| name.starts_with(prefix))
 }
 
-/// 로그인 셸 경로. `SHELL`이 비어 있거나 없으면 `/bin/zsh`다.
+/// Login shell path. `/bin/zsh` if `SHELL` is empty or unset.
 pub fn login_shell() -> String {
     std::env::var("SHELL")
         .ok()
@@ -177,7 +177,7 @@ pub fn login_shell() -> String {
         .unwrap_or_else(|| "/bin/zsh".to_string())
 }
 
-/// 셸이 한 단어로 읽도록 POSIX 작은따옴표로 감싼다. 안전한 글자만 있으면 그대로 둔다.
+/// Wraps in POSIX single quotes so the shell reads it as one word. Left as is if it has only safe characters.
 pub(crate) fn shell_quote(s: &str) -> String {
     let plain = !s.is_empty()
         && s.chars().all(|c| {
@@ -191,7 +191,7 @@ pub(crate) fn shell_quote(s: &str) -> String {
     }
 }
 
-/// 훅이 부르는 명령 줄 `<exe> _event <세션 폴더>`.
+/// The command line the hook runs: `<exe> _event <session dir>`.
 fn hook_command(exe: &Path, session_dir: &Path) -> String {
     format!(
         "{} _event {}",
@@ -200,7 +200,7 @@ fn hook_command(exe: &Path, session_dir: &Path) -> String {
     )
 }
 
-/// 세션 종류별 실행 명령을 만든다. claude와 codex에는 상태 훅을 주입한다.
+/// Builds the launch command for each session kind. State hooks are injected into claude and codex.
 pub fn launch(meta: &Meta, state: &State, exe: &Path) -> Launch {
     let mut env = vec![("MINE_SESSION".to_string(), meta.id.clone())];
     let command = hook_command(exe, &state.session_dir(&meta.id));
@@ -235,7 +235,7 @@ pub fn launch(meta: &Meta, state: &State, exe: &Path) -> Launch {
             }
         }
         Kind::Codex => {
-            // `-c` 값은 JSON이 아니라 TOML이다. JSON 문자열 이스케이프는 TOML 기본 문자열에도 통한다.
+            // The `-c` value is TOML, not JSON. JSON string escaping also works for TOML basic strings.
             let value = format!(
                 "[{{hooks=[{{type=\"command\",command={}}}]}}]",
                 json!(command)
@@ -306,7 +306,7 @@ mod tests {
         let m = sample_meta();
         m.save(t.path()).unwrap();
         assert_eq!(Meta::load(t.path()).unwrap(), m);
-        // 덮어써도 성공하고, 임시 파일이 남지 않는다.
+        // Overwriting succeeds, and no temporary file is left behind.
         let m2 = Meta {
             closed: true,
             restore: Restore::Resume,
@@ -459,7 +459,7 @@ mod tests {
         assert_eq!(l.argv.iter().filter(|a| *a == "-c").count(), 2);
         assert_eq!(session_env(&l), Some("k1-rust"));
         assert!(!l.env.iter().any(|(k, _)| k == "CLAUDE_CONFIG_DIR"));
-        // TOML 값 안의 문자열은 JSON 문자열로 읽혀 원래 명령이 되어야 한다.
+        // A string inside a TOML value must read as a JSON string and give back the original command.
         let arg = l
             .argv
             .iter()
@@ -504,7 +504,7 @@ mod tests {
         ] {
             assert!(is_leaked_env(leaked), "{leaked}");
         }
-        // 사용자가 정한 CLAUDE_* 설정은 세션까지 넘어간다.
+        // `CLAUDE_*` settings the user chose are passed through to the session.
         for kept in [
             "PATH",
             "HOME",

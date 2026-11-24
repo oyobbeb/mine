@@ -1,5 +1,5 @@
-//! 데몬 연결. 데몬이 없으면 띄운다. 헤드리스 명령(`mine ls`, `new`, `kill`)은 동기 `Conn`을,
-//! 클라이언트 화면은 비동기 `AsyncConn`을 쓴다.
+//! Daemon connection. Starts the daemon if it isn't running. Headless commands (`mine ls`, `new`, `kill`) use the synchronous `Conn`,
+//! and the client screen uses the asynchronous `AsyncConn`.
 
 use std::fs::OpenOptions;
 use std::io::{self, BufReader};
@@ -16,31 +16,31 @@ use crate::paths::{State, check_sock_path, ensure_dir};
 use crate::proto::{FromDaemon, ToDaemon, VERSION, read_msg, recv, send, write_msg};
 use crate::session::shell_quote;
 
-/// 띄운 데몬에 다시 붙기까지 기다리는 최대 시간.
+/// Maximum time to wait to reattach to a daemon that was just started.
 const SPAWN_WAIT: Duration = Duration::from_secs(2);
-/// 응답 하나를 기다리는 최대 시간. 데몬이 멈춰도 명령이 끝없이 매달리지 않게 한다.
+/// Maximum time to wait for one response. Keeps a command from hanging forever if the daemon stalls.
 const REPLY_WAIT: Duration = Duration::from_secs(15);
 
-/// 데몬과의 동기 연결(헤드리스 명령용).
+/// Synchronous connection to the daemon (for headless commands).
 pub struct Conn {
     reader: BufReader<UnixStream>,
     writer: UnixStream,
 }
 
-/// 데몬과의 비동기 연결(클라이언트 화면용). `tx`로 보낸 메시지는 쓰기 작업 하나가 차례로 쓰고,
-/// 읽기 작업 하나가 받은 메시지를 `rx`로 넘긴다. 연결이 끊기면 `rx`가 `None`을 돌려준다.
+/// Asynchronous connection to the daemon (for the client screen). Messages sent on `tx` are written in order by a single write task,
+/// and a single read task passes received messages to `rx`. When the connection drops, `rx` returns `None`.
 ///
-/// `proto::recv`는 취소에 안전하지 않으므로 `select!`에는 `rx.recv()`(취소에 안전하다)만 넣는다.
+/// `proto::recv` is not cancel-safe, so only `rx.recv()` (which is cancel-safe) goes into `select!`.
 pub struct AsyncConn {
     pub tx: mpsc::UnboundedSender<ToDaemon>,
     pub rx: mpsc::UnboundedReceiver<FromDaemon>,
 }
 
 impl Conn {
-    /// 데몬에 붙는다. 붙지 못하면 `current_exe() daemon`을 띄우고 `SPAWN_WAIT` 안에 다시 붙는다.
+    /// Attaches to the daemon. If it can't, starts `current_exe() daemon` and reattaches within `SPAWN_WAIT`.
     ///
-    /// 남은 `daemon.sock` 파일은 데몬이 pid 파일 잠금을 잡은 뒤 지우고 새로 만든다. 클라이언트가 지우면
-    /// 동시에 뜬 다른 클라이언트가 막 만들어진 소켓을 지울 수 있어서 데몬에 맡긴다.
+    /// A leftover `daemon.sock` file is removed and recreated by the daemon after it takes the pid file lock. If the client removed it,
+    /// another client started at the same time could delete the socket that was just created, so this is left to the daemon.
     pub fn connect_or_spawn(state: &State) -> Result<Conn> {
         let sock = state.daemon_sock();
         check_sock_path(&sock)?;
@@ -54,12 +54,12 @@ impl Conn {
         Conn::handshake(stream, state)
     }
 
-    /// [`Conn::connect_or_spawn`]의 비동기 판. 데몬을 띄우고 기다리는 방법은 같다.
+    /// Async version of [`Conn::connect_or_spawn`]. Starts and waits for the daemon the same way.
     pub async fn connect_or_spawn_async(state: &State) -> Result<AsyncConn> {
         connect_or_spawn_async_with(state, &current_exe()?, None).await
     }
 
-    /// `Hello`를 주고받고 버전을 확인한다.
+    /// Exchanges `Hello` and checks the version.
     fn handshake(stream: UnixStream, state: &State) -> Result<Conn> {
         stream.set_read_timeout(Some(REPLY_WAIT))?;
         let mut conn = Conn {
@@ -72,7 +72,7 @@ impl Conn {
         Ok(conn)
     }
 
-    /// 요청을 보내고 응답을 기다린다. 세션 출력(`Output`)은 건너뛰고, `Error`는 오류로 돌려준다.
+    /// Sends a request and waits for the response. Session output (`Output`) is skipped, and `Error` is returned as an error.
     pub fn request(&mut self, msg: &ToDaemon) -> Result<FromDaemon> {
         write_msg(&mut self.writer, msg).context("Couldn't send the request to the daemon")?;
         loop {
@@ -101,10 +101,10 @@ impl Conn {
     }
 }
 
-/// [`Conn::connect_or_spawn_async`]에서 띄울 데몬을 고르는 판. 데몬이 없으면 `daemon_exe daemon`을 띄운다.
+/// Variant of [`Conn::connect_or_spawn_async`] that picks which daemon to start. If there is no daemon, it starts `daemon_exe daemon`.
 ///
-/// 데스크톱 앱은 자기 실행 파일(`mine-app`)에 `daemon` 하위 명령이 없어서 `mine`의 경로를 넘긴다.
-/// `spawn_env`가 있으면 데몬은 이 프로세스의 환경을 물려받지 않고 그 환경과 `MINE_STATE_DIR`만 받는다.
+/// The desktop app's own executable (`mine-app`) has no `daemon` subcommand, so it passes the path of `mine`.
+/// If `spawn_env` is given, the daemon does not inherit this process's environment and receives only that environment plus `MINE_STATE_DIR`.
 pub async fn connect_or_spawn_async_with(
     state: &State,
     daemon_exe: &Path,
@@ -137,8 +137,8 @@ pub async fn connect_or_spawn_async_with(
             }
         }
     });
-    // ponytail: 받는 쪽은 무한 큐다. 클라이언트도 데몬과 같은 양의 출력을 화면에 먹이므로 따라간다고 보고,
-    // 처지면 데몬이 이 연결을 끊기 전에 클라이언트 메모리가 는다. 문제가 되면 바이트로 센 상한을 둔다.
+    // ponytail: the receiving side is an unbounded queue. The client feeds its screen the same amount of output as the daemon, so we assume it keeps up;
+    // if it falls behind, client memory grows before the daemon drops this connection. If that becomes a problem, add a cap counted in bytes.
     let (incoming, rx) = mpsc::unbounded_channel::<FromDaemon>();
     tokio::spawn(async move {
         while let Ok(Some(msg)) = recv(&mut reader).await {
@@ -161,8 +161,8 @@ fn no_reply() -> anyhow::Error {
     )
 }
 
-/// 떠 있는 데몬을 끝내고 다시 띄우는 방법. 버전이 다르다는 오류에 붙인다. 세션은 보관 프로세스가 쥐고 있어
-/// 데몬이 끝나도 남고, 다음 `mine`이 띄운 새 데몬이 다시 붙는다.
+/// How to stop the running daemon and start it again. Attached to the version-mismatch error. Sessions are held by the holder processes,
+/// so they survive the daemon exiting, and the new daemon started by the next `mine` reattaches to them.
 pub fn restart_hint(state: &State) -> String {
     format!(
         "Stop the daemon with the command below, then run mine again (your sessions stay alive): kill \"$(cat {})\"",
@@ -170,7 +170,7 @@ pub fn restart_hint(state: &State) -> String {
     )
 }
 
-/// 데몬의 첫 메시지가 같은 버전의 `Hello`인지 확인한다.
+/// Checks that the daemon's first message is a `Hello` of the same version.
 fn check_hello(msg: Option<FromDaemon>, state: &State) -> Result<()> {
     match msg {
         Some(FromDaemon::Hello { version }) if version == VERSION => Ok(()),
@@ -188,11 +188,11 @@ fn check_hello(msg: Option<FromDaemon>, state: &State) -> Result<()> {
     }
 }
 
-/// `exe daemon`을 새 세션 리더로 띄운다. 표준 출력과 오류는 `logs/daemon.log`에 붙인다.
-/// `env`가 있으면 이 프로세스의 환경 대신 그 환경을 준다. `MINE_STATE_DIR`는 어느 쪽이든 `state`다.
+/// Starts `exe daemon` as a new session leader. Its stdout and stderr go to `logs/daemon.log`.
+/// If `env` is given, it is passed instead of this process's environment. `MINE_STATE_DIR` is `state` either way.
 ///
-/// 오래 도는 클라이언트 화면이 끝난 데몬을 좀비로 남기지 않게 스레드 하나가 기다려 거둔다. 이 프로세스가
-/// 먼저 끝나면 데몬은 계속 돌고 init이 거둔다.
+/// So that a long-running client screen doesn't leave a finished daemon as a zombie, one thread waits for it and reaps it. If this process
+/// exits first, the daemon keeps running and init reaps it.
 fn spawn_daemon(state: &State, exe: &Path, env: Option<&[(String, String)]>) -> Result<()> {
     ensure_dir(&state.root)?;
     ensure_dir(&state.log_dir())?;
@@ -208,12 +208,12 @@ fn spawn_daemon(state: &State, exe: &Path, env: Option<&[(String, String)]>) -> 
     }
     cmd.arg("daemon")
         .env("MINE_STATE_DIR", &state.root)
-        // 데몬이 명령을 실행한 폴더를 붙잡고 있지 않게 한다.
+        // Keep the daemon from holding on to the directory the command was run in.
         .current_dir("/")
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log);
-    // SAFETY: fork 뒤 exec 전에 비동기 시그널 안전 함수인 setsid만 부른다.
+    // SAFETY: after fork and before exec, only setsid, which is async-signal-safe, is called.
     unsafe {
         cmd.pre_exec(|| {
             if libc::setsid() == -1 {
@@ -229,7 +229,7 @@ fn spawn_daemon(state: &State, exe: &Path, env: Option<&[(String, String)]>) -> 
     Ok(())
 }
 
-/// 소켓이 연결을 받을 때까지 `SPAWN_WAIT` 동안 다시 시도한다.
+/// Retries for `SPAWN_WAIT` until the socket accepts a connection.
 fn wait_connect(sock: &Path) -> Result<UnixStream> {
     let deadline = Instant::now() + SPAWN_WAIT;
     loop {

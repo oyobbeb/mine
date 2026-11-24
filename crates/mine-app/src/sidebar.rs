@@ -1,5 +1,5 @@
-//! 왼쪽 목록: 새 작업, 프로젝트 고르기, 상태별 세션 묶음, 프로젝트 추가. 상태는 모두 `Model`에 있고 여기서는 그리고
-//! 누름을 `Workspace`에 잇기만 한다.
+//! The left list: New task, the project picker, sessions grouped by state, and Add project. All state lives in `Model`;
+//! this module only draws and wires clicks through to `Workspace`.
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
@@ -14,7 +14,7 @@ use crate::model::{self, Model, ProjectItem};
 use crate::theme::*;
 use crate::workspace::Workspace;
 
-/// 목록 폭.
+/// List width.
 pub const WIDTH: f32 = 260.;
 
 pub fn render(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
@@ -66,7 +66,7 @@ pub fn render(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
         .child(add_project(cx))
 }
 
-/// 연결이 끊긴 동안 목록 위에 두는 띠. 끊긴 사유(버전이 다르면 데몬을 다시 띄우는 방법)를 아래에 작게 적는다.
+/// The strip above the list while the connection is down. The reason it dropped (if the version differs, how to restart the daemon) is written small below.
 fn offline_banner(reason: &str) -> impl IntoElement {
     v_flex()
         .px_3()
@@ -89,7 +89,7 @@ fn offline_banner(reason: &str) -> impl IntoElement {
         )
 }
 
-/// "＋ 새 작업". 누르면 실행 화면을 연다(⌘N과 같다).
+/// "＋ New task". Clicking opens the launcher (same as ⌘N).
 fn new_task(cx: &mut Context<Workspace>) -> impl IntoElement {
     h_flex()
         .id("new-task")
@@ -106,7 +106,7 @@ fn new_task(cx: &mut Context<Workspace>) -> impl IntoElement {
         .on_click(cx.listener(|ws, _, window, cx| ws.new_task(window, cx)))
 }
 
-/// 프로젝트 고르기. 누르면 아래로 펼쳐 "전체"와 프로젝트들을 보이고, 고르면 접는다.
+/// Project picker. Clicking expands it downward to show "All projects" and the projects; choosing one collapses it.
 fn project_picker(m: &Model, open: bool, cx: &mut Context<Workspace>) -> impl IntoElement {
     let items = m.projects();
     let current = items
@@ -181,7 +181,7 @@ fn approval_mark() -> impl IntoElement {
     div().text_color(rgb(APPROVAL)).child("◆")
 }
 
-/// 묶음 머리: `▾ ◆ 승인 대기  1`. 누르면 접히거나 펼쳐진다.
+/// Group header: `▾ ◆ Needs approval  1`. Clicking collapses or expands it.
 fn group_head(gi: usize, g: &Group, cx: &mut Context<Workspace>) -> impl IntoElement {
     h_flex()
         .id(("group", gi))
@@ -210,13 +210,13 @@ fn group_head(gi: usize, g: &Group, cx: &mut Context<Workspace>) -> impl IntoEle
         )
         .child(div().text_color(rgb(FAINT)).child(g.rows.len().to_string()))
         .on_click({
-            // 자리가 아니라 상태를 쥔다. 그린 뒤 새 목록이 와 묶음이 밀려도 누른 묶음을 바꾼다.
+            // Holds the state, not the position. Even if a new list arrives after drawing and the groups shift, the clicked group is the one that changes.
             let state = g.state.clone();
             cx.listener(move |ws, _, _, cx| ws.toggle_group(&state, cx))
         })
 }
 
-/// 상태 기호의 색. 탭도 같은 색을 쓴다.
+/// The color of a status symbol. Tabs use the same color.
 pub fn state_color(state: &SessionState) -> u32 {
     match state {
         SessionState::Approval => APPROVAL,
@@ -226,10 +226,10 @@ pub fn state_color(state: &SessionState) -> u32 {
     }
 }
 
-/// 세션 줄. 첫 줄은 이름과 칩, 둘째 줄은 `프로젝트 · 대기 문구 또는 상태`다. 누르면 그 세션에 붙는다.
+/// A session row. The first line is the name and chip, the second is `project · waiting text or status`. Clicking attaches to that session.
 fn session_row(m: &Model, i: usize, cx: &mut Context<Workspace>) -> impl IntoElement {
     let s: &SessionInfo = &m.sessions[i];
-    // 자리가 아니라 id를 쥔다. 그린 뒤 새 목록이 와 줄이 밀려도 누른 세션에 붙는다.
+    // Holds the id, not the position. Even if a new list arrives after drawing and the rows shift, it attaches to the clicked session.
     let id = s.meta.id.clone();
     let selected = m.attached.as_ref() == Some(&s.meta.id);
     let (status, waiting) = model::status_text(s);
@@ -276,7 +276,7 @@ fn session_row(m: &Model, i: usize, cx: &mut Context<Workspace>) -> impl IntoEle
         )
 }
 
-/// 계정 칩(A·B·C). shell처럼 칩이 없는 계정은 `None`이다. 탭에서도 쓴다.
+/// Account chip (A·B·C). An account with no chip, like shell, is `None`. Tabs use it too.
 pub fn account_chip(account: Option<&str>) -> Option<impl IntoElement + use<>> {
     let (letter, color) = chip(account)?;
     Some(
@@ -295,7 +295,7 @@ pub fn account_chip(account: Option<&str>) -> Option<impl IntoElement + use<>> {
     )
 }
 
-/// "＋ 프로젝트 추가". 누르면 폴더를 골라 프로젝트로 등록한다.
+/// "＋ Add project". Clicking picks a folder and registers it as a project.
 fn add_project(cx: &mut Context<Workspace>) -> impl IntoElement {
     h_flex()
         .id("add-project")

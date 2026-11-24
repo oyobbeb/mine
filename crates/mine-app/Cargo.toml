@@ -14,7 +14,7 @@ path = "src/main.rs"
 alacritty_terminal.workspace = true
 anyhow.workspace = true
 futures.workspace = true
-# Metal Toolchain 없이 빌드하려고 셰이더를 실행할 때 컴파일한다(runtime_shaders).
+# Compile shaders at runtime so the app builds without the Metal Toolchain (runtime_shaders).
 gpui = { version = "=0.2.2", features = ["runtime_shaders"] }
 gpui-component = "=0.4.1"
 mine-core = { path = "../mine-core" }

@@ -1,4 +1,4 @@
-//! `mine hold` 통합 테스트. 실제 바이너리를 띄워 소켓으로 붙는다.
+//! Integration test for `mine hold`. It starts the real binary and connects over the socket.
 
 use std::io::{BufReader, Read};
 use std::os::unix::net::UnixStream;
@@ -8,10 +8,10 @@ use std::time::{Duration, Instant};
 
 use mine_core::proto::{HoldIn, HoldOut, read_msg, write_msg};
 
-/// 소켓 읽기와 출력 찾기가 기다리는 최대 시간.
+/// Maximum time that socket reads and output searches wait.
 const READ_WAIT: Duration = Duration::from_secs(3);
 
-/// 띄운 보관 프로세스. 버려질 때 자식까지 정리한다.
+/// A started holder process. When dropped, it cleans up the child too.
 struct Hold {
     sock: PathBuf,
     exit: PathBuf,
@@ -19,14 +19,14 @@ struct Hold {
     _dir: tempfile::TempDir,
 }
 
-/// 보관 프로세스를 띄운다. 소켓이 생기길 기다리지 않는다(자식이 곧바로 끝나는 경우도 있다).
+/// Starts a holder process. Doesn't wait for the socket to appear (the child may exit right away).
 fn spawn_hold(argv: &[&str]) -> Hold {
     spawn_hold_with_env(argv, &[])
 }
 
-/// `--env K=V`를 더해 보관 프로세스를 띄운다.
+/// Starts a holder process with `--env K=V` added.
 fn spawn_hold_with_env(argv: &[&str], env: &[&str]) -> Hold {
-    // 유닉스 소켓 경로 한도(macOS 104바이트) 때문에 짧은 경로를 쓴다.
+    // Use a short path because of the Unix socket path limit (104 bytes on macOS).
     let dir = tempfile::Builder::new()
         .prefix("m")
         .tempdir_in("/tmp")
@@ -61,8 +61,8 @@ impl Drop for Hold {
         if matches!(self.child.try_wait(), Ok(Some(_))) {
             return;
         }
-        // 자식 프로세스가 남지 않도록 Kill을 먼저 보내 보고, 그래도 안 끝나면 보관 프로세스를 죽인다.
-        // 붙은 연결에는 재생분을 보내 주므로, 쓰기가 막히지 않게 끝날 때까지 읽어서 버린다.
+        // To avoid leaving the child process behind, first try sending Kill, and if it still doesn't end, kill the holder process.
+        // A connected client is sent the replay, so read and discard until it ends so writes don't block.
         if let Ok(stream) = UnixStream::connect(&self.sock) {
             let _ = stream.set_read_timeout(Some(Duration::from_millis(20)));
             let mut w = &stream;
@@ -92,7 +92,7 @@ struct Client {
     writer: UnixStream,
 }
 
-/// 소켓에 붙는다. 소켓이 아직 없거나 막 만들어지는 중일 수 있어 기다리며 다시 시도한다.
+/// Connects to the socket. It may not exist yet or may be just being created, so it waits and retries.
 fn connect(sock: &Path) -> Client {
     let deadline = Instant::now() + READ_WAIT;
     let stream = loop {
@@ -100,7 +100,7 @@ fn connect(sock: &Path) -> Client {
             Ok(stream) => break stream,
             Err(e) => assert!(
                 Instant::now() < deadline,
-                "소켓에 붙지 못했다: {} ({e})",
+                "couldn't connect to the socket: {} ({e})",
                 sock.display()
             ),
         }
@@ -114,29 +114,29 @@ fn connect(sock: &Path) -> Client {
 }
 
 impl Client {
-    /// 다음 메시지를 읽는다. 연결이 끝났으면 `None`이다. 시간 안에 오지 않으면 패닉한다.
+    /// Reads the next message. `None` if the connection has ended. Panics if none arrives in time.
     fn try_recv(&mut self) -> Option<HoldOut> {
-        read_msg(&mut self.reader).expect("메시지를 시간 안에 읽지 못했다")
+        read_msg(&mut self.reader).expect("couldn't read a message in time")
     }
 
     fn recv(&mut self) -> HoldOut {
-        self.try_recv().expect("연결이 끊겼다")
+        self.try_recv().expect("the connection dropped")
     }
 
     fn send(&mut self, msg: HoldIn) {
         write_msg(&mut self.writer, &msg).unwrap();
     }
 
-    /// `Output`을 최대 3초 동안 모아서 `needle`이 나오는지 본다. 연결이 끝나거나 `Exited`가 오면 포기한다.
+    /// Collects `Output` for up to 3 seconds and checks whether `needle` appears. Gives up if the connection ends or `Exited` arrives.
     fn read_until_contains(&mut self, needle: &str) -> bool {
         let deadline = Instant::now() + READ_WAIT;
         let mut seen = Vec::new();
         while let Some(left) = deadline.checked_duration_since(Instant::now()) {
-            // 상대가 이미 끊은 소켓에는 macOS가 타임아웃 설정을 거부하므로 실패해도 넘어간다.
+            // macOS rejects setting a timeout on a socket the peer has already closed, so ignore a failure.
             let _ = self.reader.get_ref().set_read_timeout(Some(left));
             match read_msg::<_, HoldOut>(&mut self.reader) {
                 Ok(Some(HoldOut::Output { data })) => {
-                    // 매번 전체를 훑지 않도록 새 조각과 그 앞 경계만 본다.
+                    // Look only at the new chunk and the boundary before it, so we don't rescan everything each time.
                     let from = seen.len().saturating_sub(needle.len());
                     seen.extend(data);
                     if String::from_utf8_lossy(&seen[from..]).contains(needle) {
@@ -151,13 +151,13 @@ impl Client {
     }
 }
 
-/// 조건이 참이 될 때까지 `ms` 밀리초 안에서 기다린다. 시간이 지나면 패닉한다.
+/// Waits up to `ms` milliseconds for the condition to become true. Panics on timeout.
 fn wait_until(ms: u64, mut cond: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_millis(ms);
     while !cond() {
         assert!(
             Instant::now() < deadline,
-            "{ms}ms 안에 조건이 참이 되지 않았다"
+            "the condition didn't become true within {ms}ms"
         );
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -215,7 +215,7 @@ fn hello_reports_child_pid_and_first_output_is_the_ring() {
     let h = spawn_hold(&["sh", "-c", "printf first; cat"]);
     let mut c = connect(&h.sock);
     let HoldOut::Hello { version, child_pid } = c.recv() else {
-        panic!("첫 메시지가 Hello가 아니다");
+        panic!("the first message isn't Hello");
     };
     assert_eq!(version, 1);
     assert!(child_pid > 1);
@@ -230,9 +230,9 @@ fn new_connection_replaces_the_old_one() {
     c1.recv();
     let mut c2 = connect(&h.sock);
     assert!(matches!(c2.recv(), HoldOut::Hello { .. }));
-    // 이전 연결은 곧 끊긴다.
+    // The previous connection will be dropped shortly.
     while c1.try_recv().is_some() {}
-    // 새 연결이 입력과 출력을 이어받는다. 에코에는 `$((6*7))`만 있고 `42`는 계산 결과에만 있다.
+    // The new connection takes over input and output. The echo contains only `$((6*7))`; `42` appears only in the computed result.
     c2.send(HoldIn::Input {
         data: b"echo $((6*7))\n".to_vec(),
     });
@@ -253,7 +253,7 @@ fn delivers_final_output_then_exited() {
 
 #[test]
 fn replay_is_capped_and_keeps_the_tail() {
-    // 링 한도(2 MiB)보다 많이 쏟아낸 뒤 새 연결이 받는 재생분은 한도까지만이고 끝부분이어야 한다.
+    // After pouring out more than the ring limit (2 MiB), the replay a new connection receives is capped at the limit and must be the tail.
     let h = spawn_hold(&[
         "sh",
         "-c",
@@ -265,7 +265,7 @@ fn replay_is_capped_and_keeps_the_tail() {
     let mut c2 = connect(&h.sock);
     c2.recv();
     let HoldOut::Output { data } = c2.recv() else {
-        panic!("Hello 다음이 Output이 아니다");
+        panic!("the message after Hello isn't Output");
     };
     assert_eq!(data.len(), 2 * 1024 * 1024);
     assert!(data.ends_with(b"xxxEND"));
@@ -287,11 +287,11 @@ fn kill_escalates_to_sigkill_when_hup_is_ignored() {
     let h = spawn_hold(&["sh", "-c", "trap '' HUP; echo ready; sleep 30"]);
     let mut c = connect(&h.sock);
     c.recv();
-    // trap이 걸린 뒤에 Kill을 보내야 SIGHUP이 무시된다.
+    // Send Kill only after the trap is set, so SIGHUP is ignored.
     assert!(c.read_until_contains("ready"));
     let killed_at = Instant::now();
     c.send(HoldIn::Kill);
-    // SIGHUP은 무시되고 2초 뒤 SIGKILL이 간다.
+    // SIGHUP is ignored and SIGKILL goes out after 2 seconds.
     wait_until(5000, || h.exit.exists());
     assert!(killed_at.elapsed() >= Duration::from_millis(1500));
     assert_eq!(std::fs::read_to_string(&h.exit).unwrap(), "signal");
@@ -303,7 +303,7 @@ fn survives_a_dropped_connection_and_keeps_running() {
     let mut c = connect(&h.sock);
     c.recv();
     drop(c);
-    // 연결이 없어도 보관 프로세스와 자식은 계속 돌고, 다음 연결을 받는다.
+    // Even with no connection, the holder and child keep running and accept the next connection.
     let mut c2 = connect(&h.sock);
     c2.recv();
     c2.send(HoldIn::Input {
@@ -315,13 +315,13 @@ fn survives_a_dropped_connection_and_keeps_running() {
 
 #[test]
 fn stops_accepting_once_killed() {
-    // 끝나 가는 보관 프로세스에, 같은 세션을 새로 띄운 데몬이 잘못 붙지 않아야 한다.
+    // A daemon that has just started a new holder for the same session must not wrongly attach to this one, which is about to end.
     let h = spawn_hold(&["sh", "-c", "trap '' HUP; echo ready; sleep 30"]);
     let mut c = connect(&h.sock);
     c.recv();
     assert!(c.read_until_contains("ready"));
     c.send(HoldIn::Kill);
-    // SIGKILL(2초 뒤)보다 먼저 새 연결을 거절한다.
+    // Refuse the new connection before SIGKILL (after 2 seconds).
     wait_until(1000, || UnixStream::connect(&h.sock).is_err());
     wait_until(5000, || h.exit.exists());
 }

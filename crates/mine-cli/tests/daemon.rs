@@ -1,7 +1,7 @@
-//! 데몬과 헤드리스 명령 통합 테스트. 실제 바이너리로 데몬과 보관 프로세스를 띄운다.
+//! Integration test for the daemon and headless commands. Starts the daemon and holder processes with the real binary.
 //!
-//! 모든 `mine` 명령은 `.git` 폴더가 있는 임시 프로젝트 폴더에서, 따로 만든 짧은 `/tmp` 상태 폴더
-//! (`MINE_STATE_DIR`)와 `SHELL=/bin/sh`로 실행한다. 테스트 프로세스의 환경은 건드리지 않는다.
+//! Every `mine` command runs in a temporary project directory with a `.git` folder, with a separate short `/tmp` state directory
+//! (`MINE_STATE_DIR`) and `SHELL=/bin/sh`. The test process's own environment is left untouched.
 
 use std::ffi::OsString;
 use std::fs::{self, File, TryLockError};
@@ -17,16 +17,16 @@ use mine_core::project::project_key;
 use mine_core::proto::{FromDaemon, HoldIn, HoldOut, ToDaemon, VERSION, read_msg, write_msg};
 use mine_core::session::{Kind, Meta, Restore, SessionState, session_id};
 
-/// 소켓 읽기와 조건 기다리기의 최대 시간. 테스트를 여럿 함께 돌려 느려져도 넉넉하게 잡는다.
+/// Maximum time for socket reads and waiting on conditions. Generous so that it holds up even when many tests run together and slow things down.
 const WAIT: Duration = Duration::from_secs(10);
 
-/// 테스트 하나가 쓰는 프로젝트 폴더와 상태 폴더. 버려질 때 데몬과 보관 프로세스를 정리한다.
+/// The project directory and state directory one test uses. When dropped, it cleans up the daemon and holder processes.
 struct St {
     root: PathBuf,
     project: PathBuf,
-    /// 있으면 `PATH` 앞에 붙인다(가짜 `claude` 등).
+    /// If set, it's prepended to `PATH` (a fake `claude`, etc.).
     path_front: Option<PathBuf>,
-    /// `mine` 명령(과 그 명령이 띄우는 데몬)에 더할 환경 변수. 앞의 기본값(`SHELL` 등)을 덮어쓴다.
+    /// Environment variables to add to the `mine` command (and the daemon it starts). Overrides the earlier defaults (`SHELL`, etc.).
     env: Vec<(&'static str, OsString)>,
     _state: tempfile::TempDir,
     _project: tempfile::TempDir,
@@ -90,9 +90,9 @@ impl St {
 
 impl Drop for St {
     fn drop(&mut self) {
-        // 데몬을 먼저 없애야 보관 프로세스에 다시 붙지 않는다.
+        // Kill the daemon first so it doesn't reattach to the holder processes.
         if let Some(pid) = daemon_pid(self) {
-            // SAFETY: kill은 정수 인자만 받는다. pid는 이 테스트가 띄운 데몬이 잠가 둔 pid 파일에서 읽었다.
+            // SAFETY: kill takes only integer arguments. The pid was read from the pid file locked by the daemon this test started.
             unsafe { libc::kill(pid, libc::SIGKILL) };
             let deadline = Instant::now() + WAIT;
             while UnixStream::connect(self.sock()).is_ok() && Instant::now() < deadline {
@@ -108,7 +108,7 @@ impl Drop for St {
     }
 }
 
-/// 보관 프로세스에 `Kill`을 보내고, 재생분을 읽어 버리며 끝날 때까지(최대 `WAIT`) 기다린다.
+/// Sends `Kill` to the holder process, then reads and discards the replay until it ends (up to `WAIT`).
 fn kill_holder(sock: &Path) {
     let Ok(stream) = UnixStream::connect(sock) else {
         return;
@@ -124,7 +124,7 @@ fn kill_holder(sock: &Path) {
     }
 }
 
-/// 살아 있는 데몬의 pid. 데몬은 pid 파일을 잠가 두므로, 잠글 수 있으면 데몬이 없는 것이다.
+/// pid of the live daemon. The daemon keeps the pid file locked, so if it can be locked, there is no daemon.
 fn daemon_pid(st: &St) -> Option<i32> {
     let path = st.root.join("daemon.pid");
     let file = File::open(&path).ok()?;
@@ -134,12 +134,12 @@ fn daemon_pid(st: &St) -> Option<i32> {
     }
 }
 
-/// `mine`을 실행하고 성공했는지 확인한다.
+/// Runs `mine` and checks that it succeeded.
 fn mine(st: &St, args: &[&str]) -> Output {
     let out = mine_raw(st, args);
     assert!(
         out.status.success(),
-        "mine {args:?} 실패: {}",
+        "mine {args:?} failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
     out
@@ -149,7 +149,7 @@ fn mine_raw(st: &St, args: &[&str]) -> Output {
     st.command(args)
         .stdin(Stdio::null())
         .output()
-        .expect("mine을 실행하지 못했다")
+        .expect("couldn't run mine")
 }
 
 fn mine_stdin(st: &St, args: &[&str], input: &str) -> Output {
@@ -167,7 +167,7 @@ fn mine_stdin(st: &St, args: &[&str], input: &str) -> Output {
         .write_all(input.as_bytes())
         .unwrap();
     let out = child.wait_with_output().unwrap();
-    assert!(out.status.success(), "mine {args:?} 실패");
+    assert!(out.status.success(), "mine {args:?} failed");
     out
 }
 
@@ -188,27 +188,27 @@ fn session_dir(st: &St, name: &str) -> String {
         .into_owned()
 }
 
-/// pid 파일로 데몬을 SIGKILL하고, 소켓이 더는 연결을 받지 않을 때까지 기다린다.
+/// SIGKILLs the daemon via the pid file and waits until the socket no longer accepts connections.
 fn kill_daemon(st: &St) {
-    let pid = daemon_pid(st).expect("데몬이 돌고 있지 않다");
-    // SAFETY: kill은 정수 인자만 받는다. pid는 이 테스트의 데몬이 잠가 둔 pid 파일에서 읽었다.
+    let pid = daemon_pid(st).expect("the daemon isn't running");
+    // SAFETY: kill takes only integer arguments. The pid was read from the pid file that this test's daemon keeps locked.
     assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
     wait_until(|| UnixStream::connect(st.sock()).is_err());
 }
 
-/// 조건이 참이 될 때까지 최대 `WAIT` 동안 기다린다.
+/// Waits up to `WAIT` for the condition to become true.
 fn wait_until(mut cond: impl FnMut() -> bool) {
     let deadline = Instant::now() + WAIT;
     while !cond() {
         assert!(
             Instant::now() < deadline,
-            "{WAIT:?} 안에 조건이 참이 되지 않았다"
+            "the condition didn't become true within {WAIT:?}"
         );
         std::thread::sleep(Duration::from_millis(20));
     }
 }
 
-/// `Conn`을 흉내 내는 작은 소켓 클라이언트.
+/// A small socket client that imitates `Conn`.
 struct Client {
     reader: BufReader<UnixStream>,
     writer: UnixStream,
@@ -216,9 +216,9 @@ struct Client {
     attached: Option<String>,
 }
 
-/// 이미 떠 있는 데몬에 붙어 Hello를 주고받는다.
+/// Attaches to an already running daemon and exchanges Hello.
 fn client(st: &St) -> Client {
-    let stream = UnixStream::connect(st.sock()).expect("데몬에 붙지 못했다");
+    let stream = UnixStream::connect(st.sock()).expect("couldn't connect to the daemon");
     let mut c = Client {
         writer: stream.try_clone().unwrap(),
         reader: BufReader::new(stream),
@@ -235,13 +235,13 @@ impl Client {
         write_msg(&mut self.writer, msg).unwrap();
     }
 
-    /// 다음 메시지. 연결이 끝났으면 `None`이다. `WAIT` 안에 오지 않으면 패닉한다.
+    /// The next message. `None` if the connection has ended. Panics if none arrives within `WAIT`.
     fn recv(&mut self) -> Option<FromDaemon> {
         self.reader.get_ref().set_read_timeout(Some(WAIT)).unwrap();
-        read_msg(&mut self.reader).expect("메시지를 시간 안에 읽지 못했다")
+        read_msg(&mut self.reader).expect("couldn't read a message in time")
     }
 
-    /// 크기 80x24로 붙고 스냅숏을 글자로 돌려준다.
+    /// Attaches at size 80x24 and returns the snapshot as text.
     fn attach(&mut self, name: &str) -> String {
         self.attach_sized(name, 80, 24)
     }
@@ -255,25 +255,25 @@ impl Client {
         });
         self.attached = Some(id.clone());
         loop {
-            match self.recv().expect("연결이 끊겼다") {
+            match self.recv().expect("the connection dropped") {
                 FromDaemon::Snapshot { id: got, data } if got == id => {
                     return String::from_utf8_lossy(&data).into_owned();
                 }
-                FromDaemon::Error { message } => panic!("붙지 못했다: {message}"),
+                FromDaemon::Error { message } => panic!("couldn't attach: {message}"),
                 _ => {}
             }
         }
     }
 
     fn input(&mut self, text: &str) {
-        let id = self.attached.clone().expect("붙은 세션이 없다");
+        let id = self.attached.clone().expect("no attached session");
         self.send(&ToDaemon::Input {
             id,
             data: text.as_bytes().to_vec(),
         });
     }
 
-    /// 붙은 세션의 출력에 `needle`이 나올 때까지 최대 `WAIT` 동안 읽는다.
+    /// Reads up to `WAIT` until `needle` appears in the attached session's output.
     fn wait_output(&mut self, needle: &str) {
         self.read_output(
             |seen| String::from_utf8_lossy(seen).contains(needle),
@@ -282,20 +282,23 @@ impl Client {
         );
     }
 
-    /// 붙은 세션의 출력이 `n`바이트 넘게 오거나, 처진 이 클라이언트를 데몬이 끊을 때까지 최대 `WAIT` 동안 읽는다.
+    /// Reads up to `WAIT` until the attached session's output exceeds `n` bytes or the daemon drops this lagging client.
     fn wait_bytes_or_drop(&mut self, n: usize) {
-        self.read_output(|seen| seen.len() > n, &format!("{n}바이트"), true);
+        self.read_output(|seen| seen.len() > n, &format!("{n} bytes"), true);
     }
 
     fn read_output(&mut self, mut done: impl FnMut(&[u8]) -> bool, what: &str, eof_ok: bool) {
-        let id = self.attached.clone().expect("붙은 세션이 없다");
+        let id = self.attached.clone().expect("no attached session");
         let deadline = Instant::now() + WAIT;
         let mut seen = Vec::new();
         loop {
             let left = deadline
                 .checked_duration_since(Instant::now())
                 .unwrap_or_else(|| {
-                    panic!("출력에 {what}가 없다: {:?}", String::from_utf8_lossy(&seen))
+                    panic!(
+                        "{what} not in the output: {:?}",
+                        String::from_utf8_lossy(&seen)
+                    )
                 });
             self.reader.get_ref().set_read_timeout(Some(left)).unwrap();
             match read_msg::<_, FromDaemon>(&mut self.reader) {
@@ -307,9 +310,9 @@ impl Client {
                 }
                 Ok(Some(_)) => {}
                 Ok(None) if eof_ok => return,
-                Ok(None) => panic!("연결이 끊겼다"),
+                Ok(None) => panic!("the connection dropped"),
                 Err(e) => panic!(
-                    "출력에 {what}가 없다 ({e}): {:?}",
+                    "{what} not in the output ({e}): {:?}",
                     String::from_utf8_lossy(&seen)
                 ),
             }
@@ -317,8 +320,8 @@ impl Client {
     }
 }
 
-/// 셸 세션이 다 뜨고 출력이 잦아들어 대기가 될 때까지 기다린다. 셸은 시작 프롬프트를 언제 낼지 모르므로
-/// (늦게 오면 다시 작업 중이 된다) 명령 하나의 결과를 먼저 보고 나서 기다린다. 붙었던 연결은 끊고 기다린다.
+/// Waits until the shell session has fully started and its output has quieted down to Idle. The shell can't tell us when it will print its startup prompt
+/// (if it comes late, the session goes back to Working), so it first looks at the result of one command and then waits. The attached connection is dropped before waiting.
 fn wait_shell_quiet(st: &St, name: &str) {
     let mut c = client(st);
     c.attach(name);
@@ -358,7 +361,7 @@ fn invalid_name_is_rejected() {
 
 #[test]
 fn failed_start_leaves_no_session() {
-    // 실행 파일이 없으면 보관 프로세스가 exit 파일 없이 끝난다.
+    // If the executable is missing, the holder process ends without an exit file.
     let st = state();
     let mut cmd = st.command(&["new", "x", "--kind", "codex"]);
     let out = cmd.env("PATH", "/usr/bin:/bin").output().unwrap();
@@ -376,11 +379,11 @@ fn session_survives_daemon_restart() {
     c.input("echo marker-1\n");
     c.wait_output("marker-1");
     kill_daemon(&st);
-    // 데몬이 자동으로 다시 뜨고 세션은 그대로다.
+    // The daemon restarts automatically and the session is as it was.
     assert_eq!(ls(&st)[0][4], "idle");
     let mut c2 = client(&st);
     assert!(c2.attach("keep").contains("marker-1"));
-    // 다시 붙은 세션에 입력이 그대로 간다.
+    // Input goes to the reattached session as is.
     c2.input("echo $((40+2))\n");
     c2.wait_output("42");
 }
@@ -401,9 +404,9 @@ fn kill_removes_from_list_and_keeps_events() {
         serde_json::from_slice(&fs::read(Path::new(&dir).join("meta.json")).unwrap()).unwrap();
     assert_eq!(meta["closed"], true);
     assert!(Path::new(&dir).join("events.jsonl").exists());
-    // 보관 프로세스도 끝난다.
+    // The holder process ends too.
     wait_until(|| !st.root.join("run").join(hold_sock_name(&st, "k")).exists());
-    // 닫힌 세션은 데몬이 다시 떠도 돌아오지 않는다.
+    // A closed session doesn't come back even when the daemon restarts.
     kill_daemon(&st);
     assert!(ls(&st).is_empty());
 }
@@ -438,7 +441,7 @@ fn stale_socket_is_replaced() {
 #[test]
 fn version_mismatch_is_rejected() {
     let st = state();
-    ls(&st); // 데몬을 띄운다.
+    ls(&st); // Starts the daemon.
     let stream = UnixStream::connect(st.sock()).unwrap();
     let mut r = BufReader::new(stream.try_clone().unwrap());
     stream.set_read_timeout(Some(WAIT)).unwrap();
@@ -449,9 +452,9 @@ fn version_mismatch_is_rejected() {
             error = Some(message);
         }
     }
-    // 데몬을 다시 띄우는 실제 명령을 알려 준다.
+    // Tells the user the real command that restarts the daemon.
     let want = format!("kill \"$(cat {})\"", st.root.join("daemon.pid").display());
-    let error = error.expect("Error가 오지 않았다");
+    let error = error.expect("no Error arrived");
     assert!(error.contains(&want), "{error}");
 }
 
@@ -462,12 +465,12 @@ fn hook_poke_updates_state() {
     mine_stdin(
         &st,
         &["_event", &session_dir(&st, "h")],
-        r#"{"hook_event_name":"Notification","message":"npm run deploy 승인?"}"#,
+        r#"{"hook_event_name":"Notification","message":"Approve npm run deploy?"}"#,
     );
     let r = &ls(&st)[0];
     assert_eq!(r[0], "◆");
     assert_eq!(r[4], "approval");
-    assert_eq!(r[5], "npm run deploy 승인?");
+    assert_eq!(r[5], "Approve npm run deploy?");
 }
 
 #[test]
@@ -480,13 +483,13 @@ fn subscribed_client_gets_pushed_sessions_after_hook() {
     mine_stdin(
         &st,
         &["_event", &session_dir(&st, "h")],
-        r#"{"hook_event_name":"Notification","message":"승인?"}"#,
+        r#"{"hook_event_name":"Notification","message":"Approve?"}"#,
     );
-    // List를 다시 보내지 않아도 바뀐 목록이 온다.
+    // The changed list arrives even without sending List again.
     loop {
-        match c.recv().expect("연결이 끊겼다") {
+        match c.recv().expect("the connection dropped") {
             FromDaemon::Sessions { sessions } if sessions[0].state == SessionState::Approval => {
-                assert_eq!(sessions[0].waiting.as_deref(), Some("승인?"));
+                assert_eq!(sessions[0].waiting.as_deref(), Some("Approve?"));
                 break;
             }
             _ => {}
@@ -496,7 +499,7 @@ fn subscribed_client_gets_pushed_sessions_after_hook() {
 
 #[test]
 fn client_colours_answer_inner_colour_queries() {
-    // 먼저 만든 세션(이미 있는 화면)과 색을 받은 뒤 만든 세션(새 화면) 모두 받은 색으로 답한다.
+    // Both a session created earlier (a screen that already exists) and one created after the colors were received (a new screen) answer with the received colors.
     let st = state();
     mine(&st, &["new", "old"]);
     let mut c = client(&st);
@@ -504,7 +507,7 @@ fn client_colours_answer_inner_colour_queries() {
         fg: "#0a0b0c".into(),
         bg: "#010203".into(),
     });
-    // 같은 연결의 메시지는 차례로 처리되므로, List의 답이 오면 Colors도 처리됐다.
+    // Messages on the same connection are handled in order, so once the List answer arrives, Colors has been handled too.
     c.send(&ToDaemon::List);
     assert!(matches!(c.recv(), Some(FromDaemon::Sessions { .. })));
     mine(&st, &["new", "new"]);
@@ -522,7 +525,7 @@ fn input_during_approval_returns_to_working() {
     mine_stdin(
         &st,
         &["_event", &session_dir(&st, "h")],
-        r#"{"hook_event_name":"Notification","message":"승인?"}"#,
+        r#"{"hook_event_name":"Notification","message":"Approve?"}"#,
     );
     let mut c = client(&st);
     c.attach("h");
@@ -534,7 +537,7 @@ fn input_during_approval_returns_to_working() {
 fn viewing_a_done_session_makes_it_idle() {
     let st = state();
     mine(&st, &["new", "d"]);
-    // 셸 출력으로 정해지는 작업 중이 대기로 돌아간 뒤에 훅 상태만 본다.
+    // Looks at the hook state only after the Working state decided by shell output has gone back to Idle.
     wait_shell_quiet(&st, "d");
     mine_stdin(
         &st,
@@ -546,7 +549,7 @@ fn viewing_a_done_session_makes_it_idle() {
     let mut c = client(&st);
     c.attach("d");
     assert_eq!(ls(&st)[0][4], "idle");
-    // 보고 있는 동안 끝난 턴은 바로 읽은 것으로 친다.
+    // A turn that ended while it was being viewed counts as already read.
     mine_stdin(
         &st,
         &["_event", &session_dir(&st, "d")],
@@ -565,7 +568,7 @@ fn shell_exit_removes_session() {
     wait_until(|| ls(&st).is_empty());
 }
 
-/// 인자를 trace 파일에 적고 곧바로 끝나는 가짜 `claude`를 `dir`에 만들고 trace 경로를 돌려준다.
+/// Creates in `dir` a fake `claude` that writes its arguments to a trace file and exits right away, and returns the trace path.
 fn fake_claude(dir: &Path) -> PathBuf {
     let trace = dir.join("trace");
     let claude = dir.join("claude");
@@ -580,7 +583,7 @@ fn fake_claude(dir: &Path) -> PathBuf {
 
 #[test]
 fn ended_claude_session_resumes_on_attach() {
-    // PATH 앞에 둔 가짜 `claude`는 인자를 trace 파일에 적고 곧바로 끝난다.
+    // The fake `claude` placed at the front of PATH writes its arguments to the trace file and exits right away.
     let bin = tmp();
     let trace = fake_claude(bin.path());
     let st = state_with_path(bin.path());
@@ -607,8 +610,8 @@ fn ended_claude_session_resumes_on_attach() {
 
 #[test]
 fn badly_answering_holder_keeps_session_on_restart() {
-    // 소켓은 받지만 다른 버전의 Hello를 보내는 보관 프로세스. 살아 있을 수 있으므로 세션을 닫거나
-    // 끝남으로 돌리지 않고, 붙어도 같은 대화에 두 번째 claude를 띄우지 않아야 한다.
+    // A holder process that accepts the socket but sends a Hello of a different version. It may be alive, so the session must not be closed or
+    // marked Done, and even when attached, a second claude must not be started in the same conversation.
     let bin = tmp();
     let trace = fake_claude(bin.path());
     let st = state_with_path(bin.path());
@@ -650,7 +653,7 @@ fn badly_answering_holder_keeps_session_on_restart() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0][2], "c");
     assert_ne!(rows[0][4], "ended");
-    // 붙으면 다시 붙어 보지만 실패를 알릴 뿐 새 프로세스를 띄우지 않는다.
+    // On attach it tries to reattach, but only reports the failure and doesn't start a new process.
     let mut c = client(&st);
     c.send(&ToDaemon::Attach {
         id: id.clone(),
@@ -659,7 +662,7 @@ fn badly_answering_holder_keeps_session_on_restart() {
     });
     let mut saw_error = false;
     loop {
-        match c.recv().expect("연결이 끊겼다") {
+        match c.recv().expect("the connection dropped") {
             FromDaemon::Snapshot { .. } => break,
             FromDaemon::Error { .. } => saw_error = true,
             _ => {}
@@ -669,13 +672,13 @@ fn badly_answering_holder_keeps_session_on_restart() {
     assert!(!trace.exists());
     assert!(!Meta::load(&dir).unwrap().closed);
     assert_ne!(ls(&st)[0][4], "ended");
-    // 가짜 소켓을 치워 정리 단계가 거기에 붙지 않게 한다.
+    // Clear away the fake socket so the cleanup step doesn't attach to it.
     fs::remove_file(&sock).unwrap();
 }
 
 #[test]
 fn daemon_answers_cursor_position_query() {
-    // 테스트 클라이언트는 질의에 답하지 않으므로, 답은 데몬이 보낸 것이다.
+    // The test client doesn't answer queries, so the answer is one the daemon sent.
     let st = state();
     mine(&st, &["new", "q"]);
     let mut c = client(&st);
@@ -690,7 +693,7 @@ fn session_size_follows_last_input_client() {
     mine(&st, &["new", "z"]);
     let mut big = client(&st);
     big.attach_sized("z", 100, 30);
-    // 셸이 다 뜬 뒤에 잰다. 시작 중에 미리 친 입력과 겹치면 크기 확인이 드물게 어긋났다(보고서 참고).
+    // Measured after the shell has fully started. When it overlapped with input typed ahead during startup, the size check occasionally came out wrong (see the report).
     big.input("echo ready-$((1+1))\n");
     big.wait_output("ready-2");
     let mut small = client(&st);
@@ -709,7 +712,7 @@ fn flood_output_keeps_ls_responsive() {
     c.attach("f");
     let pid = daemon_pid(&st);
     c.input("yes | head -c 20000000\n");
-    // 데몬이 한창 화면에 먹이는 동안 잰다. 이 클라이언트는 그 뒤로 읽지 않으므로 큐가 차서 끊긴다.
+    // Measured while the daemon is busy feeding the screen. This client stops reading after that, so its queue fills and it gets dropped.
     c.wait_bytes_or_drop(1_000_000);
     let until = Instant::now() + Duration::from_millis(1500);
     while Instant::now() < until {
@@ -717,12 +720,12 @@ fn flood_output_keeps_ls_responsive() {
         assert_eq!(ls(&st).len(), 1);
         assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
     }
-    // 같은 데몬이 답했다(죽고 다시 뜬 것이 아니다).
+    // The same daemon answered (it didn't die and restart).
     assert_eq!(daemon_pid(&st), pid);
 }
 
-/// SIGHUP을 무시하고 `ready`를 찍은 뒤 오래 도는 가짜 로그인 셸을 `dir`에 만든다. `Kill`을 받은 보관 프로세스가
-/// 2초 뒤 SIGKILL을 보내야 끝나므로, 그동안 끝나 가는 보관 프로세스가 남는다.
+/// Creates in `dir` a fake login shell that ignores SIGHUP, prints `ready`, and then runs for a long time. The holder process that received `Kill`
+/// must end with SIGKILL after 2 seconds, so a holder process that is about to end remains in the meantime.
 fn stubborn_shell(dir: &Path) -> PathBuf {
     let shell = dir.join("sh");
     fs::write(
@@ -734,7 +737,7 @@ fn stubborn_shell(dir: &Path) -> PathBuf {
     shell
 }
 
-/// `stubborn_shell`로 `dev` 세션을 만들고, trap이 걸려 SIGHUP을 무시하게 될 때까지 기다린다.
+/// Creates a `dev` session with `stubborn_shell` and waits until the trap is set and SIGHUP is ignored.
 fn new_stubborn_session(bin: &Path) -> St {
     let mut st = state();
     st.env.push(("SHELL", stubborn_shell(bin).into_os_string()));
@@ -743,7 +746,7 @@ fn new_stubborn_session(bin: &Path) -> St {
     st
 }
 
-/// 세션 `name`이 목록에 있고 보관 프로세스에 붙어 있다.
+/// The session `name` is in the list and attached to a holder process.
 fn listed_alive(st: &St, name: &str) -> bool {
     let mut c = client(st);
     c.send(&ToDaemon::List);
@@ -751,21 +754,21 @@ fn listed_alive(st: &St, name: &str) -> bool {
         Some(FromDaemon::Sessions { sessions }) => {
             sessions.iter().any(|s| s.meta.name == name && s.alive)
         }
-        other => panic!("List에 Sessions가 오지 않았다: {other:?}"),
+        other => panic!("List didn't get Sessions: {other:?}"),
     }
 }
 
 #[test]
 fn kill_then_new_with_same_name_keeps_the_new_session() {
-    // 끝나 가는 보관 프로세스(SIGHUP 무시, 2초 뒤 SIGKILL)가 남은 채 같은 이름으로 다시 만들면, 데몬이 옛 보관
-    // 프로세스에 붙어 새 세션이 사라지거나 옛 쪽이 새 소켓을 지우고 새 세션 폴더에 exit 파일을 썼다.
+    // If it's recreated with the same name while a holder process that is about to end (SIGHUP ignored, SIGKILL after 2 seconds) remains, the daemon attached to the old holder
+    // process so the new session disappeared, or the old one removed the new socket and wrote an exit file into the new session directory.
     let bin = tmp();
     let st = new_stubborn_session(bin.path());
     mine(&st, &["kill", "dev"]);
     mine(&st, &["new", "dev"]);
     assert!(listed_alive(&st, "dev"));
     client(&st).attach("dev");
-    // 옛 보관 프로세스는 이미 끝났어야 하지만, 남아 있다면 SIGKILL로 끝날 때까지 기다리고도 남는 시간이다.
+    // The old holder process should already have ended, but if it remains, this leaves time enough to wait until SIGKILL ends it.
     std::thread::sleep(Duration::from_secs(3));
     assert!(listed_alive(&st, "dev"));
     assert!(client(&st).attach("dev").contains("ready"));
@@ -785,7 +788,7 @@ fn new_is_refused_while_the_same_name_is_closing() {
     let mut c = client(&st);
     let killed_at = Instant::now();
     c.send(&ToDaemon::Kill { id: st.id("dev") });
-    // 보관 프로세스가 아직 끝나지 않았다. 같은 이름은 거절한다.
+    // The holder process hasn't ended yet. The same name is refused.
     let out = mine_raw(&st, &["new", "dev"]);
     assert!(!out.status.success());
     assert!(
@@ -793,14 +796,14 @@ fn new_is_refused_while_the_same_name_is_closing() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    // Kill의 답은 보관 프로세스가 SIGKILL로 끝난 뒤에 온다.
+    // The reply to Kill comes after the holder process ends with SIGKILL.
     loop {
-        match c.recv().expect("연결이 끊겼다") {
+        match c.recv().expect("the connection dropped") {
             FromDaemon::Sessions { sessions } => {
                 assert!(sessions.is_empty());
                 break;
             }
-            FromDaemon::Error { message } => panic!("Kill이 실패했다: {message}"),
+            FromDaemon::Error { message } => panic!("Kill failed: {message}"),
             _ => {}
         }
     }
@@ -811,8 +814,8 @@ fn new_is_refused_while_the_same_name_is_closing() {
 
 #[test]
 fn sessions_do_not_inherit_the_daemon_spawners_environment() {
-    // 데몬을 tmux 안이나 claude-b 세션 안에서 띄웠어도 그 환경이 세션 자식에게 새면 안 된다.
-    // 가짜 로그인 셸과 가짜 `claude`는 환경을 `<dump>/<MINE_SESSION>`에 적는다.
+    // Even if the daemon was started inside tmux or a claude-b session, that environment must not leak into the session child.
+    // The fake login shell and the fake `claude` write their environment to `<dump>/<MINE_SESSION>`.
     let bin = tmp();
     let dump = bin.path().join("env");
     fs::create_dir(&dump).unwrap();
@@ -840,7 +843,7 @@ fn sessions_do_not_inherit_the_daemon_spawners_environment() {
         ("CLAUDE_PID", "4242".into()),
         ("CLAUDE_CONFIG_DIR", "/tmp/fake-claude-b".into()),
         ("MINE_SESSION", "stale".into()),
-        // 사용자가 일부러 켠 설정은 세션 자식까지 넘어가야 한다.
+        // Settings the user turned on deliberately must pass through to the session child.
         ("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", "1".into()),
         ("CLAUDE_CODE_USE_BEDROCK", "1".into()),
     ]);
@@ -866,7 +869,7 @@ fn sessions_do_not_inherit_the_daemon_spawners_environment() {
         "CLAUDE_CONFIG_DIR={}",
         st.root.join("profiles").join("claude-b").display()
     );
-    // 값에는 토큰이 들어 있을 수 있으므로 실패 메시지에는 변수 이름만 적는다.
+    // Values may contain tokens, so the failure message gives only the variable name.
     let names = |env: &[String]| -> Vec<String> {
         env.iter()
             .map(|kv| {
@@ -895,7 +898,7 @@ fn sessions_do_not_inherit_the_daemon_spawners_environment() {
             })
             .filter(|k| !(name == "b" && k == "CLAUDE_CONFIG_DIR" && env.contains(&profile)))
             .collect();
-        assert!(leaked.is_empty(), "{name}: 새어 나온 변수 {leaked:?}");
+        assert!(leaked.is_empty(), "{name}: leaked variables {leaked:?}");
         for want in [
             "TERM=xterm-256color".to_string(),
             "COLORTERM=truecolor".to_string(),
@@ -905,7 +908,7 @@ fn sessions_do_not_inherit_the_daemon_spawners_environment() {
         ] {
             assert!(
                 env.contains(&want),
-                "{name}: {} 없음, 있는 변수 {:?}",
+                "{name}: {} is missing, variables present {:?}",
                 want.split_once('=').map_or(want.as_str(), |(k, _)| k),
                 names(&env)
             );
@@ -916,7 +919,7 @@ fn sessions_do_not_inherit_the_daemon_spawners_environment() {
 
 #[test]
 fn shell_output_shows_working_then_idle_after_quiet() {
-    // shell 세션은 훅이 없으므로 출력이 있으면 작업 중, 2초 동안 없으면 대기다(설계 5.2).
+    // A shell session has no hooks, so with output it's Working, and with none for 2 seconds it's Idle (design 5.2).
     let st = state();
     mine(&st, &["new", "w"]);
     wait_shell_quiet(&st, "w");
@@ -924,13 +927,13 @@ fn shell_output_shows_working_then_idle_after_quiet() {
     c.attach("w");
     c.send(&ToDaemon::List);
     let state_push = |c: &mut Client| loop {
-        if let FromDaemon::Sessions { sessions } = c.recv().expect("연결이 끊겼다") {
+        if let FromDaemon::Sessions { sessions } = c.recv().expect("the connection dropped") {
             break sessions[0].state.clone();
         }
     };
     assert_eq!(state_push(&mut c), SessionState::Idle);
     c.input("echo hi\n");
-    // 바뀔 때만 알리므로 다음 목록은 작업 중이고, 그다음 목록은 조용해진 뒤의 대기다.
+    // It announces only on change, so the next list is Working and the one after is Idle after it went quiet.
     assert_eq!(state_push(&mut c), SessionState::Working);
     let working_at = Instant::now();
     let row = &ls(&st)[0];

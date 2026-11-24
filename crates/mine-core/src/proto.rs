@@ -1,7 +1,7 @@
-//! 보관 프로세스·데몬·클라이언트가 주고받는 JSON 줄 프로토콜.
+//! JSON line protocol spoken by the holder process, daemon and clients.
 //!
-//! 메시지 하나가 JSON 객체 한 줄(`\n`으로 끝남)이다. 열거형은 `t` 필드로 종류를 나타내고,
-//! 바이트 필드는 base64 문자열로 실어 줄바꿈이 섞이지 않게 한다.
+//! One message is one line holding a JSON object (ending in `\n`). Enums name their variant in the `t` field,
+//! and byte fields are carried as base64 strings so no newlines get mixed in.
 
 use std::io::{self, BufRead, Write};
 
@@ -11,12 +11,12 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::session::{NewSession, SessionInfo};
 
-/// 클라이언트와 데몬 사이 프로토콜 버전. 2에서 `Colors`가 생겼다(1인 데몬은 모르는 메시지에 연결을 끊는다).
+/// Protocol version between client and daemon. `Colors` was added in 2 (a version 1 daemon drops the connection on a message it doesn't know).
 pub const VERSION: u32 = 2;
-/// 데몬과 보관 프로세스 사이 프로토콜 버전.
+/// Protocol version between daemon and holder process.
 pub const HOLD_VERSION: u32 = 1;
 
-/// 바이트 필드를 base64 문자열로 직렬화하는 `serde(with)` 도우미.
+/// `serde(with)` helper that serializes byte fields as base64 strings.
 mod b64 {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
@@ -32,7 +32,7 @@ mod b64 {
     }
 }
 
-/// 보관 프로세스가 데몬에 보내는 메시지.
+/// Messages the holder process sends to the daemon.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(tag = "t")]
 pub enum HoldOut {
@@ -49,7 +49,7 @@ pub enum HoldOut {
     },
 }
 
-/// 데몬이 보관 프로세스에 보내는 메시지.
+/// Messages the daemon sends to the holder process.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(tag = "t")]
 pub enum HoldIn {
@@ -64,7 +64,7 @@ pub enum HoldIn {
     Kill,
 }
 
-/// 클라이언트가 데몬에 보내는 메시지.
+/// Messages a client sends to the daemon.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(tag = "t")]
 pub enum ToDaemon {
@@ -96,14 +96,14 @@ pub enum ToDaemon {
     Poke {
         id: String,
     },
-    /// 바깥 터미널의 기본 전경색과 배경색(`#rrggbb`). 데몬이 모든 화면의 색 질의 답에 쓴다.
+    /// The outer terminal's default foreground and background colors (`#rrggbb`). The daemon uses them to answer color queries on every screen.
     Colors {
         fg: String,
         bg: String,
     },
 }
 
-/// 데몬이 클라이언트에 보내는 메시지.
+/// Messages the daemon sends to a client.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(tag = "t")]
 pub enum FromDaemon {
@@ -128,26 +128,26 @@ pub enum FromDaemon {
     },
 }
 
-/// 메시지를 JSON 한 줄(끝 `\n` 포함)로 만든다. 한 번에 쓰도록 버퍼 하나로 돌려준다.
+/// Turns a message into one line of JSON (including the trailing `\n`). Returned as a single buffer so it is written in one go.
 fn encode<T: Serialize>(msg: &T) -> io::Result<Vec<u8>> {
     let mut line = serde_json::to_vec(msg).map_err(io::Error::other)?;
     line.push(b'\n');
     Ok(line)
 }
 
-/// 읽은 한 줄을 메시지로 해석한다. 형식이 틀리면 `InvalidData`다.
+/// Parses a line that was read into a message. A malformed line is `InvalidData`.
 fn decode<T: DeserializeOwned>(line: &str) -> io::Result<T> {
     serde_json::from_str(line.trim_end_matches(['\n', '\r']))
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
-/// 메시지를 JSON 한 줄로 쓰고 비운다.
+/// Writes a message as one line of JSON and flushes.
 pub fn write_msg<W: Write, T: Serialize>(w: &mut W, msg: &T) -> io::Result<()> {
     w.write_all(&encode(msg)?)?;
     w.flush()
 }
 
-/// 한 줄을 읽어 메시지로 해석한다. 입력 끝이면 `None`이다.
+/// Reads one line and parses it into a message. `None` at end of input.
 pub fn read_msg<R: BufRead, T: DeserializeOwned>(r: &mut R) -> io::Result<Option<T>> {
     let mut line = String::new();
     if r.read_line(&mut line)? == 0 {
@@ -156,13 +156,13 @@ pub fn read_msg<R: BufRead, T: DeserializeOwned>(r: &mut R) -> io::Result<Option
     decode(&line).map(Some)
 }
 
-/// [`write_msg`]의 비동기 판.
+/// Async version of [`write_msg`].
 pub async fn send<W: AsyncWrite + Unpin, T: Serialize>(w: &mut W, msg: &T) -> io::Result<()> {
     w.write_all(&encode(msg)?).await?;
     w.flush().await
 }
 
-/// [`read_msg`]의 비동기 판.
+/// Async version of [`read_msg`].
 pub async fn recv<R: AsyncBufRead + Unpin, T: DeserializeOwned>(
     r: &mut R,
 ) -> io::Result<Option<T>> {

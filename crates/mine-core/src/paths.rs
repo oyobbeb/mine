@@ -1,4 +1,4 @@
-//! 상태 폴더(`~/.mine`)의 경로 배치와 폴더 생성.
+//! Layout of the state directory (`~/.mine`) and directory creation.
 
 use std::ffi::OsString;
 use std::fs;
@@ -9,10 +9,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{Result, bail};
 use sha2::{Digest, Sha256};
 
-/// 상태 폴더 위치를 바꾸는 환경 변수.
+/// Environment variable that overrides the state directory location.
 const STATE_DIR_ENV: &str = "MINE_STATE_DIR";
 
-/// 유닉스 소켓 경로 한도(macOS `sun_path`, 끝 NUL 포함). 경로 바이트 수가 이보다 작아야 한다.
+/// Unix socket path limit (macOS `sun_path`, including the trailing NUL). The path byte count must be below this.
 pub const SOCK_PATH_MAX: usize = 104;
 
 #[derive(Debug, Clone)]
@@ -21,12 +21,12 @@ pub struct State {
 }
 
 impl State {
-    /// `MINE_STATE_DIR`가 있으면 그 경로를, 없으면 `$HOME/.mine`을 상태 폴더로 쓴다.
+    /// Uses the `MINE_STATE_DIR` path as the state directory if set, otherwise `$HOME/.mine`.
     pub fn from_env() -> Result<State> {
         State::resolve(std::env::var_os(STATE_DIR_ENV), std::env::var_os("HOME"))
     }
 
-    /// 환경 값을 인자로 받아 상태 폴더를 정한다. 테스트가 프로세스 환경을 건드리지 않게 분리했다.
+    /// Picks the state directory from environment values passed as arguments. Split out so tests don't touch the process environment.
     fn resolve(state_dir: Option<OsString>, home: Option<OsString>) -> Result<State> {
         let root = match (state_dir, home) {
             (Some(dir), _) if !dir.is_empty() => PathBuf::from(dir),
@@ -54,12 +54,12 @@ impl State {
         self.sessions_dir().join(id)
     }
 
-    /// 보관 소켓을 두는 폴더.
+    /// Directory that holds the holder sockets.
     pub fn run_dir(&self) -> PathBuf {
         self.root.join("run")
     }
 
-    /// 보관 소켓은 macOS 소켓 경로 한도(104바이트)를 넘지 않도록 id의 해시 앞 12자로 짓는다.
+    /// The holder socket is named with the first 12 chars of the id's hash so it stays under the macOS socket path limit (104 bytes).
     pub fn hold_sock(&self, id: &str) -> PathBuf {
         self.run_dir()
             .join(format!("{}.sock", sha256_hex_prefix(id.as_bytes(), 12)))
@@ -78,7 +78,7 @@ impl State {
     }
 }
 
-/// 소켓 경로가 한도 안인지 본다. 넘으면 바인드·연결 전에 알아보기 쉬운 오류를 낸다.
+/// Checks that the socket path is within the limit. If it is over, fails with an easy-to-recognize error before bind/connect.
 pub fn check_sock_path(p: &Path) -> Result<()> {
     let len = p.as_os_str().len();
     if len >= SOCK_PATH_MAX {
@@ -90,12 +90,12 @@ pub fn check_sock_path(p: &Path) -> Result<()> {
     Ok(())
 }
 
-/// 폴더를 (상위 포함) 만들고, 새로 만드는 폴더의 권한을 0o700으로 한다.
+/// Creates the directory (including parents) and sets permissions of newly created directories to 0o700.
 pub fn ensure_dir(p: &Path) -> io::Result<()> {
     fs::DirBuilder::new().recursive(true).mode(0o700).create(p)
 }
 
-/// SHA-256의 16진수 표기 앞 `len`자.
+/// The first `len` chars of the hex form of the SHA-256.
 pub(crate) fn sha256_hex_prefix(data: &[u8], len: usize) -> String {
     let hex: String = Sha256::digest(data)
         .iter()
@@ -201,6 +201,6 @@ mod tests {
             let mode = fs::metadata(&p).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o700, "{}", p.display());
         }
-        ensure_dir(&leaf).unwrap(); // 이미 있어도 성공한다
+        ensure_dir(&leaf).unwrap(); // succeeds even if it already exists
     }
 }

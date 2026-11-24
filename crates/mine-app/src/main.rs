@@ -1,7 +1,7 @@
-//! mine 데스크톱 앱(`mine-app`). 데몬의 클라이언트로 붙어 상태별 세션 목록을 보여 준다.
+//! The mine desktop app (`mine-app`). It connects to the daemon as a client and shows the session list grouped by state.
 //!
-//! 창을 닫아도 앱은 Dock에 남고(macOS 관례), Dock 아이콘을 누르면 같은 뷰로 창을 다시 연다. ⌘Q는 앱만 끝내고
-//! 데몬과 세션은 남는다.
+//! Closing the window does not quit the app: it stays in the Dock (macOS convention), and clicking the Dock icon
+//! reopens the window with the same view. ⌘Q quits only the app; the daemon and sessions stay.
 
 mod actions;
 mod launcher;
@@ -27,14 +27,14 @@ use actions::Quit;
 use model::Model;
 use workspace::{Problem, Workspace};
 
-/// 창을 닫아도 남는 뿌리 뷰. Dock 아이콘으로 다시 연 창도 이 뷰를 그린다.
+/// The root view that outlives the window. A window reopened from the Dock icon draws this view too.
 struct MainView(AnyView);
 
 impl Global for MainView {}
 
 fn main() {
     let app = Application::new();
-    // 보이는 창이 없을 때 Dock 아이콘을 누르면 불린다. 최소화한 창이 남아 있으면 새로 열지 않고 그 창을 되살린다.
+    // Called when the Dock icon is clicked while no window is visible. If a minimized window remains, restore it instead of opening a new one.
     app.on_reopen(|cx| {
         match cx.windows().first() {
             Some(window) => {
@@ -60,13 +60,13 @@ fn main() {
     });
 }
 
-/// 상태 폴더와 `mine`을 찾아 데몬 연결을 띄운 뷰. 찾지 못하면 그 사유를 보이는 뷰다.
+/// The view that looks up the state folder and `mine` and starts the daemon link. If it can't find them, the view shows the reason.
 fn root_view(cx: &mut App) -> AnyView {
     let state = match State::from_env() {
         Ok(state) => state,
         Err(e) => return cx.new(|_| Problem(format!("{e:#}"))).into(),
     };
-    // macOS의 current_exe()는 심볼릭 링크 경로를 그대로 준다. 링크(~/bin/mine-app)가 아니라 실제 파일 옆에서 찾는다.
+    // On macOS, current_exe() returns the symlink path as is. Look next to the real file, not next to the link (~/bin/mine-app).
     let exe_dir = std::env::current_exe()
         .and_then(|exe| exe.canonicalize())
         .ok()
@@ -88,7 +88,7 @@ fn root_view(cx: &mut App) -> AnyView {
     cx.new(|cx| Workspace::new(model, state, link, cx)).into()
 }
 
-/// 앱을 띄운 폴더의 프로젝트. Dock에서 띄우면 폴더가 `/`라서 홈 폴더에서 찾고, 그렇게 대신했는지를 함께 준다.
+/// The project of the folder the app was launched from. Launched from the Dock the folder is `/`, so it looks in the home directory instead, and also reports whether it made that substitution.
 fn current_project(state: &State) -> (PathBuf, bool) {
     let (start, home_fallback) = match std::env::current_dir() {
         Ok(dir) if dir != Path::new("/") => (dir, false),
@@ -101,7 +101,7 @@ fn current_project(state: &State) -> (PathBuf, bool) {
     (root, home_fallback)
 }
 
-/// 1200×800 창을 화면 가운데에 연다. 제목줄은 목업 색으로 직접 그린다.
+/// Opens the 1200×800 window in the center of the screen. The title bar is drawn by hand in the mockup colors.
 fn open_window(cx: &mut App) {
     let view = cx.global::<MainView>().0.clone();
     let bounds = Bounds::centered(None, size(px(1200.), px(800.)), cx);

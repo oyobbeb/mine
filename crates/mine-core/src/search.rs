@@ -1,11 +1,11 @@
-//! 스크롤백 찾기. 줄 목록에서 검색어가 시작하는 곳을 모은다.
+//! Scrollback search. Collects where the query starts in a list of lines.
 
-/// 두 글자가 대소문자를 빼면 같은가. 소문자가 여러 글자로 풀리는 글자(`İ`)도 글자 단위로 견준다.
+/// Whether two chars are equal ignoring case. Chars whose lowercase expands to several chars (`İ`) are still compared char by char.
 fn same(a: char, b: char) -> bool {
     a == b || a.to_lowercase().eq(b.to_lowercase())
 }
 
-/// `query`가 시작하는 곳을 (줄, 글자 위치)로 모두 모은다. 대소문자는 가리지 않고, 겹쳐도 센다.
+/// Collects every place `query` starts as (line, char position). Case-insensitive, and overlapping matches count.
 pub fn find(lines: &[String], query: &str) -> Vec<(usize, usize)> {
     let query: Vec<char> = query.chars().collect();
     if query.is_empty() {
@@ -41,7 +41,7 @@ mod tests {
 
     #[test]
     fn find_reports_every_match_by_char_index() {
-        // 한 줄에 여럿(겹쳐도), 한글, 소문자로 바꾸면 바이트 길이가 달라지는 `İ`(2바이트 → 3바이트)가 앞에 있어도 글자 위치다.
+        // Several per line (overlapping too), Hangul, and `İ` whose byte length changes when lowercased (2 bytes → 3 bytes) in front: positions are still char positions.
         assert_eq!(find(&l(&["abab", "aaa"]), "ab"), vec![(0, 0), (0, 2)]);
         assert_eq!(find(&l(&["aaa"]), "aa"), vec![(0, 0), (0, 1)]);
         assert_eq!(find(&l(&["가나다 나", "İ Ab"]), "나"), vec![(0, 1), (0, 4)]);

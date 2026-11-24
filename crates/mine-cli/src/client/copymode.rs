@@ -1,7 +1,7 @@
-//! tmux식 복사 모드. 시작할 때 얼려 둔 줄(스크롤백 + 보이는 줄)을 키보드로 돌아다니며 고르고 검색한다.
-//! 순수 상태 기계라 I/O를 하지 않는다. 얼려 둔 화면과 맞추는 일(`reveal`, `highlight`)만 클라이언트 화면을 읽는다.
+//! tmux-style copy mode. Moves around the lines frozen at start (scrollback + visible lines) with the keyboard to select and search.
+//! A pure state machine, so it does no I/O. Only syncing with the frozen screen (`reveal`, `highlight`) reads the client screen.
 //!
-//! 좌표는 줄 번호(`lines` 인덱스, 0이 가장 오래된 줄)와 글자 위치(`char` 인덱스, 바이트도 칸도 아니다)다.
+//! Coordinates are a line number (index into `lines`, 0 being the oldest line) and a character position (a `char` index, neither a byte nor a cell).
 
 use alacritty_terminal::grid::{Dimensions, Grid, Row};
 use alacritty_terminal::index::{Column, Line};
@@ -12,13 +12,13 @@ use mine_core::screen::Screen;
 use mine_core::search::find;
 use mine_core::select::Selection;
 
-/// 키 하나를 먹은 결과.
+/// The result of consuming one key.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CopyOut {
     Stay,
-    /// 복사 모드를 끝낸다.
+    /// Ends copy mode.
     Exit,
-    /// 이 글자를 복사하고 끝낸다.
+    /// Copies this text and ends.
     Copy(String),
 }
 
@@ -26,40 +26,40 @@ pub enum CopyOut {
 pub struct CopyMode {
     pub line: usize,
     pub col: usize,
-    /// `v`로 시작한 선택의 시작점. 커서까지가 선택이다.
+    /// The start point of a selection begun with `v`. The selection runs up to the cursor.
     pub anchor: Option<(usize, usize)>,
-    /// 마지막으로 확정한 검색어. `n`·`N`과 빈 입력의 Enter가 되풀이한다.
+    /// The last confirmed search query. `n`, `N` and Enter on empty input repeat it.
     pub query: String,
-    /// 마지막으로 확정한 검색의 방향. `/`는 앞으로(아래로), `?`는 뒤로(위로)다.
+    /// The direction of the last confirmed search. `/` is forward (down), `?` is backward (up).
     pub forward: bool,
-    /// `/`·`?` 뒤 검색어를 입력하는 중이다.
+    /// A search query is being typed after `/` or `?`.
     pub typing: bool,
-    /// 명령 키 자리에 한글이 와서 아무것도 하지 않았다. 다음 키나 휠까지 상태줄이 영문으로 바꾸라고 알린다.
+    /// Hangul arrived where a command key goes and nothing was done. Until the next key or wheel, the status line tells the user to switch to English.
     pub hangul: bool,
-    /// 입력 중인 검색어. Enter로 확정하기 전에는 `query`를 건드리지 않아서 Esc가 지난 검색을 그대로 둔다.
+    /// The query being typed. `query` isn't touched until Enter confirms it, so Esc leaves the previous search as it was.
     pub input: String,
-    /// 입력 중인 검색의 방향. Enter로 확정하면 `forward`가 된다.
+    /// The direction of the search being typed. It becomes `forward` once Enter confirms it.
     typing_forward: bool,
-    /// 한 쪽의 줄 수(터미널 칸의 줄 수). `freeze`가 화면 줄 수로 정한다.
-    /// 쪽 넘김(PgUp·PgDn·⌃b·⌃f)은 이만큼, 반 쪽 넘김(⌃u·⌃d)은 이 절반만큼 커서를 옮긴다.
+    /// Lines per page (the number of lines in the terminal pane). `freeze` sets it from the screen's line count.
+    /// Page keys (PgUp, PgDn, ⌃b, ⌃f) move the cursor by this much, half-page keys (⌃u, ⌃d) by half of it.
     pub page: usize,
-    /// 아직 화면에 반영하지 않은, 커서가 쪽 넘김·휠로 옮긴 줄 수(아래가 양수). `reveal`이 화면을 같은 줄 수만큼 따라 옮기고 비운다.
+    /// The number of lines the cursor has moved by page keys or the wheel that hasn't been reflected on screen yet (positive is down). `reveal` moves the screen by the same number of lines and clears it.
     drift: i32,
-    /// 방금 한 검색이 맞는 곳을 찾지 못했다. 다음 키에 지워진다.
+    /// The search just made found no match. Cleared on the next key.
     pub miss: bool,
-    /// 검색어에 넣다 만 UTF-8 글자의 앞 바이트.
+    /// The leading bytes of a UTF-8 character that was only partly entered into the query.
     pending: Vec<u8>,
-    /// 줄 바꿈으로 다음 줄에 이어지는 줄의, 줄 수에서 잘려 나간 오른쪽 공백 수. 이어지지 않는 줄은 `None`이다.
-    /// 복사할 때 이런 줄은 공백을 되살려 `\n` 없이 다음 줄에 붙인다.
+    /// For a line that continues onto the next line by wrapping, the number of right-hand spaces cut off from its line count. `None` for a line that doesn't continue.
+    /// When copying, such a line gets its spaces back and is joined to the next line without a `\n`.
     wraps: Vec<Option<usize>>,
 }
 
-/// 이 줄의 글자 수.
+/// The number of characters in this line.
 fn len_at(lines: &[String], line: usize) -> usize {
     lines.get(line).map_or(0, |l| l.chars().count())
 }
 
-/// 한 줄의 `from`번째 글자부터 `to`번째(포함)까지, 없으면 줄 끝까지. 바이트가 아니라 글자 위치로 센다.
+/// From the `from`-th character of a line through the `to`-th (inclusive), or to the end of the line if none. Counted in character positions, not bytes.
 fn slice(line: &str, from: usize, to: Option<usize>) -> String {
     let rest = line.chars().skip(from);
     match to {
@@ -69,8 +69,8 @@ fn slice(line: &str, from: usize, to: Option<usize>) -> String {
 }
 
 impl CopyMode {
-    /// 마지막으로 글자가 있는 줄의 처음에서 시작한다. 화면 아래 빈 줄에서 시작하면 커서가 허공에 뜨기 때문이다.
-    /// 모든 줄이 비었으면 맨 아랫줄이다.
+    /// Starts at the beginning of the last line that has any characters. Starting on a blank line at the bottom of the screen would leave the cursor floating in the air.
+    /// If all lines are empty, it's the bottom line.
     pub fn new(lines: &[String]) -> Self {
         let line = lines
             .iter()
@@ -111,7 +111,7 @@ impl CopyMode {
             b'$' => self.col = len_at(lines, self.line).saturating_sub(1),
             b'g' => (self.line, self.col) = (0, 0),
             b'G' => (self.line, self.col) = (lines.len().saturating_sub(1), 0),
-            // 쪽 넘김(PgUp·PgDn은 `split`을 거쳐 ⌃b·⌃f로 들어온다). 반 쪽은 적어도 한 줄은 간다.
+            // A page key (PgUp and PgDn come in as ⌃b and ⌃f via `split`). A half page moves at least one line.
             0x02 => self.move_lines(lines, -(self.page as isize)),
             0x06 => self.move_lines(lines, self.page as isize),
             0x15 => self.move_lines(lines, -((self.page / 2).max(1) as isize)),
@@ -131,7 +131,7 @@ impl CopyMode {
         CopyOut::Stay
     }
 
-    /// 화살표(`A`~`D`). 검색어를 입력하는 중에는 아무것도 하지 않는다.
+    /// Arrow keys (`A`–`D`). Does nothing while a search query is being typed.
     pub fn arrow(&mut self, lines: &[String], dir: u8) -> CopyOut {
         if self.typing {
             return CopyOut::Stay;
@@ -145,15 +145,15 @@ impl CopyMode {
         self.key(lines, vi)
     }
 
-    /// `line`(마지막 줄을 넘으면 마지막 줄)으로 옮기고 `col`을 그 줄 안으로 줄인다.
+    /// Moves to `line` (the last line if it's past it) and clamps `col` into that line.
     fn go(&mut self, lines: &[String], line: usize) {
         self.line = line.min(lines.len().saturating_sub(1));
         self.col = self.col.min(len_at(lines, self.line).saturating_sub(1));
     }
 
-    /// 커서를 `delta`줄(아래가 양수) 옮긴다. 처음과 끝에서 멈추고 `col`은 새 줄 안으로 줄인다.
-    /// 화면은 `reveal`이 옮긴 줄 수만큼 따라 움직여서 커서가 화면의 같은 줄에 머문다.
-    /// 키를 거치지 않는 휠에서도 "No matches"이 걷히게 여기서 알림을 지운다.
+    /// Moves the cursor by `delta` lines (positive is down). Stops at the start and end, and clamps `col` into the new line.
+    /// The screen follows by the number of lines `reveal` moved, so the cursor stays on the same line of the screen.
+    /// Also clears the notice here so "No matches" goes away even on a wheel scroll that doesn't pass through a key.
     pub fn move_lines(&mut self, lines: &[String], delta: isize) {
         self.miss = false;
         self.hangul = false;
@@ -162,10 +162,10 @@ impl CopyMode {
         self.drift += self.line as i32 - from as i32;
     }
 
-    /// 검색어를 입력하는 중의 키. Esc는 입력만 취소하고 복사 모드에 남는다.
+    /// A key while a search query is being typed. Esc only cancels the input and stays in copy mode.
     fn type_key(&mut self, lines: &[String], b: u8) {
         match b {
-            // 입력만 접는다. 지난 검색어와 방향은 그대로라 `n`·`N`이 이어서 된다.
+            // Only fold up the input. The previous query and direction are unchanged, so `n` and `N` continue from them.
             0x1b => {
                 self.typing = false;
                 self.input.clear();
@@ -176,7 +176,7 @@ impl CopyMode {
                 self.pending.clear();
                 self.search(lines);
             }
-            // 덜 온 글자가 있으면 그 조각만 버린다.
+            // If there is a partly arrived character, discard only that fragment.
             0x7f | 0x08 => {
                 if self.pending.is_empty() {
                     self.input.pop();
@@ -192,7 +192,7 @@ impl CopyMode {
                         self.input.push_str(text);
                         self.pending.clear();
                     }
-                    // 글자가 아직 덜 왔다. 다음 바이트를 기다린다.
+                    // The character hasn't fully arrived yet. Wait for the next byte.
                     Err(e) if e.error_len().is_none() => {}
                     Err(_) => self.pending.clear(),
                 }
@@ -200,9 +200,9 @@ impl CopyMode {
         }
     }
 
-    /// Enter: 입력한 검색어를 확정하고, 방향대로 커서 자리나 그 앞·뒤의 첫 매치로 간다.
-    /// 끝까지 없으면 반대쪽 끝으로 돌아가 찾는다. 입력이 비었으면 지난 검색어를 새 방향으로 되풀이하는데,
-    /// 이때는 `n`처럼 커서 다음 매치로 간다(커서 자리를 맞는 곳으로 치면 제자리에 선다).
+    /// Enter: confirms the typed query and goes to the first match at or before/after the cursor position, depending on direction.
+    /// If there is none to the end, it wraps around to the opposite end and searches there. If the input is empty, it repeats the previous query in the new direction,
+    /// and this time it goes to the next match after the cursor like `n` (if the cursor position counted as a match, it would stay in place).
     fn search(&mut self, lines: &[String]) {
         let forward = self.typing_forward;
         let input = std::mem::take(&mut self.input);
@@ -221,7 +221,7 @@ impl CopyMode {
         self.jump(hit.copied());
     }
 
-    /// `n`(앞으로)·`N`(뒤로): 커서 다음·이전 매치로 간다. 끝에서는 반대쪽 끝으로 돌아간다.
+    /// `n` (forward) and `N` (backward): go to the next or previous match after the cursor. At the end, wrap around to the opposite end.
     fn step(&mut self, lines: &[String], forward: bool) {
         let hits = find(lines, &self.query);
         let here = (self.line, self.col);
@@ -233,7 +233,7 @@ impl CopyMode {
         self.jump(hit.copied());
     }
 
-    /// 매치로 옮긴다. 없으면 제자리에 두고 알린다(검색어가 비었으면 알릴 것도 없다).
+    /// Moves to a match. If there is none, leaves the cursor where it is and notifies (if the query is empty, there's nothing to notify).
     fn jump(&mut self, hit: Option<(usize, usize)>) {
         match hit {
             Some((line, col)) => (self.line, self.col) = (line, col),
@@ -241,7 +241,7 @@ impl CopyMode {
         }
     }
 
-    /// `y`·Enter: 선택이 있으면 그 글자를 복사하고, 없으면 tmux처럼 복사 없이 끝낸다.
+    /// `y` and Enter: copies the selection if there is one, otherwise ends without copying, like tmux.
     fn yank(&self, lines: &[String]) -> CopyOut {
         let Some(anchor) = self.anchor else {
             return CopyOut::Exit;
@@ -257,7 +257,7 @@ impl CopyMode {
             out.push_str(&slice(text, start, (i == to.0).then_some(to.1)));
             if i < to.0 {
                 match self.wraps.get(i).copied().flatten() {
-                    // 줄 바꿈으로 이어진 줄: 끝의 공백도 글자고, 다음 줄에 바로 붙는다.
+                    // A line continued by wrapping: the trailing spaces are characters too, and join straight onto the next line.
                     Some(pad) => out.extend(std::iter::repeat_n(' ', pad)),
                     None => out.push('\n'),
                 }
@@ -266,7 +266,7 @@ impl CopyMode {
         CopyOut::Copy(out)
     }
 
-    /// 상태줄에 띄울 글. 검색어를 입력하는 중이면 그 입력이다.
+    /// The text to show in the status line. While a search query is being typed, it's that input.
     pub fn status(&self, total: usize) -> String {
         if self.typing {
             let prompt = if self.typing_forward { '/' } else { '?' };
@@ -282,10 +282,10 @@ impl CopyMode {
         format!("Copy mode │ {}/{total} │ {hint}", self.line + 1)
     }
 
-    /// 클라이언트 화면을 커서 줄이 보이게 스크롤한다. 쪽 넘김·휠로 커서가 옮긴 줄 수는 화면도 그만큼 따라 옮기고,
-    /// 그 밖에는 이미 보이면 그대로 두고 벗어났으면 가장자리까지만 옮긴다.
+    /// Scrolls the client screen so the cursor line is visible. For lines the cursor moved by page keys or the wheel, the screen follows by the same number of lines;
+    /// otherwise it leaves things as they are if already visible, and moves only as far as the edge if off screen.
     pub fn reveal(&mut self, screen: &mut Screen) {
-        // 화면 스크롤은 위가 양수라 커서와 부호가 반대다. 스크롤백 끝에서 막히면 아래에서 보이게 맞춘다.
+        // Screen scrolling is positive upward, so its sign is opposite to the cursor's. If blocked at the end of the scrollback, adjust so it's visible from below.
         screen.scroll(-std::mem::take(&mut self.drift));
         let (row, rows) = {
             let grid = screen.term().grid();
@@ -301,8 +301,8 @@ impl CopyMode {
         screen.scroll(delta as i32);
     }
 
-    /// 지금 보이는 화면 위에 반전으로 칠할 곳. 선택이 없으면 커서 칸 하나다.
-    /// 선택이 화면 밖으로 나가면 보이는 첫 칸·마지막 칸에서 자르고, 통째로 밖이면 `None`이다.
+    /// The area to paint inverted over the currently visible screen. If there is no selection, it's the one cursor cell.
+    /// If the selection runs off screen, it's clipped at the first and last visible cells; if it's entirely off screen, `None`.
     pub fn highlight(&self, screen: &Screen) -> Option<Selection> {
         let grid = screen.term().grid();
         let (rows, cols) = (grid.screen_lines() as i64, grid.columns());
@@ -329,18 +329,18 @@ impl CopyMode {
     }
 }
 
-/// 얼려 둔 줄 번호의 그리드 줄 번호. 스크롤백은 음수다.
+/// The grid line number for a frozen line number. Scrollback is negative.
 fn line_of(grid: &Grid<Cell>, line: usize) -> i32 {
     line as i32 - grid.history_size() as i32
 }
 
-/// 얼려 둔 줄 번호가 지금 스크롤 위치에서 보이는 화면의 몇 번째 줄인가. 화면 밖이면 음수이거나 화면 줄 수 이상이다.
+/// Which line of the currently visible screen a frozen line number is at the current scroll position. Off screen it is negative or at least the screen's line count.
 fn view_row(grid: &Grid<Cell>, line: usize) -> i64 {
     i64::from(line_of(grid, line)) + grid.display_offset() as i64
 }
 
-/// 줄의 `char_idx`번째 글자(결합 문자 포함)가 놓인 칸. `history_text`와 같은 셈법이다: 넓은 글자의 뒤 칸은 건너뛰고
-/// 칸 하나에 얹힌 결합 문자는 글자 하나씩으로 센다.
+/// The cell where the `char_idx`-th character (combining characters included) of a line sits. Counted the same way as `history_text`: cells after a wide character are skipped,
+/// and combining characters stacked on one cell are counted one character each.
 fn grid_col(row: &Row<Cell>, cols: usize, char_idx: usize) -> usize {
     let mut seen = 0;
     for x in 0..cols {
@@ -359,9 +359,9 @@ fn grid_col(row: &Row<Cell>, cols: usize, char_idx: usize) -> usize {
     cols - 1
 }
 
-/// 복사 모드를 시작할 때 얼려 둘 줄(스크롤백 + 보이는 줄)과 그 줄에서 시작하는 `CopyMode`.
-/// 줄은 `Screen::history_text` 그대로 화면 줄 하나가 한 줄이다. 줄 바꿈으로 이어진 줄은 `wraps`에 따로 적어 둔다.
-/// 한 쪽(`page`)은 화면 줄 수, 곧 터미널 칸의 줄 수다. 따로 정해 주는 걸 잊어도 한 줄씩 넘기지 않게 여기서 정한다.
+/// The lines to freeze when starting copy mode (scrollback + visible lines) and the `CopyMode` that starts on that line.
+/// The lines are exactly `Screen::history_text`'s, one screen line per line. Lines continued by wrapping are recorded separately in `wraps`.
+/// A page (`page`) is the screen's line count, i.e. the number of lines in the terminal pane. It's set here so forgetting to set it separately doesn't make it page one line at a time.
 pub fn freeze(screen: &Screen) -> (Vec<String>, CopyMode) {
     let lines = screen.history_text();
     let mut mode = CopyMode::new(&lines);
@@ -370,8 +370,8 @@ pub fn freeze(screen: &Screen) -> (Vec<String>, CopyMode) {
     (lines, mode)
 }
 
-/// `lines`(`history_text`)의 줄마다, 자동 줄 바꿈으로 다음 줄에 이어졌으면 `history_text`가 뗀 오른쪽 공백 수를 돌려준다.
-/// 이어졌는지는 `mine_core::select::selected_text`와 같게 줄 끝 칸의 `WRAPLINE`으로 본다.
+/// For each line of `lines` (`history_text`), if it continued onto the next line by auto-wrap, returns the number of right-hand spaces `history_text` stripped.
+/// Whether it continued is judged by `WRAPLINE` on the last cell of the line, the same as `mine_core::select::selected_text`.
 fn wrap_pads(screen: &Screen, lines: &[String]) -> Vec<Option<usize>> {
     let grid = screen.term().grid();
     let cols = grid.columns();
@@ -382,7 +382,7 @@ fn wrap_pads(screen: &Screen, lines: &[String]) -> Vec<Option<usize>> {
             if !row[Column(cols - 1)].flags.contains(Flags::WRAPLINE) {
                 return None;
             }
-            // `history_text`와 같은 셈법으로 센 글자 수에서 남은 글자 수를 뺀다.
+            // Subtract the remaining character count from the character count, counted the same way as `history_text`.
             let full: usize = (0..cols)
                 .map(|x| &row[Column(x)])
                 .filter(|cell| {
@@ -397,11 +397,11 @@ fn wrap_pads(screen: &Screen, lines: &[String]) -> Vec<Option<usize>> {
         .collect()
 }
 
-/// 입력 덩이에서 뽑은 키.
+/// A key extracted from a chunk of input.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Key {
     Byte(u8),
-    /// 화살표의 끝 바이트 `A`(위) `B`(아래) `C`(오른쪽) `D`(왼쪽).
+    /// The final byte of an arrow, `A` (up), `B` (down), `C` (right), `D` (left).
     Arrow(u8),
     /// `ESC [ 5 ~`.
     PageUp,
@@ -409,12 +409,12 @@ pub enum Key {
     PageDown,
 }
 
-/// 세션에 넘길 뻔한 입력 덩이를 키로 나눈다. 키마다 그 키가 끝나는 바이트 위치(앞서 버린 시퀀스 포함)를 함께 돌려준다.
-/// 복사 모드를 끝낸 키 뒤의 `bytes[끝..]`을 세션에 넘기려고 쓴다.
+/// Splits an input chunk that was about to go to the session into keys. Returns, with each key, the byte position where that key ends (including sequences discarded before it).
+/// Used to pass `bytes[end..]` after the key that ended copy mode to the session.
 ///
-/// 화살표(`ESC [ A`, `ESC O A` 등)는 `Arrow`, PgUp·PgDn은 `PageUp`·`PageDown`, 단독 Esc는 `Byte(0x1b)`,
-/// 그 밖의 이스케이프 시퀀스(다른 CSI·SS3, Alt 키)는 통째로 버린다. Esc가 연달아 오면 Esc 키가 둘이다.
-/// 글자는 바이트 하나씩이다.
+/// An arrow (`ESC [ A`, `ESC O A`, etc.) is `Arrow`, PgUp and PgDn are `PageUp` and `PageDown`, a lone Esc is `Byte(0x1b)`,
+/// and any other escape sequence (other CSI and SS3, Alt keys) is discarded whole. If Esc comes twice in a row, that's two Esc keys.
+/// Characters are one byte each.
 pub fn split(bytes: &[u8]) -> Vec<(Key, usize)> {
     let mut out = Vec::new();
     let mut i = 0;
@@ -429,13 +429,13 @@ pub fn split(bytes: &[u8]) -> Vec<(Key, usize)> {
             out.push((Key::Byte(0x1b), i));
             break;
         };
-        // Esc 뒤에 Esc가 오면 앞의 것은 Esc 키 단독이다. 뒤의 것은 다음 바퀴에서 읽는다.
+        // If Esc follows Esc, the earlier one is a lone Esc key. The later one is read in the next round.
         if lead == 0x1b {
             out.push((Key::Byte(0x1b), i));
             continue;
         }
         i += 1;
-        // CSI(`[`)는 0x40..=0x7e 바이트로, SS3(`O`)는 바이트 하나로 끝난다. 그 밖에는 Alt 키라서 하나만 버린다.
+        // CSI (`[`) ends with a byte in 0x40..=0x7e and SS3 (`O`) with one byte. Anything else is an Alt key, so just one is discarded.
         let end = match lead {
             b'[' => bytes[i..]
                 .iter()
@@ -445,7 +445,7 @@ pub fn split(bytes: &[u8]) -> Vec<(Key, usize)> {
             _ => continue,
         };
         let Some(end) = end else { break };
-        // 수정 키가 붙은 `ESC [ 5 ; 2 ~`도 쪽 넘김이다. 첫 매개변수만 본다.
+        // `ESC [ 5 ; 2 ~` with a modifier is a page key too. Only the first parameter is looked at.
         let first = bytes[i..end].split(|&c| c == b';').next();
         let key = match (bytes[end], first) {
             (b'A'..=b'D', _) => Some(Key::Arrow(bytes[end])),
@@ -461,15 +461,15 @@ pub fn split(bytes: &[u8]) -> Vec<(Key, usize)> {
     out
 }
 
-/// kitty 키보드 프로토콜로 온, 수정 키 없는 Esc 누름의 세 꼴(`CSI 27 u`, `CSI 27;1 u`, `CSI 27;1:1 u`).
-/// 세션이 그 프로토콜을 켜 두면 복사 모드를 나온 직후부터 Esc가 이렇게 온다(modifyOtherKeys는 Esc를 그대로 보낸다).
+/// The three forms of an Esc press without modifiers that arrive via the kitty keyboard protocol (`CSI 27 u`, `CSI 27;1 u`, `CSI 27;1:1 u`).
+/// If the session has that protocol on, Esc arrives like this right after leaving copy mode (modifyOtherKeys sends Esc as is).
 const KITTY_ESC: [&[u8]; 3] = [b"\x1b[27u", b"\x1b[27;1u", b"\x1b[27;1:1u"];
 
-/// Esc로 복사 모드를 끝낸 뒤 남은 바이트 맨 앞의 단독 Esc를 뗀다. Esc를 빠르게 두 번 눌러 나오는 사람이 많은데,
-/// 둘째 Esc가 세션에 가면 Claude Code에서 턴을 끊고 Esc Esc는 되감기를 연다.
-/// 단독 Esc는 맨 Esc 바이트와 kitty 인코딩의 수정 키 없는 Esc 누름(`KITTY_ESC`)이다.
-/// CSI(`ESC [`)·SS3(`ESC O`)의 다른 시퀀스는 남기고, 수정 키가 붙었거나 뗌·반복 이벤트인 Esc도 남긴다.
-/// 맨 앞이 아닌 Esc도 그대로 둔다.
+/// After copy mode is ended with Esc, strips the lone Esc at the very front of the remaining bytes. Many people press Esc twice quickly to get out,
+/// and if the second Esc went to the session, in Claude Code it would interrupt the turn, and Esc Esc opens rewind.
+/// A lone Esc is a bare Esc byte or the kitty-encoded Esc press without modifiers (`KITTY_ESC`).
+/// Other sequences of CSI (`ESC [`) and SS3 (`ESC O`) are kept, as is an Esc that has a modifier or is a release or repeat event.
+/// An Esc that isn't at the very front is left alone too.
 pub fn drop_lone_esc(mut rest: &[u8]) -> &[u8] {
     loop {
         if let Some(tail) = KITTY_ESC.iter().find_map(|esc| rest.strip_prefix(*esc)) {
@@ -513,12 +513,12 @@ mod tests {
         let ls = l(&["foo", "bar", "foo x foo"]);
         let mut c = CopyMode::new(&ls);
         assert_eq!(at(&c), (2, 0));
-        // 커서 자리도 맞는 곳이다.
+        // The cursor position is a match too.
         search(&mut c, &ls, "foo");
         assert_eq!(at(&c), (2, 0));
         c.key(&ls, b'n');
         assert_eq!(at(&c), (2, 6));
-        // 마지막 매치에서 n은 첫 매치로 돌아간다.
+        // From the last match, n wraps back to the first match.
         c.key(&ls, b'n');
         assert_eq!(at(&c), (0, 0));
         c.key(&ls, b'n');
@@ -532,7 +532,7 @@ mod tests {
         search(&mut c, &ls, "foo");
         c.key(&ls, b'N');
         assert_eq!(at(&c), (0, 0));
-        // 첫 매치에서 N은 마지막 매치로 돌아간다.
+        // From the first match, N wraps back to the last match.
         c.key(&ls, b'N');
         assert_eq!(at(&c), (2, 6));
         c.key(&ls, b'N');
@@ -557,7 +557,7 @@ mod tests {
         assert_eq!(at(&c), (0, 0));
         assert!(c.miss && !c.typing);
         assert!(c.status(2).contains("No matches"));
-        // n도 못 찾으면 마찬가지고, 다른 키를 누르면 알림이 걷힌다.
+        // The same if n finds nothing either, and pressing another key clears the notice.
         c.key(&ls, b'n');
         assert!(c.miss);
         c.key(&ls, b'j');
@@ -581,15 +581,15 @@ mod tests {
     fn selection_is_normalised_whichever_end_comes_first() {
         let ls = l(&["alpha", "beta"]);
         let mut c = CopyMode::new(&ls);
-        // 커서가 선택 시작점의 위·왼쪽에 있다.
+        // The cursor is above and to the left of the selection start.
         typed(&mut c, &ls, "Gllvkh");
         assert_eq!((c.anchor, at(&c)), (Some((1, 2)), (0, 1)));
         assert_eq!(c.key(&ls, b'y'), CopyOut::Copy("lpha\nbet".into()));
-        // 한 줄 안의 범위는 양 끝 글자를 포함한다.
+        // A range within one line includes both end characters.
         let mut c = CopyMode::new(&ls);
         typed(&mut c, &ls, "glvll");
         assert_eq!(c.key(&ls, b'y'), CopyOut::Copy("lph".into()));
-        // 가운데 줄은 통째로 담는다.
+        // Middle lines are included whole.
         let ls = l(&["one", "two", "three"]);
         let mut c = CopyMode::new(&ls);
         typed(&mut c, &ls, "gvjjl");
@@ -630,7 +630,7 @@ mod tests {
         assert!(c.typing);
         assert_eq!(c.key(&ls, 0x1b), CopyOut::Stay);
         assert!(!c.typing && c.input.is_empty() && c.query.is_empty());
-        // 입력 중이 아니면 Esc는 끝낸다. 입력 중에는 q도 글자다.
+        // When not typing, Esc ends. While typing, q is a character too.
         c.key(&ls, b'/');
         assert_eq!(c.key(&ls, b'q'), CopyOut::Stay);
         assert_eq!(c.input, "q");
@@ -644,7 +644,7 @@ mod tests {
         let mut c = CopyMode::new(&ls);
         c.key(&ls, b'/');
         let bytes = "세계".as_bytes();
-        // 세는 3바이트다. 다 오기 전에는 검색어에 넣지 않는다.
+        // 세 is 3 bytes. It isn't added to the query until all of it has arrived.
         c.key(&ls, bytes[0]);
         c.key(&ls, bytes[1]);
         assert_eq!(c.input, "");
@@ -669,7 +669,7 @@ mod tests {
         assert_eq!(c.input, "a한");
         c.key(&ls, 0x7f);
         assert_eq!(c.input, "a");
-        // 한의 앞 바이트만 오고 지우면 그 조각만 버린다.
+        // If only the leading byte of 한 arrives and then it's erased, only that fragment is discarded.
         c.key(&ls, "한".as_bytes()[0]);
         c.key(&ls, 0x08);
         assert_eq!(c.input, "a");
@@ -703,7 +703,7 @@ mod tests {
         typed(&mut c, &ls, "g");
         typed(&mut c, &ls, "llllllllll");
         assert_eq!(at(&c), (0, 5));
-        // j는 col을 새 줄 길이로 줄인다.
+        // j clamps col to the new line's length.
         typed(&mut c, &ls, "j");
         assert_eq!(at(&c), (1, 1));
         typed(&mut c, &ls, "j");
@@ -730,7 +730,7 @@ mod tests {
         assert_eq!(at(&c), (0, 0));
     }
 
-    /// `l00`~`l29` 서른 줄에 한 쪽이 열 줄이다. 커서는 마지막 줄에서 시작한다.
+    /// Thirty lines `l00`–`l29` with ten lines per page. The cursor starts on the last line.
     fn thirty() -> (Vec<String>, CopyMode) {
         let ls: Vec<String> = (0..30).map(|i| format!("l{i:02}")).collect();
         let mut c = CopyMode::new(&ls);
@@ -742,7 +742,7 @@ mod tests {
     fn page_keys_move_a_page_and_half_page_keys_move_half() {
         let (ls, mut c) = thirty();
         assert_eq!(c.line, 29);
-        // ⌃b·⌃f는 한 쪽(10줄), ⌃u·⌃d는 반 쪽(5줄)이다.
+        // ⌃b and ⌃f move one page (10 lines), ⌃u and ⌃d half a page (5 lines).
         c.key(&ls, 0x02);
         assert_eq!(c.line, 19);
         c.key(&ls, 0x15);
@@ -751,7 +751,7 @@ mod tests {
         assert_eq!(c.line, 19);
         c.key(&ls, 0x06);
         assert_eq!(c.line, 29);
-        // 한 줄짜리 쪽에서도 반 쪽은 한 줄은 움직인다.
+        // Even on a one-line page, a half page moves at least one line.
         c.page = 1;
         c.key(&ls, 0x15);
         assert_eq!(c.line, 28);
@@ -764,7 +764,7 @@ mod tests {
         c.key(&ls, 0x04);
         assert_eq!(c.line, 29);
         typed(&mut c, &ls, "g");
-        // 맨 위에서 더 올라가지 않는다. 쪽보다 적게 남았으면 남은 만큼만 간다.
+        // It doesn't go further up at the top. If fewer lines remain than a page, it moves only what remains.
         c.key(&ls, 0x02);
         c.key(&ls, 0x15);
         assert_eq!(c.line, 0);
@@ -773,7 +773,7 @@ mod tests {
         c.key(&ls, 0x06);
         c.key(&ls, 0x06);
         assert_eq!(c.line, 29);
-        // 열은 새 줄 안으로 줄어든다.
+        // The column is clamped into the new line.
         let ls = l(&["abcdef", "ab", "abcdef"]);
         let mut c = CopyMode::new(&ls);
         c.page = 1;
@@ -803,20 +803,20 @@ mod tests {
         let ls = l(&["abcdef", "", "한글x"]);
         let mut c = CopyMode::new(&ls);
         assert_eq!(at(&c), (2, 0));
-        // 글자 위치로 센다: `한글x`의 끝은 2번째 글자다.
+        // Counted by character position: the end of `한글x` is the 2nd character.
         typed(&mut c, &ls, "$");
         assert_eq!(at(&c), (2, 2));
         typed(&mut c, &ls, "0");
         assert_eq!(at(&c), (2, 0));
-        // 빈 줄에서는 0이다.
+        // On an empty line it's 0.
         typed(&mut c, &ls, "k$");
         assert_eq!(at(&c), (1, 0));
         typed(&mut c, &ls, "k$");
         assert_eq!(at(&c), (0, 5));
-        // 선택과 함께 쓰면 줄 끝까지 복사한다.
+        // Used together with a selection, it copies through to the end of the line.
         typed(&mut c, &ls, "0lv$");
         assert_eq!(c.key(&ls, b'y'), CopyOut::Copy("bcdef".into()));
-        // 검색어를 입력하는 중에는 글자다.
+        // While a search query is being typed, it's a character.
         c.key(&ls, b'/');
         typed(&mut c, &ls, "0$");
         assert_eq!((c.input.as_str(), at(&c)), ("0$", (0, 5)));
@@ -834,7 +834,7 @@ mod tests {
         assert_eq!(c.status(6), "?foo");
         c.key(&ls, b'\r');
         assert_eq!(at(&c), (4, 0));
-        // n은 검색한 방향(뒤)으로, N은 반대(앞)로 간다. 끝에서는 반대쪽 끝으로 돌아간다.
+        // n goes in the direction searched (backward), N the opposite (forward). At the end, they wrap to the opposite end.
         c.key(&ls, b'n');
         assert_eq!(at(&c), (2, 0));
         c.key(&ls, b'n');
@@ -845,7 +845,7 @@ mod tests {
         assert_eq!(at(&c), (0, 0));
         c.key(&ls, b'N');
         assert_eq!(at(&c), (2, 0));
-        // 다시 `/`로 검색하면 방향이 앞으로 바뀐다.
+        // Searching again with `/` changes the direction to forward.
         search(&mut c, &ls, "foo");
         assert_eq!(at(&c), (2, 0));
         c.key(&ls, b'n');
@@ -860,12 +860,12 @@ mod tests {
         let mut c = CopyMode::new(&ls);
         typed(&mut c, &ls, "$");
         assert_eq!(at(&c), (2, 8));
-        // 커서 자리도 맞는 곳이다(`/`와 같다).
+        // The cursor position is a match too (same as `/`).
         c.key(&ls, b'?');
         typed(&mut c, &ls, "oo");
         c.key(&ls, b'\r');
         assert_eq!(at(&c), (2, 7));
-        // 앞에 매치가 없으면 마지막 매치로 돌아온다.
+        // If there's no match before it, it comes back to the last match.
         let ls = l(&["x", "foo", "bar foo"]);
         let mut c = CopyMode::new(&ls);
         typed(&mut c, &ls, "g");
@@ -885,19 +885,19 @@ mod tests {
         let mut c = CopyMode::new(&ls);
         search(&mut c, &ls, "foo");
         assert_eq!(at(&c), (4, 0));
-        // `?`는 빈 입력으로 시작하고, 지난 검색어는 상태줄에 보이지 않는다.
+        // `?` starts with empty input, and the previous query isn't shown in the status line.
         c.key(&ls, b'?');
         assert_eq!((c.input.as_str(), c.status(5).as_str()), ("", "?"));
         typed(&mut c, &ls, "ba");
         c.key(&ls, 0x1b);
-        // Esc는 입력만 접고, 지난 검색어와 방향(앞으로)은 그대로다.
+        // Esc only folds up the input; the previous query and direction (forward) stay.
         assert!(!c.typing);
         assert_eq!((c.query.as_str(), c.forward), ("foo", true));
         c.key(&ls, b'n');
         assert_eq!(at(&c), (0, 0));
         c.key(&ls, b'N');
         assert_eq!(at(&c), (4, 0));
-        // 방향이 뒤였어도 마찬가지다.
+        // The same even if the direction was backward.
         c.key(&ls, b'?');
         typed(&mut c, &ls, "foo");
         c.key(&ls, b'\r');
@@ -915,22 +915,22 @@ mod tests {
         let ls = l(&["foo 1", "bar", "foo 2", "baz", "foo 3", "tail"]);
         let mut c = CopyMode::new(&ls);
         search(&mut c, &ls, "foo");
-        // 커서 뒤에 매치가 없어 처음으로 돌아가 (0, 0)이다.
+        // There's no match after the cursor, so it wraps to the start, (0, 0).
         assert_eq!(at(&c), (0, 0));
-        // 빈 `/` Enter: 같은 검색어로 앞으로. n처럼 커서 다음 매치로 가서 제자리에 서지 않는다.
+        // Empty `/` Enter: forward with the same query. Like n, it goes to the next match after the cursor and doesn't stay in place.
         c.key(&ls, b'/');
         c.key(&ls, b'\r');
         assert_eq!((at(&c), c.query.as_str(), c.typing), ((2, 0), "foo", false));
         c.key(&ls, b'/');
         c.key(&ls, b'\r');
         assert_eq!(at(&c), (4, 0));
-        // 빈 `?` Enter: 새 방향(뒤)으로 되풀이하고, 이제 n도 뒤로 간다.
+        // Empty `?` Enter: repeats in the new direction (backward), and now n goes backward too.
         c.key(&ls, b'?');
         c.key(&ls, b'\r');
         assert_eq!((at(&c), c.forward), ((2, 0), false));
         c.key(&ls, b'n');
         assert_eq!(at(&c), (0, 0));
-        // 지난 검색어가 없으면 아무 일도 없다.
+        // If there's no previous query, nothing happens.
         let mut c = CopyMode::new(&ls);
         c.key(&ls, b'?');
         c.key(&ls, b'\r');
@@ -939,16 +939,16 @@ mod tests {
 
     #[test]
     fn paging_moves_the_view_by_as_many_lines_as_the_cursor() {
-        // 3줄 화면에 31줄이 있고 스크롤백은 28줄이다. 한 쪽은 3줄이다.
+        // A 3-line screen holds 31 lines, and the scrollback is 28 lines. A page is 3 lines.
         let mut sc = screen(10, 3, &numbered(30));
         let ls = sc.history_text();
         let mut c = CopyMode::new(&ls);
         c.page = 3;
         c.reveal(&mut sc);
         assert_eq!((c.line, offset(&sc)), (29, 0));
-        // 커서가 화면 가운데 줄에 있다.
+        // The cursor is on the middle line of the screen.
         assert_eq!(c.highlight(&sc), Some(sel((0, 1), (0, 1))));
-        // 쪽 넘김은 화면도 같은 줄 수만큼 움직여 커서가 같은 줄에 머문다. 가장자리까지만 스크롤하지 않는다.
+        // A page key moves the screen by the same number of lines, so the cursor stays on the same line. It doesn't scroll only up to the edge.
         c.key(&ls, 0x02);
         c.reveal(&mut sc);
         assert_eq!((c.line, offset(&sc)), (26, 3));
@@ -956,14 +956,14 @@ mod tests {
         c.key(&ls, 0x06);
         c.reveal(&mut sc);
         assert_eq!((c.line, offset(&sc)), (29, 0));
-        // 맨 위에서는 화면이 더 올라가지 못해도 커서는 보인다.
+        // At the top, the cursor stays visible even if the screen can't go up any further.
         for _ in 0..12 {
             c.key(&ls, 0x02);
         }
         c.reveal(&mut sc);
         assert_eq!((c.line, offset(&sc)), (0, 28));
         assert_eq!(c.highlight(&sc), Some(sel((0, 0), (0, 0))));
-        // 밀린 줄 수는 한 번만 쓴다.
+        // The number of lines pushed is used only once.
         c.reveal(&mut sc);
         assert_eq!(offset(&sc), 28);
     }
@@ -997,7 +997,7 @@ mod tests {
         c.key(&ls, b'/');
         typed(&mut c, &ls, "ab");
         assert_eq!(c.status(3), "/ab");
-        // 역방향 검색은 `?`로 입력을 보여 준다.
+        // A backward search shows its input with `?`.
         c.key(&ls, 0x1b);
         c.key(&ls, b'?');
         typed(&mut c, &ls, "ab");
@@ -1015,13 +1015,13 @@ mod tests {
         assert_eq!(keys(b"\x1bOA\x1bOD"), [Arrow(b'A'), Arrow(b'D')]);
         assert_eq!(keys(b"\x1b"), [Byte(0x1b)]);
         assert_eq!(keys(b"j\x1b"), [Byte(b'j'), Byte(0x1b)]);
-        // PgUp(`5~`)·PgDn(`6~`)는 수정 키가 붙어도 쪽 넘김이다.
+        // PgUp (`5~`) and PgDn (`6~`) are page keys even with a modifier.
         assert_eq!(keys(b"\x1b[5~\x1b[6~\x1b[5;2~"), [PageUp, PageDown, PageUp]);
-        // 수정 키가 붙은 화살표도 화살표고, 다른 CSI·SS3와 Alt 키는 통째로 버린다.
+        // An arrow with a modifier is still an arrow, and other CSI, SS3 and Alt keys are discarded whole.
         assert_eq!(keys(b"\x1b[1;5Aq"), [Arrow(b'A'), Byte(b'q')]);
         assert_eq!(keys(b"\x1b[3~\x1b[15~\x1b[H\x1bOPj"), [Byte(b'j')]);
         assert_eq!(keys(b"\x1bxj"), [Byte(b'j')]);
-        // 끝나지 않은 시퀀스는 버린다. 글자는 바이트 하나씩 간다.
+        // An unfinished sequence is discarded. Characters go one byte at a time.
         assert_eq!(keys(b"j\x1b["), [Byte(b'j')]);
         assert_eq!(keys("한\r".as_bytes()).len(), 4);
         assert_eq!(keys(b"\r"), [Byte(b'\r')]);
@@ -1030,7 +1030,7 @@ mod tests {
     #[test]
     fn split_reports_where_each_key_ends() {
         use Key::{Arrow, Byte, PageDown};
-        // 버린 시퀀스도 지나온 길이에 들어간다.
+        // A discarded sequence counts toward the length passed over too.
         assert_eq!(
             split(b"q\x1b[Als"),
             [
@@ -1044,7 +1044,7 @@ mod tests {
         assert_eq!(split(b"\x1bxj"), [(Byte(b'j'), 3)]);
         assert_eq!(split(b"\x1bOBx"), [(Arrow(b'B'), 3), (Byte(b'x'), 4)]);
         assert_eq!(split(b"\x1b[6~"), [(PageDown, 4)]);
-        // 끝낸 키 뒤는 그대로 남는다.
+        // What follows the key that ended it is left as is.
         let bytes = b"qls\r";
         let (key, end) = split(bytes)[0];
         assert_eq!((key, &bytes[end..]), (Byte(b'q'), b"ls\r".as_slice()));
@@ -1067,11 +1067,11 @@ mod tests {
         assert_eq!(drop_lone_esc(b"\x1b"), b"");
         assert_eq!(drop_lone_esc(b"\x1b\x1b\x1b"), b"");
         assert_eq!(drop_lone_esc(b"\x1b\x1bls\r"), b"ls\r");
-        // 시퀀스의 시작은 남긴다.
+        // The start of a sequence is kept.
         assert_eq!(drop_lone_esc(b"\x1b[A"), b"\x1b[A");
         assert_eq!(drop_lone_esc(b"\x1b\x1bOA"), b"\x1bOA");
         assert_eq!(drop_lone_esc(b"\x1b\x1b\x1b[5~x"), b"\x1b[5~x");
-        // kitty 키보드의 수정 키 없는 Esc 누름도 단독 Esc다. 수정 키가 붙었거나 뗌·반복 이벤트는 남긴다.
+        // An Esc press without modifiers in the kitty keyboard protocol is a lone Esc too. One with a modifier, or a release or repeat event, is kept.
         assert_eq!(drop_lone_esc(b"\x1b[27u"), b"");
         assert_eq!(drop_lone_esc(b"\x1b[27;1u\x1b[27;1:1u\x1bls"), b"ls");
         assert_eq!(drop_lone_esc(b"\x1b\x1b[27uls"), b"ls");
@@ -1079,14 +1079,14 @@ mod tests {
         assert_eq!(drop_lone_esc(b"\x1b[27;2u"), b"\x1b[27;2u");
         assert_eq!(drop_lone_esc(b"\x1b[27;1:3u"), b"\x1b[27;1:3u");
         assert_eq!(drop_lone_esc(b"\x1b[270u"), b"\x1b[270u");
-        // 맨 앞이 아니면 건드리지 않는다.
+        // If it isn't at the very front, leave it alone.
         assert_eq!(drop_lone_esc(b"ls\x1b"), b"ls\x1b");
         assert_eq!(drop_lone_esc(b"x\x1b\x1b"), b"x\x1b\x1b");
     }
 
     #[test]
     fn freeze_sets_the_page_to_the_screen_lines() {
-        // 3줄 화면이면 한 쪽은 3줄이다. 따로 정해 주지 않아도 한 줄씩 넘기지 않는다.
+        // With a 3-line screen, a page is 3 lines. Even if not set separately, it doesn't page one line at a time.
         let sc = screen(10, 3, &numbered(30));
         let (ls, mut c) = freeze(&sc);
         assert_eq!((c.page, c.line), (3, 29));
@@ -1122,7 +1122,7 @@ mod tests {
 
     #[test]
     fn reveal_scrolls_just_enough_to_show_the_cursor_line() {
-        // 3줄 화면에 10줄을 써서 맨 아래에는 line9와 빈 줄이 있고, 스크롤백은 8줄이다.
+        // 10 lines written on a 3-line screen, so the bottom has line9 and a blank line, and the scrollback is 8 lines.
         let mut sc = screen(10, 3, &numbered(10));
         let ls = sc.history_text();
         assert_eq!(ls.len(), 11);
@@ -1130,18 +1130,18 @@ mod tests {
         assert_eq!(c.line, 9);
         c.reveal(&mut sc);
         assert_eq!(offset(&sc), 0);
-        // 맨 위로 가면 끝까지 거슬러 올라간다.
+        // Going to the top scrolls all the way back.
         c.key(&ls, b'g');
         c.reveal(&mut sc);
         assert_eq!(offset(&sc), 8);
-        // 화면 안에서는 스크롤하지 않고, 화면 아래로 벗어나는 순간 한 줄씩만 내려온다.
+        // Within the screen it doesn't scroll, and the moment it goes off the bottom of the screen it comes down only one line at a time.
         c.key(&ls, b'j');
         c.reveal(&mut sc);
         assert_eq!(offset(&sc), 8);
         typed(&mut c, &ls, "jj");
         c.reveal(&mut sc);
         assert_eq!((c.line, offset(&sc)), (3, 7));
-        // 한 줄 위로 벗어나면 한 줄만 올라간다.
+        // Going one line off the top moves up only one line.
         typed(&mut c, &ls, "kkk");
         c.reveal(&mut sc);
         assert_eq!((c.line, offset(&sc)), (0, 8));
@@ -1159,18 +1159,18 @@ mod tests {
         let mut sc = screen(10, 3, &numbered(10));
         let ls = sc.history_text();
         let mut c = CopyMode::new(&ls);
-        // 커서는 line9(보이는 줄 1)의 첫 칸이다.
+        // The cursor is on the first cell of line9 (visible line 1).
         assert_eq!(c.highlight(&sc), Some(sel((0, 1), (0, 1))));
         typed(&mut c, &ls, "ll");
         assert_eq!(c.highlight(&sc), Some(sel((2, 1), (2, 1))));
-        // 선택은 anchor에서 커서까지다. 커서가 앞에 있어도 같다.
+        // The selection runs from the anchor to the cursor. The same even if the cursor is before it.
         typed(&mut c, &ls, "vk");
         assert_eq!(c.highlight(&sc), Some(sel((2, 0), (2, 1))));
-        // 위로 벗어난 끝은 보이는 첫 칸으로, 아래로 벗어난 끝은 마지막 칸으로 눌러 이어 그린다.
+        // An end that goes off the top is clamped to the first visible cell, and one that goes off the bottom to the last cell, and the paint continues.
         c.key(&ls, b'g');
         c.reveal(&mut sc);
         assert_eq!(c.highlight(&sc), Some(sel((0, 0), (9, 2))));
-        // 선택이 통째로 화면 밖이면 그리지 않는다.
+        // If the selection is entirely off screen, nothing is drawn.
         typed(&mut c, &ls, "G");
         assert_eq!(c.highlight(&sc), None);
     }
@@ -1181,7 +1181,7 @@ mod tests {
         let ls = sc.history_text();
         assert_eq!(ls[0], "한글 ab");
         let mut c = CopyMode::new(&ls);
-        // 한(칸 0~1) 글(칸 2~3) 공백(4) a(5) b(6)
+        // 한 (cells 0–1) 글 (cells 2–3) space (4) a (5) b (6)
         let cols: Vec<u16> = (0..5)
             .map(|_| {
                 let col = c.highlight(&sc).unwrap().start.0;
@@ -1192,7 +1192,7 @@ mod tests {
         assert_eq!(cols, [0, 2, 4, 5, 6]);
     }
 
-    /// 좁은 화면(10칸)에 줄바꿈 없이 25글자를 쓴다. 첫 줄 끝 칸이 공백이라 화면 줄로는 `abcdefghi`로 잘린다.
+    /// Writes 25 characters on a narrow screen (10 cells) without line breaks. The last cell of the first row is a space, so as a screen line it's cut to `abcdefghi`.
     const WRAPPED: &str = "abcdefghi jklmnopqrstuvwx";
 
     fn copy_range(sc: &Screen, keys: &str) -> CopyOut {
@@ -1206,17 +1206,17 @@ mod tests {
         let sc = screen(10, 5, WRAPPED.as_bytes());
         let (ls, _) = freeze(&sc);
         assert_eq!(&ls[..3], ["abcdefghi", "jklmnopqrs", "tuvwx"]);
-        // 처음부터 끝까지: 줄바꿈 자리의 공백은 글자라서 남고 `\n`은 없다.
+        // From start to end: the space at the wrap point is a character so it remains, and there is no `\n`.
         assert_eq!(
             copy_range(&sc, "gvjjllll"),
             CopyOut::Copy(WRAPPED.to_string())
         );
-        // 이어진 줄 한가운데서 시작해 한가운데서 끝나도 같다.
+        // The same when starting in the middle of a wrapped line and ending in the middle.
         assert_eq!(
             copy_range(&sc, "gllllllvjjhh"),
             CopyOut::Copy("ghi jklmnopqrstuv".to_string())
         );
-        // 이어진 두 줄만: 첫 줄 끝 공백이 남는다.
+        // Just the two wrapped lines: the space at the end of the first line remains.
         assert_eq!(
             copy_range(&sc, "gvjl"),
             CopyOut::Copy("abcdefghi jk".to_string())
@@ -1232,12 +1232,12 @@ mod tests {
             ["abcdefghi", "jklmnopqrs", "tuvwx", "next", "last"]
         );
         assert_eq!(c.line, 4);
-        // 이어진 줄에서 진짜 줄바꿈을 지나 다음 줄 일부까지: `\n`은 `tuvwx`와 `next` 사이 하나뿐이다.
+        // From a wrapped line through a real line break into part of the next line: there is exactly one `\n`, between `tuvwx` and `next`.
         assert_eq!(
             copy_range(&sc, "gvjjjlll"),
             CopyOut::Copy(format!("{WRAPPED}\nnext"))
         );
-        // 진짜 줄 둘은 그대로 `\n`으로 잇고 오른쪽 공백은 뗀다.
+        // Two real lines are joined with `\n` as they are, and the right-hand spaces are stripped.
         assert_eq!(
             copy_range(&sc, "gvjjjjll"),
             CopyOut::Copy(format!("{WRAPPED}\nnext\nlas"))
@@ -1246,7 +1246,7 @@ mod tests {
 
     #[test]
     fn rows_that_do_not_wrap_stay_trimmed_and_newline_joined() {
-        // 가득 찬 줄이 아니면 이어진 줄이 아니다.
+        // A line that isn't full is not a wrapped line.
         let sc = screen(10, 5, b"ab  \r\ncd");
         assert_eq!(copy_range(&sc, "gvjl"), CopyOut::Copy("ab\ncd".to_string()));
     }
@@ -1269,7 +1269,7 @@ mod tests {
         c.hangul = true;
         c.key(&ls, b'j');
         assert!(!c.hangul);
-        // 검색어를 입력하는 중에는 입력이 상태줄이다.
+        // While a search query is being typed, the input is the status line.
         c.key(&ls, b'/');
         c.hangul = true;
         assert_eq!(c.status(2), "/");

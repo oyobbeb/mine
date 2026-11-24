@@ -1,10 +1,10 @@
-//! 터미널 칸: 붙은 세션의 화면(`Model::screen`)을 그리고, 칸 크기·휠 스크롤·링크 누르기를 모델에 잇는다.
+//! The terminal pane: draws the attached session's screen (`Model::screen`) and wires pane size, wheel scrolling, and link presses to the model.
 //!
-//! 구조는 Zed의 터미널과 같다. [`render`]가 만드는 `div`(포커스, 키 문맥 [`CONTEXT`], 마우스 처리) 안에 `canvas`
-//! 하나가 있다.
-//! - prepaint: 칸 크기로 행·열을 구해 모델에 알린다(처음이면 `Attach`, 바뀌면 `Resize`). 그다음 보이는 행마다
-//!   [`render::row_runs`]로 글자 묶음을 만들어 모양을 잡는다(shape).
-//! - paint: 바탕 사각형, 글자, 커서 순서로 그린다.
+//! The structure is the same as Zed's terminal: inside the `div` that [`render`] builds (focus, key context [`CONTEXT`],
+//! mouse handling) there is a single `canvas`.
+//! - prepaint: derives rows and columns from the pane size and reports them to the model (`Attach` the first time,
+//!   `Resize` when it changes). Then, for each visible row, builds text runs with [`render::row_runs`] and shapes them.
+//! - paint: draws background rectangles, text, then the cursor, in that order.
 
 pub mod render;
 
@@ -23,18 +23,18 @@ use crate::theme::{TERM_BG, TERM_CURSOR};
 use crate::workspace::Workspace;
 use render::{CellRun, CursorCell};
 
-/// 터미널 칸의 키 문맥. `Workspace` 문맥 안에 있어서 칸에 포커스가 있어도 ⌘ 단축키는 그대로 온다.
+/// The terminal pane's key context. It is inside the `Workspace` context, so ⌘ shortcuts still arrive even when the pane has focus.
 pub const CONTEXT: &str = "Terminal";
 const FONT_FAMILY: &str = "Menlo";
 const FONT_SIZE: Pixels = px(13.);
-/// 칸 가장자리 여백.
+/// Margin around the pane's edge.
 const PADDING: Pixels = px(6.);
-/// 흐린 글(SGR 2)의 불투명도.
+/// Opacity of dim text (SGR 2).
 const DIM: f32 = 0.6;
-/// 막대·밑줄 커서의 두께.
+/// Thickness of the bar and underline cursors.
 const CARET: Pixels = px(2.);
 
-/// 셀 하나의 크기. Menlo 13px의 'M' 폭과 줄 높이(ascent + descent를 올림)다.
+/// The size of one cell: the width of 'M' in Menlo 13px and the line height (ascent + descent, rounded up).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Metrics {
     pub cell_w: Pixels,
@@ -48,16 +48,16 @@ impl Metrics {
         let cell_w = text
             .advance(id, FONT_SIZE, 'M')
             .map_or(FONT_SIZE * 0.6, |advance| advance.width);
-        // 글꼴의 descent는 음수다.
+        // The font's descent is negative.
         let line_h = (text.ascent(id, FONT_SIZE) + text.descent(id, FONT_SIZE).abs()).ceil();
         Metrics { cell_w, line_h }
     }
 }
 
-/// 마지막으로 그린 칸의 자리와 셀 크기. 마우스 자리를 셀로 바꿀 때 쓴다(Task 6의 선택도 쓴다).
+/// The position and cell size of the pane as last drawn. Used to turn a mouse position into a cell (Task 6's selection uses it too).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Geometry {
-    /// 첫 셀(0, 0)의 왼쪽 위, 창 좌표.
+    /// Top left of the first cell (0, 0), in window coordinates.
     pub origin: Point<Pixels>,
     pub metrics: Metrics,
     pub cols: u16,
@@ -65,7 +65,7 @@ pub struct Geometry {
 }
 
 impl Geometry {
-    /// 창 좌표 `pos`가 놓인 셀(열, 행). 칸 밖이면 없다.
+    /// The cell (column, row) under window coordinates `pos`. None if it is outside the pane.
     pub fn cell_at(&self, pos: Point<Pixels>) -> Option<(u16, u16)> {
         let x = f32::from(pos.x - self.origin.x) / f32::from(self.metrics.cell_w);
         let y = f32::from(pos.y - self.origin.y) / f32::from(self.metrics.line_h);
@@ -76,7 +76,7 @@ impl Geometry {
         (col < self.cols && row < self.rows).then_some((col, row))
     }
 
-    /// (`col`, `row`)부터 `cells`칸의 사각형, 창 좌표.
+    /// The rectangle of `cells` cells starting at (`col`, `row`), in window coordinates.
     pub fn cell_bounds(&self, col: u16, row: u16, cells: u16) -> Bounds<Pixels> {
         let Metrics { cell_w, line_h } = self.metrics;
         Bounds::new(
@@ -89,17 +89,17 @@ impl Geometry {
     }
 }
 
-/// 터미널 칸의 뷰 상태. 화면과 붙기·크기는 `Model`에 있고, 여기에는 GPUI 쪽 일만 있다.
+/// View state of the terminal pane. The screen, attaching and size live in `Model`; only GPUI-side work is here.
 pub struct Pane {
-    /// 세션이 붙어 실행 화면이 닫혀 있으면 늘 여기에 포커스를 둔다. Task 5의 키 입력과 입력기가 여기에 걸린다.
+    /// While a session is attached and the launcher is closed, focus is always here. Task 5's key input and input method hook in here.
     pub focus: FocusHandle,
-    /// 마지막으로 그린 칸. 그리기 전에는 없다.
+    /// The pane as last drawn. None before the first draw.
     pub geometry: Option<Geometry>,
-    /// 한 줄이 안 되는 휠 이동의 나머지(픽셀).
+    /// The remainder (pixels) of wheel movement that doesn't make a full line.
     scroll_acc: f32,
-    /// 링크 셀에서 왼쪽 단추를 누른 자리. 같은 자리에서 떼면 연다. 다른 셀로 끌면 버린다.
+    /// Where the left button was pressed on a link cell. Releasing at the same spot opens it. Dragging to another cell discards it.
     press: Option<(u16, u16)>,
-    /// 끝나지 않은 동기화 갱신에 건 타이머의 기한. 같은 기한에 두 번 걸지 않는다.
+    /// The deadline of the timer set for a synchronized update that hasn't ended. It is not set twice for the same deadline.
     sync_timer: Option<Instant>,
 }
 
@@ -116,7 +116,7 @@ impl Pane {
 }
 
 impl Workspace {
-    /// 트랙패드·휠: 화면 사본만 스크롤한다. 세션이 마우스 보고를 켰을 때 세션에 넘기는 것은 Task 6이 한다.
+    /// Trackpad/wheel: scrolls only the local copy of the screen. Passing it on to the session when the session has mouse reporting on is Task 6's job.
     fn term_scroll(&mut self, ev: &ScrollWheelEvent, cx: &mut Context<Self>) {
         let Some(geometry) = self.term.geometry else {
             return;
@@ -155,7 +155,7 @@ impl Workspace {
         }
     }
 
-    /// 누른 링크 셀에서 끌지 않고 떼면 그 링크를 연다.
+    /// Releasing on a pressed link cell without dragging opens that link.
     fn term_release(&mut self, ev: &MouseUpEvent, cx: &mut Context<Self>) {
         let Some(at) = self.term.press.take() else {
             return;
@@ -167,7 +167,7 @@ impl Workspace {
         }
     }
 
-    /// 붙은 세션이 끝내지 않은 동기화 갱신(`?2026`)에 GPUI 타이머를 건다. 기한이 지나면 끝내고 다시 그린다.
+    /// Sets a GPUI timer for the attached session's unfinished synchronized update (`?2026`). When the deadline passes, ends it and redraws.
     pub(crate) fn watch_sync(&mut self, cx: &mut Context<Self>) {
         let Some(deadline) = self.model.sync_deadline() else {
             return;
@@ -184,7 +184,7 @@ impl Workspace {
                 if ws.model.end_stale_sync(Instant::now()) {
                     cx.notify();
                 }
-                // 그사이 새 갱신이 열렸으면 그 기한에 다시 건다.
+                // If a new update opened in the meantime, set the timer again for that deadline.
                 ws.watch_sync(cx);
             });
         })
@@ -192,7 +192,7 @@ impl Workspace {
     }
 }
 
-/// 붙은 세션의 칸. 칸을 누르면 포커스가 온다.
+/// The pane of the attached session. Clicking the pane gives it focus.
 pub fn render(ws: &Workspace, window: &Window, cx: &mut Context<Workspace>) -> impl IntoElement {
     let entity = cx.entity();
     let focused = ws.term.focus.is_focused(window);
@@ -222,7 +222,7 @@ pub fn render(ws: &Workspace, window: &Window, cx: &mut Context<Workspace>) -> i
         )
 }
 
-/// prepaint: 칸 크기를 모델에 알리고, 보이는 행의 글자 묶음과 커서 모양을 잡는다.
+/// prepaint: reports the pane size to the model, and shapes the visible rows' text runs and the cursor.
 fn layout(
     ws: &Entity<Workspace>,
     focused: bool,
@@ -243,7 +243,7 @@ fn layout(
         cols,
         rows,
     };
-    // 뷰의 render는 끝났으니 뷰를 고칠 수 있다. 화면은 여기서 칸 크기로 맞춰지므로 이번 프레임이 새 크기로 그려진다.
+    // The view's render is done, so the view can be modified. The screen is fitted to the pane size here, so this frame is drawn at the new size.
     let (runs, cursor) = ws.update(cx, |ws, _| {
         ws.term.geometry = Some(geometry);
         let effects = ws.model.set_grid(cols, rows);
@@ -276,7 +276,7 @@ fn layout(
     }
 }
 
-/// 한 프레임에 그릴 것.
+/// What to draw in one frame.
 struct Frame {
     bounds: Bounds<Pixels>,
     line_h: Pixels,
@@ -310,12 +310,12 @@ impl Frame {
     }
 }
 
-/// 모양을 잡은 글자 묶음 하나와 그 자리.
+/// One shaped text run and its position.
 struct Painted {
     bounds: Bounds<Pixels>,
     bg: Option<Hsla>,
     line: ShapedLine,
-    /// 글자를 놓을 자리. 넓은 글자는 두 칸 가운데로 민다.
+    /// Where to place the text. A wide character is pushed to the middle of its two cells.
     text_at: Point<Pixels>,
 }
 
@@ -350,8 +350,9 @@ impl Painted {
         let force = glyph_width(run, geometry.metrics.cell_w);
         let bounds = geometry.cell_bounds(run.col, row, run.cells);
         let line = text.shape_line(run.text.clone().into(), FONT_SIZE, &[style], force);
-        // 넓은 글자(한글 등)는 대체 글꼴의 폭이 두 칸보다 좁다. 왼쪽에 붙이면 글자 뒤만 비니 두 칸 가운데에 놓는다.
-        // 줄의 폭은 칸에 맞추기 전 글꼴이 놓은 폭이다.
+        // The fallback font of a wide character (such as Hangul) is narrower than two cells. Pinning it to the left
+        // would leave only the space after it empty, so center it in the two cells. The line's width is the width the
+        // font laid it out at before fitting to cells.
         let mut text_at = bounds.origin;
         let chars = run.text.chars().count();
         if usize::from(run.cells) == 2 * chars {
@@ -370,11 +371,12 @@ impl Painted {
     }
 }
 
-/// 글자 하나가 차지할 폭. 글자마다 셀(넓은 글자는 두 칸)에 맞춰 놓아야 대체 글꼴(한글 등)이 섞여도 칸이 맞는다.
-/// 결합 문자가 얹힌 셀은 글자 수와 칸 수가 맞지 않으니 글꼴이 놓은 대로 둔다.
+/// The width one character occupies. Each character must be placed to fit its cell (two cells for a wide character) so
+/// the cells line up even when a fallback font (for Hangul etc.) is mixed in. A cell with a combining character on it
+/// has a character count that doesn't match its cell count, so leave it as the font laid it out.
 ///
-/// ponytail: 넓은 글자 하나에 결합 문자 하나가 얹힌 셀은 좁은 글자 둘과 구별하지 못해 결합 문자가 반 칸 왼쪽에
-/// 놓인다. 드물어서 둔다.
+/// ponytail: a cell with one combining character on one wide character can't be told apart from two narrow
+/// characters, so the combining character lands half a cell to the left. It's rare, so it stays.
 fn glyph_width(run: &CellRun, cell_w: Pixels) -> Option<Pixels> {
     let chars = run.text.chars().count();
     match usize::from(run.cells) {
@@ -384,7 +386,7 @@ fn glyph_width(run: &CellRun, cell_w: Pixels) -> Option<Pixels> {
     }
 }
 
-/// 그릴 커서. 블록은 칸에 포커스가 있을 때 칠하고 그 글자를 바탕색으로 다시 쓴다. 포커스가 없으면 빈 블록이다.
+/// The cursor to draw. A block is filled when the pane has focus, and the character under it is redrawn in the background color. Without focus it is a hollow block.
 struct Caret {
     bounds: Bounds<Pixels>,
     shape: CursorShape,
@@ -414,7 +416,7 @@ impl Caret {
         }
     }
 
-    /// 글자 밑에 칠하는 블록인가.
+    /// Is it a block painted under the text?
     fn filled(&self) -> bool {
         self.focused && self.shape == CursorShape::Block
     }
@@ -425,7 +427,7 @@ impl Caret {
         match self.shape {
             CursorShape::Block if self.focused => {
                 if let Some(glyph) = &self.glyph {
-                    // 셀 가운데에 놓는다(넓은 글자는 두 칸 가운데).
+                    // Place it in the middle of the cell (the middle of two cells for a wide character).
                     let dx = ((cell.width - glyph.width) / 2.).max(px(0.));
                     let _ = glyph.paint(point(origin.x + dx, origin.y), line_h, window, cx);
                 }
@@ -471,7 +473,7 @@ mod tests {
         assert_eq!(g.cell_at(point(px(100.), px(50.))), Some((0, 0)));
         assert_eq!(g.cell_at(point(px(115.9), px(81.9))), Some((1, 1)));
         assert_eq!(g.cell_at(point(px(179.), px(129.))), Some((9, 4)));
-        // 칸 밖(왼쪽 위 여백, 오른쪽 아래 끝 너머)은 셀이 없다.
+        // Outside the pane (the top left margin, past the bottom right edge) there is no cell.
         assert_eq!(g.cell_at(point(px(99.), px(60.))), None);
         assert_eq!(g.cell_at(point(px(120.), px(49.))), None);
         assert_eq!(g.cell_at(point(px(180.), px(60.))), None);

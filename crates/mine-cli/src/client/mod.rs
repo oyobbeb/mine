@@ -1,7 +1,7 @@
-//! 클라이언트 화면(명령 없이 `mine`). 바깥 터미널을 잡고 데몬에 붙어, 고른 세션 화면을 그리고 입력을 넘긴다.
+//! The client screen (`mine` with no command). Grabs the outer terminal, attaches to the daemon, draws the chosen session's screen and passes input on.
 //!
-//! 이 작업 하나가 상태를 모두 쥐고 표준 입력(스레드)·데몬 메시지(읽기 작업)·SIGWINCH·다시 그릴 때를
-//! `select!` 하나로 기다린다. `select!`에는 취소에 안전한 채널 수신과 타이머만 넣는다.
+//! This one task holds all the state and waits on stdin (a thread), daemon messages (read tasks), SIGWINCH and redraws with a single
+//! `select!`. Only cancellation-safe channel receives and timers go in the `select!`.
 
 pub mod copymode;
 pub mod input;
@@ -44,25 +44,25 @@ use mine_core::view;
 use select::Select;
 use ui::{Hit, LinkRun, Model, Prompt};
 
-/// 다시 그리는 최소 간격(초당 60번).
+/// Minimum interval between redraws (60 per second).
 const FRAME: Duration = Duration::from_micros(16_667);
-/// 휠 한 칸에 스크롤하는 줄 수.
+/// Number of lines scrolled per wheel notch.
 const WHEEL_LINES: i32 = 3;
 
-/// 바깥 화면 좌표와 그 칸.
+/// Outer screen coordinates and the cell there.
 type Cells = Vec<(u16, u16, Cell)>;
 
-/// 클라이언트를 실행한다. `⌃a d`로 나오면 `Ok`다. 데몬과 세션은 계속 돈다.
+/// Runs the client. Returns `Ok` when it exits via `⌃a d`. The daemon and sessions keep running.
 pub async fn run(state: State, project: PathBuf) -> Result<()> {
-    // 계정 이름은 시작할 때 한 번 읽는다. 읽다 남기는 경고가 화면을 깨지 않게 바깥 터미널을 잡기 전에 읽는다.
+    // Account names are read once at startup. They're read before grabbing the outer terminal so a warning left while reading doesn't corrupt the screen.
     let labels = Labels::load(&state, std::env::home_dir().as_deref());
     let _tty = tty::Tty::enter()?;
-    // 표준 입력 읽기 스레드보다 먼저 묻고 끝낸다(R13). 그사이 들어온 키는 아래에서 먼저 먹인다.
+    // Ask before starting the stdin reader thread and finish (R13). Keys that arrive in the meantime are fed first below.
     let (colors, early) = tty::probe_colors();
     let conn = Conn::connect_or_spawn_async(&state).await?;
     let mut stdin = tty::spawn_stdin_reader();
     let mut winch = signal(SignalKind::window_change())?;
-    // 종료·끊김 신호도 `⌃a d`처럼 끝낸다. 키 인코딩 모드를 되돌리고 `Tty`가 바깥 터미널을 되돌린다.
+    // A terminate or hangup signal also ends it like `⌃a d`. The key encoding modes are restored and `Tty` restores the outer terminal.
     let mut term = signal(SignalKind::terminate())?;
     let mut hangup = signal(SignalKind::hangup())?;
     let mut terminal = Terminal::new(CrosstermBackend::new(BufWriter::with_capacity(
@@ -78,13 +78,13 @@ pub async fn run(state: State, project: PathBuf) -> Result<()> {
             bg: bg.to_string(),
         });
     }
-    // 목록 변경을 받으려면 List를 한 번 보내 구독해야 한다(R18). 답이 오면 붙을 세션을 고른다.
+    // To receive list changes, it must subscribe by sending List once (R18). When the answer arrives, it picks a session to attach to.
     app.send(ToDaemon::List);
     app.on_input(&early);
     let mut last_draw: Option<Instant> = None;
     loop {
         app.end_stale_sync();
-        // 키 인코딩 모드는 상태가 바뀐 바로 다음, 프레임 사이에 화면과 같은 쓰기 통로로 건다.
+        // The key encoding modes are applied right after the state changes, between frames, over the same write path as the screen.
         let keys = app.sync_keys();
         if !keys.is_empty() {
             let out = terminal.backend_mut();
@@ -126,14 +126,14 @@ pub async fn run(state: State, project: PathBuf) -> Result<()> {
     Ok(())
 }
 
-/// 바깥에 거는 kitty 플래그.
+/// kitty flags to set on the outer terminal.
 ///
-/// ponytail: 플래그 2(뗌·반복 이벤트 보고)는 빼고 건다. 뗌·반복까지 오면 접두 키 처리가 훨씬 복잡해지고,
-/// CLI 앱은 거의 쓰지 않는다. 이 플래그를 켠 앱은 누름만 받는다.
+/// ponytail: Flag 2 (reporting release and repeat events) is left out. With release and repeat, prefix key handling gets much more complicated, and
+/// CLI apps rarely use it. An app that turns this flag on receives only presses.
 const KITTY_MIRRORED: u8 = !2;
 
-/// 바깥 터미널에 `applied`가 걸려 있을 때 `wanted`로 바꾸는 바이트. 달라진 모드만 쓴다.
-/// kitty 플래그는 시작할 때 쌓은 한 단(`tty::ENTER`)에 통째로 건다.
+/// The bytes that change the outer terminal from `applied` to `wanted`. Writes only the modes that differ.
+/// The kitty flags are set wholesale on the one level pushed at startup (`tty::ENTER`).
 fn mode_diff(applied: KeyModes, wanted: KeyModes) -> Vec<u8> {
     let mut out = Vec::new();
     if applied.app_cursor != wanted.app_cursor {
@@ -160,50 +160,50 @@ fn mode_diff(applied: KeyModes, wanted: KeyModes) -> Vec<u8> {
     out
 }
 
-/// 복사 모드에서 돌아다니는 얼린 화면. `lines`는 들어갈 때의 스크롤백 + 보이는 줄이다.
+/// The frozen screen being moved around in copy mode. `lines` is the scrollback + visible lines at the time of entering.
 struct Copying {
     mode: CopyMode,
     lines: Vec<String>,
-    /// 그동안 온 세션 출력. 나갈 때 화면에 먹인다.
+    /// Session output that arrived meanwhile. Fed to the screen on exit.
     held: Vec<u8>,
 }
 
-/// Esc로 복사 모드를 나온 뒤, 따로 읽혀 온 단독 Esc를 세션에 넘기지 않고 떼는 시간.
-/// Esc를 두 번 눌러 나오는 사람이 많고, 둘째 Esc는 보통 다른 읽기로 온다.
+/// How long, after leaving copy mode with Esc, a lone Esc that was read separately is dropped instead of passed to the session.
+/// Many people press Esc twice to get out, and the second Esc usually arrives in a separate read.
 ///
-/// ponytail: 타이머를 걸지 않고 다음 입력이 올 때 지난 시간만 본다. 입력 간격을 재는 정교한 방법은 필요해지면 한다.
+/// ponytail: No timer is set; the elapsed time is checked only when the next input arrives. A more precise way of measuring the interval between inputs can wait until it's needed.
 const ESC_GRACE: Duration = Duration::from_millis(300);
 
-/// 복사 모드 동안 쌓아 두는 출력의 최대 바이트.
+/// Maximum bytes of output kept while in copy mode.
 ///
-/// ponytail: 넘으면 복사 모드를 끝내고 따라잡는다. 디스크로 넘기거나 오래된 출력을 줄이는 일은 필요해지면 한다.
+/// ponytail: If exceeded, copy mode ends and catches up. Spilling to disk or trimming the oldest output can wait until it's needed.
 const MAX_HELD: usize = 8 << 20;
 
 struct App {
     m: Model,
-    /// 붙은 세션의 화면. 데몬이 보낸 스냅숏으로 만들고 출력을 먹인다. 질의 답은 데몬이 하므로 버린다.
+    /// The attached session's screen. Built from the snapshot the daemon sent and fed the output. Query answers are the daemon's job, so they're discarded.
     screen: Option<Screen>,
     tx: UnboundedSender<ToDaemon>,
     parser: InputParser,
-    /// 바깥 터미널 크기.
+    /// The outer terminal size.
     area: Rect,
-    /// 처음 받은 목록으로 붙을 세션을 정했다.
+    /// The session to attach to was chosen from the first list received.
     started: bool,
-    /// `New`를 보낸 세션의 (프로젝트, 이름). 목록에 나타나면 붙는다.
+    /// The (project, name) of the session `New` was sent for. It attaches once it appears in the list.
     pending: Option<(PathBuf, String)>,
-    /// 지난 화면에서 하이퍼링크로 다시 쓴 구간.
+    /// Spans of the previous screen that were rewritten as hyperlinks.
     links: Vec<LinkRun>,
-    /// 터미널 칸의 드래그 선택.
+    /// The drag selection in the terminal pane.
     select: Select,
-    /// 바깥 터미널에 쓸 클립보드 OSC 52. 그릴 때 화면과 같은 쓰기 통로로 내보낸다.
+    /// Clipboard OSC 52 to write to the outer terminal. Emitted over the same write path as the screen when drawing.
     clipboard: Vec<u8>,
-    /// 복사 모드. 들어갈 때 화면을 얼려 두고, 그동안 온 출력은 쌓아 둔다.
+    /// Copy mode. The screen is frozen on entry, and output that arrives meanwhile is kept.
     copy: Option<Copying>,
-    /// Esc로 복사 모드를 나온 때. `ESC_GRACE` 안에 오는 입력 앞의 단독 Esc는 뗀다.
+    /// When copy mode was left with Esc. A lone Esc in front of input arriving within `ESC_GRACE` is dropped.
     esc_exit: Option<Instant>,
-    /// 세션에 넘긴 누름이 아직 눌려 있다. 이 동안 칸 밖 끌기·뗌도 칸 안으로 눌러 넘겨 세션이 뗌을 받게 한다.
+    /// A press passed to the session is still held. While it is, drags and releases outside the pane are clamped into the pane and passed on so the session receives the release.
     held: bool,
-    /// 바깥 터미널에 지금 걸린 키 인코딩 모드.
+    /// The key encoding modes currently set on the outer terminal.
     keys: KeyModes,
     dirty: bool,
     quit: bool,
@@ -243,10 +243,10 @@ impl App {
         }
     }
 
-    /// 바깥 터미널에 걸 키 인코딩 모드를 맞추는 바이트. 돌려준 바이트를 썼다고 보고 걸린 상태를 바꾼다.
+    /// The bytes that adjust the key encoding modes to set on the outer terminal. Assumes the returned bytes were written and updates the applied state.
     ///
-    /// 붙은 세션 화면의 모드를 따르되, 세션 화면이 없을 때, mine이 키를 직접 읽는 복사 모드·상태줄 입력·시작 화면 동안,
-    /// 끝낼 때는 기본값으로 돌린다. 이때 키는 평범한(레거시) 인코딩으로 와야 한다.
+    /// Follows the attached session screen's modes, but uses the defaults when there's no session screen, during copy mode, status line input and the launcher where mine reads keys itself,
+    /// and when exiting. In those cases keys must arrive in plain (legacy) encoding.
     fn sync_keys(&mut self) -> Vec<u8> {
         let reading = self.copy.is_some() || self.m.prompt.is_some() || self.m.launcher;
         let wanted = match &self.screen {
@@ -258,7 +258,7 @@ impl App {
         out
     }
 
-    /// 쓰기 작업이 끝났으면(연결이 끊겼으면) 버린다. 곧 `rx`가 끝을 알린다.
+    /// If the write task has ended (the connection dropped), discard it. `rx` will report the end shortly.
     fn send(&self, msg: ToDaemon) {
         let _ = self.tx.send(msg);
     }
@@ -268,7 +268,7 @@ impl App {
         self.dirty = true;
     }
 
-    /// 터미널 칸 크기. `Attach`와 `Resize`가 이 크기를 보낸다.
+    /// The terminal pane size. `Attach` and `Resize` send this size.
     fn term_size(&self) -> (u16, u16) {
         let term = ui::layout(self.area, self.m.list_open).term;
         (term.width.max(1), term.height.max(1))
@@ -279,7 +279,7 @@ impl App {
         match msg {
             FromDaemon::Sessions { sessions } => self.on_sessions(sessions),
             FromDaemon::Snapshot { id, data } if attached(&id) => {
-                // 새 화면이 얼려 둔 줄을 대신한다. 쌓아 둔 출력도 스냅숏에 들어 있다.
+                // The new screen replaces the frozen lines. The output that was kept is already in the snapshot.
                 self.copy = None;
                 self.m.status = None;
                 let (cols, rows) = self.term_size();
@@ -293,7 +293,7 @@ impl App {
             }
             FromDaemon::Output { id, data } if attached(&id) => {
                 if let Some(copy) = &mut self.copy {
-                    // 줄 번호가 흔들리지 않게 얼린 화면에는 먹이지 않고 쌓아 둔다.
+                    // So that line numbers don't shift, it isn't fed to the frozen screen and is kept instead.
                     copy.held.extend_from_slice(&data);
                     if copy.held.len() > MAX_HELD {
                         self.exit_copy();
@@ -302,7 +302,7 @@ impl App {
                 } else if let Some(screen) = &mut self.screen {
                     screen.feed(&data);
                     screen.take_replies();
-                    // 반전은 보이는 칸에 걸려 있어 출력이 칸을 밀면 엉뚱한 글자를 가린다. 끄는 중에는 뗄 때 읽는다.
+                    // The inversion is tied to visible cells, so if output pushes the cells it covers the wrong characters. While it's being cleared, it's read on release.
                     if !self.select.dragging() {
                         self.select.clear();
                     }
@@ -313,7 +313,7 @@ impl App {
                 self.pending = None;
                 self.say(&message);
             }
-            // 버전은 연결할 때 확인했고, 다른 세션의 화면은 이제 보지 않는다.
+            // The version was checked at connect time, and the other sessions' screens are no longer viewed.
             FromDaemon::Hello { .. } | FromDaemon::Snapshot { .. } | FromDaemon::Output { .. } => {}
         }
     }
@@ -343,8 +343,8 @@ impl App {
         }
     }
 
-    /// 지금 목록의 첫 줄 세션에 붙는다. 보이는 줄이 없으면(대기 묶음은 처음에 접혀 있다) 접힌 묶음까지 본다.
-    /// 붙으면 그 묶음은 펼쳐 그린다(`Model::visible_groups`).
+    /// Attaches to the session on the first row of the current list. If there are no visible rows (the Idle group starts out collapsed), looks through collapsed groups too.
+    /// Once attached, that group is drawn expanded (`Model::visible_groups`).
     fn attach_first(&mut self) {
         let groups = self.m.visible_groups();
         let first = view::order(&groups)
@@ -376,8 +376,8 @@ impl App {
         self.dirty = true;
     }
 
-    /// 붙은 세션을 놓는다. 데몬에는 떨어지는 메시지가 없어 그 세션 출력이 계속 오지만 버린다.
-    /// 붙은 세션이 없으면 시작 화면이 터미널 칸을 채운다.
+    /// Lets go of the attached session. The daemon has no message for dropping, so that session's output keeps arriving but is discarded.
+    /// With no attached session, the launcher fills the terminal pane.
     fn detach(&mut self) {
         self.m.attached = None;
         self.m.launcher = true;
@@ -388,7 +388,7 @@ impl App {
         self.dirty = true;
     }
 
-    /// 프로젝트를 고른다. 붙은 세션이 그 프로젝트 것이 아니면 그 프로젝트의 첫 줄 세션으로 옮긴다.
+    /// Chooses a project. If the attached session isn't in that project, switches to the project's first row session.
     fn set_filter(&mut self, filter: Option<PathBuf>) {
         self.m.filter = filter;
         self.dirty = true;
@@ -411,7 +411,7 @@ impl App {
 
     fn on_action(&mut self, action: Action) {
         if !matches!(action, Action::Mouse(_)) {
-            // 키를 누르면 선택 반전과 알림은 걷는다.
+            // Pressing a key clears the selection inversion and the notice.
             if self.select.clear() || !self.m.message.is_empty() {
                 self.m.message.clear();
                 self.dirty = true;
@@ -428,7 +428,7 @@ impl App {
                 }
             }
             Action::Paste(text) if self.m.prompt.is_some() => self.prompt_paste(&text),
-            // 복사 모드와 시작 화면에서는 입력이 세션으로 가지 않는다.
+            // In copy mode and the launcher, input doesn't go to the session.
             Action::Paste(_) if self.copy.is_some() || self.m.launcher => {}
             Action::Paste(text) => {
                 let bracketed = self
@@ -453,7 +453,7 @@ impl App {
         }
     }
 
-    /// Esc로 복사 모드를 막 나왔으면(`ESC_GRACE` 안) 입력 앞의 단독 Esc를 뗀다. 뗀 뒤에 남은 입력이 있으면 창은 닫힌다.
+    /// If copy mode was just left with Esc (within `ESC_GRACE`), drops a lone Esc in front of the input. If input remains after dropping, the window closes.
     fn after_esc_exit(&mut self, data: Vec<u8>) -> Vec<u8> {
         let Some(at) = self.esc_exit else {
             return data;
@@ -469,7 +469,7 @@ impl App {
         rest.to_vec()
     }
 
-    /// 키 입력과 붙여넣기를 세션에 넘긴다. 스크롤해 둔 화면은 맨 아래로 돌려놓고 넘긴다.
+    /// Passes key input and paste to the session. A scrolled screen is returned to the bottom before passing.
     fn input(&mut self, data: Vec<u8>) {
         if let Some(screen) = &mut self.screen {
             let scrolled = screen.term().grid().display_offset();
@@ -492,7 +492,7 @@ impl App {
 
     fn command(&mut self, cmd: Cmd) {
         self.esc_exit = None;
-        // 복사 모드 안에서 다른 명령을 하면 복사 모드를 끝내고 한다.
+        // Running another command inside copy mode ends copy mode and then runs it.
         if cmd != Cmd::CopyMode {
             self.exit_copy();
         }
@@ -522,7 +522,7 @@ impl App {
         }
     }
 
-    /// 목록에 보이는 줄 순서로 다음·이전 세션에 붙는다. 끝에서는 처음으로 돈다.
+    /// Attaches to the next or previous session in the order of rows visible in the list. At the ends it wraps around to the start.
     fn step_session(&mut self, step: isize) {
         let order = view::order(&self.m.visible_groups());
         let Some(n) = isize::try_from(order.len()).ok().filter(|&n| n > 0) else {
@@ -541,7 +541,7 @@ impl App {
         self.attach(self.m.sessions[order[next as usize]].meta.id.clone());
     }
 
-    /// 아이콘 줄 순서(∗ 포함)로 다음·이전 프로젝트를 고른다.
+    /// Chooses the next or previous project in project rail order (including ∗).
     fn step_project(&mut self, step: isize) {
         let rail = view::rail(&self.m.sessions, &self.m.current_project);
         let at = rail
@@ -557,12 +557,12 @@ impl App {
             return;
         }
         let areas = ui::layout(self.area, self.m.list_open);
-        // 선택을 끄는 중이면 터미널 칸 밖에서 끌거나 떼도 칸 안으로 눌러 이어 간다.
+        // If the selection is being cleared, dragging or releasing outside the terminal pane is clamped into the pane and continues.
         if self.select.dragging() && matches!(ev.kind, MouseKind::Drag | MouseKind::Up) {
             let at = select::local(areas.term, ev.col, ev.row);
             return self.select_event(ev, at);
         }
-        // 세션에 넘긴 누름이 눌려 있으면 칸 밖에서 끌거나 떼도 칸 안으로 눌러 넘긴다. 앱이 뗌을 놓치지 않게 한다.
+        // If a press passed to the session is still held, dragging or releasing outside the pane is clamped into the pane and passed on. So the app doesn't miss the release.
         if self.held && matches!(ev.kind, MouseKind::Drag | MouseKind::Up) {
             let at = select::local(areas.term, ev.col, ev.row);
             return self.term_mouse(ev, at);
@@ -572,7 +572,7 @@ impl App {
         }
         let hit = ui::hit(&areas, &self.m, ev.col, ev.row);
         if let Hit::Term(x, y) = hit {
-            // 복사 모드에서는 터미널 칸의 마우스를 세션에 넘기지도 선택에 쓰지도 않는다. 휠만 커서를 옮긴다.
+            // In copy mode, the terminal pane's mouse is neither passed to the session nor used for selection. Only the wheel moves the cursor.
             if self.copy.is_some() {
                 match ev.kind {
                     MouseKind::WheelUp => self.copy_wheel(-WHEEL_LINES),
@@ -603,8 +603,8 @@ impl App {
         }
     }
 
-    /// 터미널 칸의 마우스(`at`은 칸 기준). 세션이 마우스를 쓰면 그대로 넘기고, 아니면 휠은 스크롤하고
-    /// 왼쪽 단추 끌기는 선택한다. 칸 안 누름이 눌려 있는 동안은 칸 밖에서 온 끌기·뗌도 여기로 눌려 온다.
+    /// The terminal pane's mouse (`at` is relative to the pane). If the session uses the mouse, passes it on as is; otherwise the wheel scrolls and
+    /// left-button drag selects. While a press inside the pane is held, drags and releases from outside the pane are clamped and arrive here too.
     fn term_mouse(&mut self, ev: MouseEv, at: (u16, u16)) {
         let Some(screen) = &mut self.screen else {
             return;
@@ -620,14 +620,14 @@ impl App {
             }
             return;
         }
-        // 세션이 마우스를 껐으면 누르고 있던 것도 끝난 셈이다.
+        // If the session turned the mouse off, a press that was held is considered ended too.
         self.held = false;
         let step = match ev.kind {
             MouseKind::WheelUp => WHEEL_LINES,
             MouseKind::WheelDown => -WHEEL_LINES,
             _ => return self.select_event(ev, at),
         };
-        // 클라이언트가 가진 화면 사본만 스크롤한다. 세션에는 아무것도 보내지 않는다.
+        // Scrolls only the client's copy of the screen. Nothing is sent to the session.
         let before = screen.term().grid().display_offset();
         screen.scroll(step);
         if screen.term().grid().display_offset() != before {
@@ -636,7 +636,7 @@ impl App {
         }
     }
 
-    /// 왼쪽 단추의 누름·끌기·뗌으로 선택을 진행한다. 뗄 때 선택이 있으면 복사한다.
+    /// Advances the selection with left-button press, drag and release. If there is a selection on release, copies it.
     fn select_event(&mut self, ev: MouseEv, at: (u16, u16)) {
         if ev.button != 0 {
             return;
@@ -659,16 +659,16 @@ impl App {
         self.dirty = true;
     }
 
-    /// `⌃a [`: 지금 화면(스크롤백 포함)을 얼려 두고 복사 모드에 들어간다. 이미 들어가 있으면 그대로 둔다.
+    /// `⌃a [`: freezes the current screen (scrollback included) and enters copy mode. If already in, leaves it as is.
     fn enter_copy(&mut self) {
         if self.copy.is_some() {
             return;
         }
-        // 시작 화면이 세션 칸을 덮고 있으면 복사할 화면이 보이지 않는다.
+        // If the launcher covers the session pane, there's no screen visible to copy.
         let Some(screen) = self.screen.as_ref().filter(|_| !self.m.launcher) else {
             return self.say("No session screen to copy");
         };
-        // 쪽 넘김의 한 쪽(터미널 칸의 줄 수)은 `freeze`가 화면에서 읽는다. 크기가 바뀌면 복사 모드가 끝난다.
+        // The page size for page keys (the number of lines in the terminal pane) is read from the screen by `freeze`. If the size changes, copy mode ends.
         let (lines, mode) = copymode::freeze(screen);
         self.copy = Some(Copying {
             mode,
@@ -681,7 +681,7 @@ impl App {
         self.sync_copy();
     }
 
-    /// 복사 모드의 휠: 커서를 `step`줄(아래가 양수) 옮기고 화면이 따라가게 한다.
+    /// Wheel in copy mode: moves the cursor by `step` lines (positive is down) and makes the screen follow.
     fn copy_wheel(&mut self, step: i32) {
         if let Some(copy) = &mut self.copy {
             copy.mode.move_lines(&copy.lines, step as isize);
@@ -689,9 +689,9 @@ impl App {
         self.sync_copy();
     }
 
-    /// 복사 모드의 키를 먹인다. 끝나는 키(`q`, `y`, Esc)가 오면 그 뒤 바이트는 복사 모드 키가 아니니,
-    /// 다음 읽기로 온 것처럼 평소 입력 경로로 세션에 넘긴다. 다만 Esc로 끝냈으면 바로 뒤의 단독 Esc는 뗀다
-    /// (Esc를 두 번 눌러 나오는 습관이 세션에 Esc를 보내지 않게).
+    /// Feeds copy mode keys. When an ending key (`q`, `y`, Esc) arrives, the bytes after it aren't copy mode keys, so
+    /// they go to the session through the usual input path as if they came in the next read. But if it ended with Esc, a lone Esc right after is dropped
+    /// (so the habit of pressing Esc twice to get out doesn't send an Esc to the session).
     fn copy_keys(&mut self, bytes: &[u8]) {
         let Some(copy) = &mut self.copy else {
             return;
@@ -703,12 +703,12 @@ impl App {
         for (key, end) in copymode::split(bytes) {
             out = match key {
                 copymode::Key::Byte(b) => {
-                    // 검색어를 입력하는 중이 아니면 명령 키 자리다. 한글은 동작하지 않으니 알린다.
+                    // When not typing a search query, this is the command key position. Hangul does nothing, so tell the user.
                     hangul |= !copy.mode.typing && input::hangul_at(&bytes[end - 1..]);
                     copy.mode.key(&copy.lines, b)
                 }
                 copymode::Key::Arrow(dir) => copy.mode.arrow(&copy.lines, dir),
-                // 검색어를 입력하는 중이면 ⌃b·⌃f는 무시되니 화살표처럼 입력에 섞이지 않는다.
+                // While typing a search query, ⌃b and ⌃f are ignored, so they aren't mixed into the input like an arrow.
                 copymode::Key::PageUp => copy.mode.key(&copy.lines, 0x02),
                 copymode::Key::PageDown => copy.mode.key(&copy.lines, 0x06),
             };
@@ -735,13 +735,13 @@ impl App {
             rest = copymode::drop_lone_esc(rest);
         }
         if !rest.is_empty() {
-            // 글자가 이어 가면 Esc 뒤의 일은 끝난 것이다.
+            // If characters continue, what followed Esc is over.
             self.esc_exit = None;
             self.input(rest.to_vec());
         }
     }
 
-    /// 커서 줄이 보이게 화면을 스크롤하고 상태줄을 복사 모드 글로 바꾼다.
+    /// Scrolls the screen so the cursor line is visible and replaces the status line with the copy mode text.
     fn sync_copy(&mut self) {
         if let (Some(copy), Some(screen)) = (&mut self.copy, &mut self.screen) {
             copy.mode.reveal(screen);
@@ -750,7 +750,7 @@ impl App {
         self.dirty = true;
     }
 
-    /// 복사 모드를 끝낸다. 쌓아 둔 출력을 화면에 먹이고 맨 아래로 돌아간다.
+    /// Ends copy mode. Feeds the kept output to the screen and returns to the bottom.
     fn exit_copy(&mut self) {
         let Some(copy) = self.copy.take() else {
             return;
@@ -765,7 +765,7 @@ impl App {
         self.dirty = true;
     }
 
-    /// 입력 중인 상태줄에 키를 넣는다. `⌃a x` 확인은 `y`만 닫고 다른 키는 취소다.
+    /// Feeds a key to the status line being typed into. A `⌃a x` confirmation closes only on `y`; any other key cancels.
     fn prompt_keys(&mut self, bytes: &[u8]) {
         self.dirty = true;
         match self.m.prompt.take() {
@@ -775,7 +775,7 @@ impl App {
                 }
             }
             Some(Prompt::New(mut text)) => {
-                // Esc 단독은 취소, 화살표 같은 다른 이스케이프 시퀀스는 무시한다.
+                // A lone Esc cancels; other escape sequences such as arrows are ignored.
                 if bytes.contains(&0x1b) {
                     if bytes != b"\x1b" {
                         self.m.prompt = Some(Prompt::New(text));
@@ -812,7 +812,7 @@ impl App {
         }
     }
 
-    /// 시작 화면의 `n` 입력을 해석해 `New`를 보낸다. 새 세션이 목록에 나타나면 붙는다(`on_sessions`).
+    /// Interprets the input of `n` in the launcher and sends `New`. When the new session appears in the list, it attaches (`on_sessions`).
     fn submit_new(&mut self, text: &str) {
         match view::parse_new(text, self.m.project()) {
             Ok(spec) => self.create(spec),
@@ -825,8 +825,8 @@ impl App {
         self.send(ToDaemon::New { spec });
     }
 
-    /// 시작 화면의 키. Esc는 세션 위에 연 시작 화면을 닫는다(붙은 세션이 없으면 돌아갈 곳이 없어 아무것도 안 한다).
-    /// 줄을 고르는 키만 받고 나머지는 세션으로도 보내지 않고 버린다. `⌃a` 명령은 입력 해석기가 먼저 가져간다.
+    /// Keys of the launcher. Esc closes a launcher opened over a session (with no attached session there's nowhere to return to, so it does nothing).
+    /// Accepts only keys that choose a row; the rest are discarded without sending them to the session. `⌃a` commands are taken first by the input parser.
     fn launcher_keys(&mut self, bytes: &[u8]) {
         if bytes == b"\x1b" {
             if self.m.attached.is_some() {
@@ -840,8 +840,8 @@ impl App {
         }
     }
 
-    /// 한글이 명령 키 자리(시작 화면, 접두 뒤, 복사 모드)에 왔다. 동작하지 않고 영문으로 바꾸라고 알린다.
-    /// 복사 모드는 상태줄 전체를 그 글이 쓰니 거기에 얹는다.
+    /// Hangul arrived where a command key goes (launcher, after the prefix, copy mode). Does nothing and tells the user to switch to English.
+    /// Copy mode uses the whole status line for that text, so it's layered on there.
     fn hangul_hint(&mut self) {
         if let Some(copy) = &mut self.copy {
             copy.mode.hangul = true;
@@ -851,14 +851,14 @@ impl App {
         }
     }
 
-    /// 고른 줄을 시작한다. 세션은 새 이름(`t<N>`)으로 바로 만들고, 붙는 것은 목록에 나타난 뒤(`on_sessions`)다.
+    /// Starts the chosen row. The session is created right away with a new name (`t<N>`), and attaching happens after it appears in the list (`on_sessions`).
     fn launch(&mut self, choice: Choice) {
         if choice == Choice::Typed {
             self.m.prompt = Some(Prompt::New(String::new()));
             self.dirty = true;
             return;
         }
-        // 앞서 보낸 `New`의 답을 기다리는 동안은 받지 않는다. 같은 이름으로 또 보내 서로 엉키지 않게 한다.
+        // While waiting for the answer to a `New` sent earlier, don't accept another. Keeps sending the same name again from tangling.
         if self.pending.is_some() {
             return;
         }
@@ -874,9 +874,9 @@ impl App {
         self.resize_session();
     }
 
-    /// 터미널 칸 크기가 바뀌었다(창 크기, 목록 접기). 화면과 세션 PTY를 맞춘다.
+    /// The terminal pane size changed (window size, list collapse). Fits the screen and the session PTY.
     fn resize_session(&mut self) {
-        // 크기가 바뀌면 줄 바꿈이 달라져 얼려 둔 줄과 화면이 어긋난다.
+        // If the size changes, line wrapping changes and the frozen lines and the screen get out of step.
         self.exit_copy();
         let (cols, rows) = self.term_size();
         if let Some(screen) = &mut self.screen {
@@ -894,14 +894,14 @@ impl App {
     }
 
     fn sync_deadline(&self) -> Option<Instant> {
-        // 복사 모드 동안은 화면을 얼려 둔다. 끝내지 않은 동기화 갱신이 줄을 바꾸지 않게 한다.
+        // During copy mode the screen is frozen. Keeps an unfinished synchronized update from changing lines.
         if self.copy.is_some() {
             return None;
         }
         self.screen.as_ref()?.sync_deadline()
     }
 
-    /// 세션이 끝내지 않은 동기화 갱신(`?2026`)이 시간을 넘겼으면 끝내고 다시 그린다. 칸이 멈춘 채 남지 않게 한다.
+    /// If a synchronized update (`?2026`) the session never ended has exceeded its time, ends it and redraws. Keeps the pane from staying frozen.
     fn end_stale_sync(&mut self) {
         if self.copy.is_some() {
             return;
@@ -915,15 +915,15 @@ impl App {
         }
     }
 
-    /// 한 화면을 그린다. 바깥 터미널이 동기화 갱신으로 한 번에 보여 주도록 감싼다.
+    /// Draws one screen. Wrapped so the outer terminal shows it at once as a synchronized update.
     ///
-    /// ponytail: ratatui는 OSC 8 하이퍼링크를 모른다. 그래서 ratatui가 그린 뒤, 이번 화면의 링크 구간을
-    /// 막 그린 버퍼의 칸(같은 글자·색)으로 `ESC ] 8 ; ; URL` 안에서 한 번 더 쓴다. 터미널은 칸마다 링크를
-    /// 기억하므로 ratatui가 다시 쓰지 않은 칸도 링크가 남는다. 지난 화면에만 있던 구간은 링크 없이 다시 써서,
-    /// 글자가 같아 ratatui가 건너뛴 칸에 지난 링크가 남지 않게 한다. 커서는 DECSC/DECRC로 되돌린다.
-    /// 링크가 많아 느려지면 바뀐 구간만 쓴다.
+    /// ponytail: ratatui doesn't know OSC 8 hyperlinks. So after ratatui draws, this frame's link spans are written once more
+    /// inside `ESC ] 8 ; ; URL` using the cells of the buffer just drawn (same characters and colors). The terminal remembers the link per
+    /// cell, so cells ratatui didn't rewrite keep the link too. Spans that were only in the previous screen are rewritten without a link,
+    /// so a cell that ratatui skipped because its characters were the same doesn't keep the old link. The cursor is restored with DECSC/DECRC.
+    /// If many links make it slow, write only the changed spans.
     fn draw<W: Write>(&mut self, terminal: &mut Terminal<CrosstermBackend<W>>) -> io::Result<()> {
-        // 클립보드 OSC 52는 화면과 같은 쓰기 통로로, 그리는 도중이 아닌 프레임 사이에 내보낸다.
+        // The clipboard OSC 52 goes over the same write path as the screen, between frames rather than mid-draw.
         if !self.clipboard.is_empty() {
             terminal.backend_mut().write_all(&self.clipboard)?;
             self.clipboard.clear();
@@ -933,7 +933,7 @@ impl App {
             ui::draw(f, &self.m, self.screen.as_ref());
             let areas = ui::layout(f.area(), self.m.list_open);
             if let (Some(copy), Some(screen)) = (&self.copy, &self.screen) {
-                // 복사 모드의 커서와 선택은 같은 반전으로 칠한다. 검색어를 입력하는 중이면 커서는 상태줄에 둔다.
+                // The copy mode cursor and selection are painted with the same inversion. While typing a search query, the cursor stays in the status line.
                 if let Some(sel) = copy.mode.highlight(screen) {
                     select::paint_selection(f.buffer_mut(), areas.term, &sel);
                 }
@@ -953,7 +953,7 @@ impl App {
             .screen
             .as_ref()
             .and_then(|screen| ime_anchor(&self.m, screen, term));
-        // 시작 화면이 세션 칸을 덮는 동안은 세션 화면의 링크를 걸지 않는다.
+        // While the launcher covers the session pane, the session screen's links aren't applied.
         let runs = self
             .screen
             .as_ref()
@@ -984,7 +984,7 @@ impl App {
             }
             backend.write_all(b"\x1b8")?;
         }
-        // 반드시 위 DECRC(`\x1b8`) 뒤에 쓴다. 앞에 쓰면 DECRC가 커서를 되돌려 버린다.
+        // Must be written after the DECRC (`\x1b8`) above. Written before it, DECRC would put the cursor back.
         if let Some(pos) = anchor {
             queue!(backend, MoveTo(pos.x, pos.y))?;
         }
@@ -996,14 +996,14 @@ impl App {
     }
 }
 
-/// 세션이 커서를 숨겼을 때 바깥 커서를 둘 자리. 없으면 `None`이다.
+/// Where to put the outer cursor when the session hid its cursor. `None` if there is none.
 ///
-/// 한글 조합(IME preedit)은 바깥 터미널의 실제 커서 자리에 뜨고, 숨겨도 그렇다. Claude Code는 커서를 숨기고 자기 입력줄에
-/// 두므로, 바깥 커서는 숨긴 채 그 자리로 옮겨야 조합이 입력줄에 뜬다. 보이는 커서는 `ui::term_cursor`가 맡는다.
-/// 상태줄 입력(프롬프트·복사 모드 검색)은 상태줄 커서가 우선이고, 스크롤해 과거를 보는 중이나 시작 화면이 칸을 덮은 동안은
-/// 칸 안으로 옮기지 않는다.
+/// Hangul composition (IME preedit) shows at the outer terminal's real cursor position, even when it's hidden. Claude Code hides the cursor and puts it on its own input line,
+/// so the outer cursor must be moved there while staying hidden for the composition to show on the input line. The visible cursor is `ui::term_cursor`'s job.
+/// For status line input (prompts, copy mode search), the status line cursor takes priority, and while scrolled back in time or while the launcher covers the pane,
+/// it isn't moved into the pane.
 ///
-/// ponytail: 칸 안 판정은 `ui::term_cursor`와 같은 두 줄이다. ui.rs를 키우지 않으려고 그쪽을 고치지 않고 여기에 두었다.
+/// ponytail: The in-pane check is the same two lines as `ui::term_cursor`. It lives here rather than editing ui.rs, to avoid growing ui.rs.
 fn ime_anchor(m: &Model, sc: &Screen, term: Rect) -> Option<Position> {
     if m.attached.is_none()
         || m.launcher
@@ -1018,7 +1018,7 @@ fn ime_anchor(m: &Model, sc: &Screen, term: Rect) -> Option<Position> {
     (x < term.width && y < term.height).then(|| Position::new(term.x + x, term.y + y))
 }
 
-/// 링크 구간이 덮는 칸을 막 그린 버퍼에서 꺼낸다. 넓은 글자가 가린 다음 칸은 뺀다.
+/// Takes the cells covered by a link span out of the buffer just drawn. Skips the next cell covered by a wide character.
 fn run_cells(buf: &Buffer, run: &LinkRun) -> Cells {
     let end = run
         .x
@@ -1044,7 +1044,7 @@ mod tests {
     use super::*;
     use mine_core::session::Kind;
 
-    /// 바깥 터미널 120x40, 목록이 열려 터미널 칸은 (34, 0)에서 86x39다. 세션 `s1`에 붙어 있고 화면에 `feed`를 먹였다.
+    /// Outer terminal 120x40 with the list open, so the terminal pane is 86x39 at (34, 0). Attached to session `s1`, with `feed` already fed to the screen.
     fn app(feed: &[u8]) -> (App, UnboundedReceiver<ToDaemon>) {
         let (tx, rx) = unbounded_channel();
         let mut app = App::new(tx, PathBuf::from("/p"), Size::new(120, 40));
@@ -1085,7 +1085,7 @@ mod tests {
         }
     }
 
-    /// 한 프레임을 그리고 바깥 터미널(120x40)에 쓴 바이트를 돌려준다. 크기를 묻지 않도록 고정 영역으로 연다.
+    /// Draws one frame and returns the bytes written to the outer terminal (120x40). Opens a fixed area so it doesn't query the size.
     fn frame(app: &mut App) -> String {
         let mut out = Vec::new();
         let viewport = Viewport::Fixed(Rect::new(0, 0, 120, 40));
@@ -1095,12 +1095,12 @@ mod tests {
         )
         .unwrap();
         app.draw(&mut terminal).unwrap();
-        // Terminal의 Drop은 숨긴 커서를 보이는 시퀀스를 쓴다. 프레임이 쓴 것만 보려고 Drop을 건너뛴다.
+        // Terminal's Drop writes the sequence that shows a hidden cursor. Skip Drop to see only what the frame wrote.
         std::mem::forget(terminal);
         String::from_utf8(out).unwrap()
     }
 
-    /// 세션 커서(행 3, 열 5)를 숨긴다. 터미널 칸이 (34, 0)에서 시작하므로 바깥 화면에서는 행 3, 열 39(CUP `4;40`)다.
+    /// Hides the session cursor (row 3, column 5). The terminal pane starts at (34, 0), so on the outer screen it's row 3, column 39 (CUP `4;40`).
     const HIDDEN_AT_3_5: &[u8] = b"\x1b[?25l\x1b[4;6H";
     const MOVE: &str = "\x1b[4;40H";
     const SHOW: &str = "\x1b[?25h";
@@ -1111,9 +1111,9 @@ mod tests {
         let sc = app.screen.as_ref().unwrap();
         let term = ui::layout(app.area, app.m.list_open).term;
         assert_eq!(ime_anchor(&app.m, sc, term), Some(Position::new(39, 3)));
-        // 칸 밖(칸보다 좁은 영역)이면 옮기지 않는다.
+        // If it's outside the pane (an area narrower than the pane), don't move it.
         assert_eq!(ime_anchor(&app.m, sc, Rect::new(34, 0, 5, 39)), None);
-        // 붙은 세션이 없으면 옮기지 않는다.
+        // If there's no attached session, don't move it.
         let mut detached = app.m;
         detached.attached = None;
         assert_eq!(ime_anchor(&detached, sc, term), None);
@@ -1134,13 +1134,13 @@ mod tests {
         app.mouse(ev(MouseKind::WheelUp, 40, 5));
         assert_eq!(offset(&app), 3);
         assert_eq!(ime_anchor(&app.m, app.screen.as_ref().unwrap(), term), None);
-        // 맨 아래로 돌아오고 나서 시작 화면(`⌃a c`)이 열리면 세션 칸이 가려지니 옮기지 않는다.
+        // After returning to the bottom, if the launcher (`⌃a c`) opens, the session pane is covered, so don't move it.
         app.on_action(Action::Pass(b"a".to_vec()));
         assert!(ime_anchor(&app.m, app.screen.as_ref().unwrap(), term).is_some());
         app.on_input(b"\x01c");
         assert!(app.m.launcher);
         assert_eq!(ime_anchor(&app.m, app.screen.as_ref().unwrap(), term), None);
-        // 거기서 `n`으로 연 프롬프트는 상태줄 커서가 우선이다.
+        // A prompt opened from there with `n` gives priority to the status line cursor.
         app.on_input(b"n");
         assert!(app.m.prompt.is_some());
         assert_eq!(ime_anchor(&app.m, app.screen.as_ref().unwrap(), term), None);
@@ -1148,7 +1148,7 @@ mod tests {
         app.on_input(b"\x1b");
         assert!(app.m.prompt.is_none() && !app.m.launcher);
         assert!(ime_anchor(&app.m, app.screen.as_ref().unwrap(), term).is_some());
-        // 복사 모드는 상태줄을 쓰니 검색어를 치는 중이든 아니든 옮기지 않는다.
+        // Copy mode uses the status line, so don't move it whether or not a search query is being typed.
         enter_copy(&mut app);
         app.on_input(b"/ab");
         assert_eq!(ime_anchor(&app.m, app.screen.as_ref().unwrap(), term), None);
@@ -1158,7 +1158,7 @@ mod tests {
     fn hidden_cursor_is_parked_at_its_spot_after_the_frame_and_never_shown() {
         let (mut app, _rx) = app(HIDDEN_AT_3_5);
         let out = frame(&mut app);
-        // 옮기는 시퀀스는 프레임 끝, 동기화 갱신을 닫기 바로 앞에 쓴다.
+        // The moving sequence is written at the end of the frame, right before closing the synchronized update.
         assert!(out.ends_with(&format!("{MOVE}\x1b[?2026l")), "{out:?}");
         assert!(!out.contains(SHOW), "{out:?}");
         assert!(out.contains("\x1b[?25l"));
@@ -1168,8 +1168,8 @@ mod tests {
     fn visible_cursor_keeps_the_existing_set_cursor_path() {
         let (mut app, _rx) = app(b"\x1b[4;6H");
         let out = frame(&mut app);
-        // ratatui가 커서를 보이고 그 자리에 놓는다. 프레임 끝은 그 둘과 동기화 갱신 닫기뿐이고, 따로 더 옮기지 않는다.
-        // (칸에 무엇이 그려졌는지와 무관하게, 끝부분의 순서만 본다.)
+        // ratatui shows the cursor and puts it there. The end of the frame is just those two and the synchronized-update close, and nothing else moves it.
+        // (Only the order at the end is checked, regardless of what was drawn in the pane.)
         assert!(
             out.ends_with(&format!("{SHOW}{MOVE}\x1b[?2026l")),
             "{out:?}"
@@ -1178,7 +1178,7 @@ mod tests {
 
     #[test]
     fn park_move_comes_after_the_link_patch_restores_the_cursor() {
-        // 첫 줄에 OSC 8 링크가 있고 세션 커서는 숨겨져 있다. 링크 패치는 DECSC/DECRC로 커서를 되돌린다.
+        // The first row has an OSC 8 link and the session cursor is hidden. The link patch restores the cursor with DECSC/DECRC.
         let feed = [
             b"\x1b]8;;https://x.example\x1b\\link\x1b]8;;\x1b\\".as_slice(),
             HIDDEN_AT_3_5,
@@ -1201,12 +1201,12 @@ mod tests {
         scrolled.mouse(ev(MouseKind::WheelUp, 40, 5));
         let out = frame(&mut scrolled);
         assert!(out.ends_with("\x1b[?25l\x1b[?2026l"), "{out:?}");
-        // 프롬프트를 열면 상태줄(맨 아래 줄)에 커서를 보이고, 칸 안으로는 옮기지 않는다.
+        // Opening a prompt shows the cursor in the status line (the bottom row) and doesn't move it into the pane.
         let (mut prompting, _rx) = app(HIDDEN_AT_3_5);
         prompting.on_input(b"\x01cn");
         let out = frame(&mut prompting);
         assert!(out.contains(SHOW) && !out.contains(MOVE), "{out:?}");
-        // 시작 화면이 세션 칸을 덮는 동안은 커서를 보이지도 칸 안으로 옮기지도 않는다.
+        // While the launcher covers the session pane, the cursor is neither shown nor moved into the pane.
         let (mut launching, _rx) = app(HIDDEN_AT_3_5);
         launching.on_input(b"\x01c");
         let out = frame(&mut launching);
@@ -1219,7 +1219,7 @@ mod tests {
         assert!(frame(&mut app).contains("\x1b]8;;https://x.example\x1b\\"));
         app.on_input(b"\x01c");
         let out = frame(&mut app);
-        // 지난 화면의 링크는 링크 없이 다시 쓰고, 새 링크는 걸지 않는다.
+        // Links from the previous screen are rewritten without a link, and no new links are applied.
         assert!(!out.contains("https://x.example"), "{out:?}");
         assert!(app.links.is_empty());
     }
@@ -1234,7 +1234,7 @@ mod tests {
         app.mouse(ev(MouseKind::WheelDown, 40, 5));
         assert_eq!(offset(&app), 3);
         assert!(sent(&mut rx).is_empty());
-        // 터미널 칸 밖의 휠은 스크롤하지 않는다.
+        // A wheel outside the terminal pane doesn't scroll.
         app.mouse(ev(MouseKind::WheelUp, 10, 5));
         assert_eq!(offset(&app), 3);
     }
@@ -1255,10 +1255,10 @@ mod tests {
                 input(b"\x1b[<64;7;6M"),
             ]
         );
-        // 휠은 넘겼을 뿐 클라이언트 화면은 스크롤하지 않고, 선택도 시작하지 않는다.
+        // The wheel was only passed on; the client screen doesn't scroll and no selection starts.
         assert_eq!(offset(&app), 0);
         assert!(app.select.selection().is_none());
-        // 터미널 칸 밖은 넘기지 않는다.
+        // Outside the terminal pane isn't passed on.
         app.mouse(ev(MouseKind::Down, 10, 5));
         app.mouse(ev(MouseKind::WheelUp, 2, 5));
         assert!(sent(&mut rx).is_empty());
@@ -1267,7 +1267,7 @@ mod tests {
     #[test]
     fn held_forwarded_press_gets_clamped_drag_and_release_outside_the_pane() {
         let (mut app, mut rx) = app(b"\x1b[?1000h\x1b[?1002h");
-        // 누르기는 칸 안이다. 끌다가 목록 위로, 다시 상태줄 위로 벗어나 거기서 뗀다.
+        // The press is inside the pane. Dragging goes over the list, then over the status line, and is released there.
         app.mouse(ev(MouseKind::Down, 40, 5));
         app.mouse(ev(MouseKind::Drag, 10, 5));
         app.mouse(ev(MouseKind::Drag, 50, 39));
@@ -1281,11 +1281,11 @@ mod tests {
                 input(b"\x1b[<0;17;39m"),
             ]
         );
-        // 뗌으로 누름이 끝났으니 칸 밖 끌기와 뗌은 다시 넘기지 않는다.
+        // The release ends the press, so drags and releases outside the pane are no longer passed on.
         app.mouse(ev(MouseKind::Drag, 10, 5));
         app.mouse(ev(MouseKind::Up, 10, 5));
         assert!(sent(&mut rx).is_empty());
-        // 칸 밖에서 시작한 누름은 잡지 않는다.
+        // A press that started outside the pane isn't picked up.
         app.mouse(ev(MouseKind::Down, 10, 5));
         app.mouse(ev(MouseKind::Drag, 40, 5));
         app.mouse(ev(MouseKind::Up, 40, 5));
@@ -1318,7 +1318,7 @@ mod tests {
         assert_eq!(app.clipboard, select::osc52("hello"));
         assert_eq!(app.m.message, "Copied 5 chars");
         assert!(app.select.selection().is_some());
-        // 복사 알림은 마우스로는 지워지지 않고, 키를 누르면 알림과 반전이 함께 사라진다.
+        // The copy notice isn't cleared by the mouse; pressing a key removes the notice and the inversion together.
         app.mouse(ev(MouseKind::WheelDown, 40, 5));
         assert_eq!(app.m.message, "Copied 5 chars");
         app.on_action(Action::Pass(b"x".to_vec()));
@@ -1343,7 +1343,7 @@ mod tests {
     fn dragging_outside_the_pane_clamps_into_it() {
         let (mut app, _rx) = app(b"hello world\r\nsecond");
         app.mouse(ev(MouseKind::Down, 34 + 6, 0));
-        // 목록 위로 벗어나도 선택은 이어지고 터미널 칸 왼쪽 끝으로 눌린다.
+        // Even going off over the list, the selection continues and is pressed at the left edge of the terminal pane.
         app.mouse(ev(MouseKind::Drag, 10, 1));
         app.mouse(ev(MouseKind::Up, 10, 1));
         assert_eq!(app.clipboard, select::osc52("world\ns"));
@@ -1371,7 +1371,7 @@ mod tests {
         app.attach("s2".into());
         assert!(app.select.selection().is_none());
         assert!(app.screen.is_none());
-        // 끄는 도중에 온 출력은 선택을 끊지 않는다.
+        // Output that arrives while it's being cleared doesn't break the selection.
         app.m.attached = Some("s1".into());
         app.screen = Some(Screen::new(86, 39));
         app.mouse(ev(MouseKind::Down, 34, 0));
@@ -1383,7 +1383,7 @@ mod tests {
         assert!(app.select.selection().is_some());
     }
 
-    /// `⌃a [`로 복사 모드에 들어간다.
+    /// Enters copy mode with `⌃a [`.
     fn enter_copy(app: &mut App) {
         app.on_input(b"\x01[");
         assert!(app.copy.is_some());
@@ -1397,19 +1397,19 @@ mod tests {
     fn copy_mode_swallows_keys_and_only_exit_sends_them_on() {
         let (mut app, mut rx) = app(&lines(100));
         enter_copy(&mut app);
-        // l, s는 복사 모드 키고, 선택이 없는 Enter는 끝낸다. 어느 것도 세션에 가지 않는다.
+        // l and s are copy mode keys, and Enter with no selection ends it. None of them goes to the session.
         app.on_input(b"ls\r");
         assert!(app.copy.is_none());
         assert!(sent(&mut rx).is_empty());
         app.on_input(b"x");
         assert_eq!(sent(&mut rx), [input(b"x")]);
-        // 화살표와 붙여넣기도 가지 않는다.
+        // Arrows and paste don't go either.
         enter_copy(&mut app);
         app.on_input(b"\x1b[A\x1bOB");
         app.on_action(Action::Paste(b"pasted".to_vec()));
         assert!(app.copy.is_some());
         assert!(sent(&mut rx).is_empty());
-        // 단독 Esc가 끝낸다.
+        // A lone Esc ends it.
         app.on_input(b"\x1b");
         assert!(app.copy.is_none());
     }
@@ -1434,7 +1434,7 @@ mod tests {
 
     #[test]
     fn wheel_in_copy_mode_moves_the_cursor_three_lines_and_the_view_with_it() {
-        // 세션이 마우스를 쓰고 있어도 얼린 화면이라 세션에는 아무것도 가지 않는다.
+        // Even if the session uses the mouse, the screen is frozen so nothing goes to the session.
         let (mut app, mut rx) = app(&[lines(100), b"\x1b[?1000h\x1b[?1002h".to_vec()].concat());
         enter_copy(&mut app);
         assert_eq!((copy_line(&app), offset(&app)), (99, 0));
@@ -1445,11 +1445,11 @@ mod tests {
         app.mouse(ev(MouseKind::WheelDown, 40, 5));
         assert_eq!((copy_line(&app), offset(&app)), (96, 3));
         assert!(app.m.status.as_deref().unwrap().contains("│ 97/101 │"));
-        // 터미널 칸 밖의 휠은 커서를 옮기지 않는다.
+        // A wheel outside the terminal pane doesn't move the cursor.
         app.mouse(ev(MouseKind::WheelUp, 10, 5));
         assert_eq!(copy_line(&app), 96);
         assert!(app.copy.is_some() && sent(&mut rx).is_empty());
-        // 휠로 움직이면 "No matches"이 걷힌다.
+        // Moving with the wheel clears "No matches".
         app.on_input(b"/nothing\r");
         assert!(app.m.status.as_deref().unwrap().contains("No matches"));
         app.mouse(ev(MouseKind::WheelDown, 40, 5));
@@ -1460,21 +1460,21 @@ mod tests {
     fn bytes_after_the_key_that_ends_copy_mode_go_to_the_session() {
         let (mut app, mut rx) = app(&lines(100));
         enter_copy(&mut app);
-        // q 뒤의 `ls\r`은 복사 모드 키가 아니라 세션 입력이다.
+        // The `ls\r` after q is session input, not copy mode keys.
         app.on_input(b"qls\r");
         assert!(app.copy.is_none());
         assert_eq!(sent(&mut rx), [input(b"ls\r")]);
-        // 복사하고 끝내는 y도 같다.
+        // The same for y, which copies and ends.
         enter_copy(&mut app);
         app.on_input(b"gvlyecho\r");
         assert!(app.copy.is_none());
         assert_eq!(app.clipboard, select::osc52("li"));
         assert_eq!(sent(&mut rx), [input(b"echo\r")]);
-        // 선택 없는 Enter도 끝내는 키다.
+        // Enter with no selection is an ending key too.
         enter_copy(&mut app);
         app.on_input(b"\rx");
         assert_eq!(sent(&mut rx), [input(b"x")]);
-        // q로 끝낸 뒤의 Esc는 그대로 세션으로 간다.
+        // An Esc after ending with q goes to the session as is.
         enter_copy(&mut app);
         app.on_input(b"q\x1b");
         assert!(app.copy.is_none());
@@ -1483,31 +1483,31 @@ mod tests {
 
     #[test]
     fn esc_that_ends_copy_mode_drops_the_bare_escs_right_after_it() {
-        // Esc를 빠르게 두 번 눌러 나오는 사람이 많다. 세션(Claude Code)에 Esc가 가면 턴을 끊고 Esc Esc는 되감기를 연다.
+        // Many people press Esc twice quickly to get out. If an Esc reached the session (Claude Code), it would interrupt the turn, and Esc Esc opens rewind.
         let (mut app, mut rx) = app(&lines(100));
         enter_copy(&mut app);
         app.on_input(b"\x1b\x1b");
         assert!(app.copy.is_none());
         assert!(sent(&mut rx).is_empty());
-        // 그 뒤에 이어 오는 입력은 평소처럼 간다.
+        // Input that follows goes through as usual.
         enter_copy(&mut app);
         app.on_input(b"\x1b\x1bls\r");
         assert!(app.copy.is_none());
         assert_eq!(sent(&mut rx), [input(b"ls\r")]);
-        // 세 번 와도 모두 뗀다.
+        // Even if it comes three times, all are dropped.
         enter_copy(&mut app);
         app.on_input(b"\x1b\x1b\x1bx");
         assert_eq!(sent(&mut rx), [input(b"x")]);
-        // 이스케이프 시퀀스의 시작(CSI)은 단독 Esc가 아니라서 남긴다.
+        // The start of an escape sequence (CSI) isn't a lone Esc, so it's kept.
         enter_copy(&mut app);
         app.on_input(b"\x1b\x1b\x1b[A");
         assert_eq!(sent(&mut rx), [input(b"\x1b[A")]);
-        // 검색어를 입력하는 중의 Esc 둘: 첫째는 입력을 접고 둘째가 끝낸다. 보내는 것은 없다.
+        // Two Escs while typing a search query: the first folds up the input and the second ends. Nothing is sent.
         enter_copy(&mut app);
         app.on_input(b"/ab\x1b\x1b");
         assert!(app.copy.is_none());
         assert!(sent(&mut rx).is_empty());
-        // q·y·Enter로 끝낸 뒤는 Esc도 그대로 간다.
+        // After ending with q, y or Enter, an Esc goes through as is.
         enter_copy(&mut app);
         app.on_input(b"q\x1b\x1b");
         assert_eq!(sent(&mut rx), [input(b"\x1b\x1b")]);
@@ -1520,16 +1520,16 @@ mod tests {
     fn a_second_esc_read_separately_is_dropped_within_the_grace_window() {
         let (mut app, mut rx) = app(&lines(100));
         enter_copy(&mut app);
-        // 첫 Esc가 복사 모드를 끝내고 시각을 적어 둔다.
+        // The first Esc ends copy mode and records the time.
         app.on_input(b"\x1b");
         assert!(app.copy.is_none() && app.esc_exit.is_some());
         assert!(sent(&mut rx).is_empty());
-        // 둘째 Esc는 따로 읽혀도 창 안이라 세션에 가지 않는다. 연달아 와도 같다.
+        // The second Esc doesn't go to the session even if read separately, because it's within the window. The same if they arrive back to back.
         app.esc_exit = Some(Instant::now());
         app.on_input(b"\x1b");
         app.on_input(b"\x1b");
         assert!(sent(&mut rx).is_empty());
-        // Esc 뒤에 글자가 이어지면 글자는 가고, 그 뒤로는 창이 닫힌다.
+        // If a character follows Esc, the character goes through, and the window is closed after that.
         app.on_input(b"\x1bx");
         assert_eq!(sent(&mut rx), [input(b"x")]);
         assert!(app.esc_exit.is_none());
@@ -1542,18 +1542,18 @@ mod tests {
         let (mut app, mut rx) = app(&lines(100));
         enter_copy(&mut app);
         app.on_input(b"\x1b");
-        // 창이 지났다(시각을 되돌려 흉내 낸다).
+        // The window has passed (simulated by setting the time back).
         app.esc_exit = Some(Instant::now() - 2 * ESC_GRACE);
         app.on_input(b"\x1b");
         assert_eq!(sent(&mut rx), [input(b"\x1b")]);
         assert!(app.esc_exit.is_none());
-        // q·y·Enter로 끝낸 뒤에는 창이 없다.
+        // After ending with q, y or Enter, there is no window.
         enter_copy(&mut app);
         app.on_input(b"q");
         assert!(app.esc_exit.is_none());
         app.on_input(b"\x1b");
         assert_eq!(sent(&mut rx), [input(b"\x1b")]);
-        // 복사 모드에 다시 들어가면 창은 닫힌다.
+        // Entering copy mode again closes the window.
         enter_copy(&mut app);
         app.on_input(b"\x1b");
         assert!(app.esc_exit.is_some());
@@ -1566,16 +1566,16 @@ mod tests {
         let (mut app, mut rx) = app(&lines(100));
         enter_copy(&mut app);
         app.on_input(b"\x1b");
-        // 세션이 kitty 키보드를 켜면 둘째 Esc는 `CSI 27 u`로 온다. 수정 키 없는 누름 세 꼴을 모두 뗀다.
+        // If the session turns on the kitty keyboard, the second Esc arrives as `CSI 27 u`. All three forms of an Esc press without modifiers are dropped.
         for esc in [&b"\x1b[27u"[..], b"\x1b[27;1u", b"\x1b[27;1:1u"] {
             app.on_input(esc);
         }
         assert!(sent(&mut rx).is_empty());
-        // 수정 키가 붙은 것(⌃Esc)은 남긴다.
+        // One with a modifier (⌃Esc) is kept.
         app.on_input(b"\x1b[27;5u");
         assert_eq!(sent(&mut rx), [input(b"\x1b[27;5u")]);
         assert!(app.esc_exit.is_none());
-        // 창이 지난 뒤에는 그대로 간다.
+        // After the window has passed, it goes through as is.
         enter_copy(&mut app);
         app.on_input(b"\x1b");
         app.esc_exit = Some(Instant::now() - 2 * ESC_GRACE);
@@ -1600,12 +1600,12 @@ mod tests {
         enter_copy(&mut app);
         app.on_input(b"\x1b");
         assert!(app.esc_exit.is_some());
-        // `⌃a n`은 명령이다. 세션이 하나도 없어 옮겨 가지는 않지만 창은 닫힌다.
+        // `⌃a n` is a command. With no sessions at all it doesn't move anywhere, but the window closes.
         app.on_input(b"\x01n");
         assert!(app.esc_exit.is_none());
         app.on_input(b"\x1b");
         assert_eq!(sent(&mut rx), [input(b"\x1b")]);
-        // 세션에 붙어도 닫힌다.
+        // It closes when attached to a session too.
         enter_copy(&mut app);
         app.on_input(b"\x1b");
         assert!(app.esc_exit.is_some());
@@ -1615,7 +1615,7 @@ mod tests {
 
     #[test]
     fn paging_moves_the_cursor_and_the_view_by_a_page() {
-        // 39줄 화면에 스크롤백 62줄이다. 한 쪽은 39줄이다.
+        // A 39-line screen with 62 lines of scrollback. A page is 39 lines.
         let (mut app, _rx) = app(&lines(100));
         enter_copy(&mut app);
         let at = |app: &App| (copy_line(app), offset(app));
@@ -1624,12 +1624,12 @@ mod tests {
         assert_eq!(at(&app), (60, 39));
         app.on_input(b"\x1b[6~");
         assert_eq!(at(&app), (99, 0));
-        // 반 쪽은 19줄이다.
+        // A half page is 19 lines.
         app.on_input(b"\x15");
         assert_eq!(at(&app), (80, 19));
         app.on_input(b"\x04");
         assert_eq!(at(&app), (99, 0));
-        // 끝에서는 멈춘다. ⌃b·⌃f도 같은 쪽 넘김이다.
+        // It stops at the ends. ⌃b and ⌃f are the same page movement.
         app.on_input(b"\x1b[6~\x06");
         assert_eq!(at(&app), (100, 0));
         app.on_input(b"\x02\x02\x02\x02");
@@ -1648,10 +1648,10 @@ mod tests {
             id: "s1".into(),
             data: b"\r\nlater".to_vec(),
         });
-        // 줄 번호가 흔들리지 않게 화면은 그대로고, 출력은 쌓아 둔다.
+        // So line numbers don't shift, the screen stays as is and output is kept.
         assert_eq!(history(&app), frozen);
         assert_eq!(app.copy.as_ref().unwrap().held, b"\r\nlater");
-        // 다른 세션의 출력은 쌓지 않는다.
+        // Output from other sessions isn't kept.
         app.on_msg(FromDaemon::Output {
             id: "s2".into(),
             data: b"other".to_vec(),
@@ -1661,7 +1661,7 @@ mod tests {
         assert_eq!(app.screen.as_ref().unwrap().lines()[1], "later");
         assert_eq!(offset(&app), 0);
         assert!(app.copy.is_none() && app.m.status.is_none());
-        // 나온 뒤의 출력은 바로 화면으로 간다.
+        // Output after leaving goes straight to the screen.
         app.on_msg(FromDaemon::Output {
             id: "s1".into(),
             data: b"!".to_vec(),
@@ -1680,7 +1680,7 @@ mod tests {
         assert_eq!(app.m.message, "Copied 8 chars");
         assert!(app.copy.is_none() && app.m.status.is_none());
         assert!(sent(&mut rx).is_empty());
-        // 선택 없이 y는 복사하지 않고 끝낸다.
+        // y with no selection ends without copying.
         app.clipboard.clear();
         app.m.message.clear();
         enter_copy(&mut app);
@@ -1690,7 +1690,7 @@ mod tests {
 
     #[test]
     fn status_and_view_follow_the_cursor() {
-        // 100줄을 쓴 39줄 화면: 스크롤백 62줄 + 보이는 39줄에 line99가 마지막 글자 줄이다.
+        // A 39-line screen with 100 lines written: 62 lines of scrollback + 39 visible lines, with line99 on the last line that has characters.
         let (mut app, _rx) = app(&lines(100));
         enter_copy(&mut app);
         assert_eq!(
@@ -1701,7 +1701,7 @@ mod tests {
         app.on_input(b"g");
         assert_eq!(offset(&app), 62);
         assert!(app.m.status.as_deref().unwrap().contains("│ 1/101 │"));
-        // 검색어는 상태줄에 보이고, 찾으면 그 줄이 보이게 스크롤한다.
+        // The query shows in the status line, and when found, it scrolls so that line is visible.
         app.on_input(b"/line5");
         assert_eq!(app.m.status.as_deref(), Some("/line5"));
         app.on_input(b"\r");
@@ -1710,7 +1710,7 @@ mod tests {
         assert_eq!(offset(&app), 62);
         app.on_input(b"G");
         assert_eq!(offset(&app), 0);
-        // 못 찾으면 그 자리에서 알린다.
+        // If not found, it notifies on the spot.
         app.on_input(b"/nothing\r");
         assert!(app.m.status.as_deref().unwrap().contains("No matches"));
     }
@@ -1740,7 +1740,7 @@ mod tests {
         app.detach();
         assert!(app.copy.is_none() && app.m.status.is_none());
 
-        // 다른 접두 명령은 복사 모드를 끝내고 실행된다. 복사 모드 안의 `⌃a [`는 아무것도 바꾸지 않는다.
+        // Other prefix commands end copy mode and run. `⌃a [` inside copy mode changes nothing.
         app.attach("s1".into());
         app.screen = Some(Screen::new(86, 39));
         enter_copy(&mut app);
@@ -1755,7 +1755,7 @@ mod tests {
     fn rail_clicks_still_work_and_switching_leaves_copy_mode() {
         let (mut app, _rx) = app(&lines(100));
         enter_copy(&mut app);
-        // 아이콘 줄 첫 항목(∗)을 누르면 프로젝트를 고르고, 붙은 세션이 사라지니 복사 모드도 끝난다.
+        // Pressing the first project rail item (∗) chooses the project, and since the attached session disappears, copy mode ends too.
         app.mouse(ev(MouseKind::Down, 1, 1));
         assert_eq!(app.m.filter, None);
         assert!(app.copy.is_none());
@@ -1776,7 +1776,7 @@ mod tests {
         });
         assert!(app.copy.is_none() && app.m.status.is_none());
         assert_eq!(app.m.message, "Too much output, so copy mode was ended");
-        // 넘친 덩이까지 화면에 먹였고 맨 아래로 돌아와 있다.
+        // Even the overflowing chunk was fed to the screen, and it has returned to the bottom.
         assert_eq!(offset(&app), 0);
         assert!(
             app.screen
@@ -1788,12 +1788,12 @@ mod tests {
         );
     }
 
-    /// 바깥 터미널에 쓸 키 인코딩 모드 바이트(지난번과 달라진 것만).
+    /// The key encoding mode bytes to write to the outer terminal (only what differs from last time).
     fn keys(app: &mut App) -> String {
         String::from_utf8(app.sync_keys()).unwrap()
     }
 
-    /// 세션이 켠 키 인코딩 모드(DECCKM, modifyOtherKeys 2, kitty 1)와, 그것을 바깥에 걸고 푸는 바이트.
+    /// The key encoding modes the session turned on (DECCKM, modifyOtherKeys 2, kitty 1), and the bytes that set and unset them on the outside.
     const KEY_MODES: &[u8] = b"\x1b[?1h\x1b[>4;2m\x1b[>1u";
     const APPLY: &str = "\x1b[?1h\x1b[>4;2m\x1b[=1;1u";
     const RESET: &str = "\x1b[?1l\x1b[>4;0m\x1b[=0;1u";
@@ -1817,7 +1817,7 @@ mod tests {
         };
         assert_eq!(diff(all, changed), "\x1b[>4;1m\x1b[=9;1u");
         assert_eq!(diff(all, none), "\x1b[?1l\x1b>\x1b[>4;0m\x1b[=0;1u");
-        // kitty 플래그 2(이벤트 종류)는 걸지 않는다. 2만 달라지면 쓸 것이 없다.
+        // kitty flag 2 (event types) isn't set. If only 2 differs, there's nothing to write.
         let kitty = |kitty| KeyModes { kitty, ..none };
         assert_eq!(diff(none, kitty(3)), "\x1b[=1;1u");
         assert_eq!(diff(none, kitty(31)), "\x1b[=29;1u");
@@ -1835,14 +1835,14 @@ mod tests {
         };
         app.on_msg(output("s1", b"\x1b[>1u"));
         assert_eq!(keys(&mut app), "\x1b[=1;1u");
-        // 이미 건 모드는 다시 쓰지 않는다.
+        // A mode that's already set isn't written again.
         assert_eq!(keys(&mut app), "");
         app.on_msg(output("s1", b"\x1b[?1h\x1b=\x1b[>4;2m"));
         assert_eq!(keys(&mut app), "\x1b[?1h\x1b=\x1b[>4;2m");
-        // 다른 세션의 출력은 따르지 않는다.
+        // Output from other sessions isn't followed.
         app.on_msg(output("s2", b"\x1b[<u\x1b[>4m"));
         assert_eq!(keys(&mut app), "");
-        // 앱이 끄면 따라 끈다.
+        // When the app turns it off, it follows and turns it off.
         app.on_msg(output("s1", b"\x1b[<u\x1b[>4m\x1b[?1l\x1b>"));
         assert_eq!(keys(&mut app), "\x1b[?1l\x1b>\x1b[>4;0m\x1b[=0;1u");
     }
@@ -1866,18 +1866,18 @@ mod tests {
     fn copy_mode_and_prompts_get_plain_keys_and_give_the_modes_back() {
         let (mut app, mut rx) = app(KEY_MODES);
         assert_eq!(keys(&mut app), APPLY);
-        // 세션이 kitty를 켰으니 `⌃a`는 인코딩되어 온다.
+        // The session turned on kitty, so `⌃a` arrives encoded.
         app.on_input(b"\x1b[97;5u[");
         assert!(app.copy.is_some());
         assert_eq!(keys(&mut app), RESET);
         app.on_input(b"q");
         assert!(app.copy.is_none());
         assert_eq!(keys(&mut app), APPLY);
-        // `⌃a c` 시작 화면도 같다. 세션 칸을 가리니 키는 평범하게 와야 한다.
+        // The `⌃a c` launcher is the same. It covers the session pane, so keys must arrive plain.
         app.on_input(b"\x1b[97;5uc");
         assert!(app.m.launcher);
         assert_eq!(keys(&mut app), RESET);
-        // 거기서 `n`으로 연 상태줄 입력도 같고, Esc는 한 단계씩 되돌린다.
+        // Status line input opened there with `n` is the same, and Esc steps back one level at a time.
         app.on_input(b"n");
         assert!(app.m.prompt.is_some());
         assert_eq!(keys(&mut app), "");
@@ -1906,7 +1906,7 @@ mod tests {
 
     #[test]
     fn frozen_screen_does_not_end_a_stale_sync_update() {
-        // 동기화 갱신(`?2026`) 중이라 `buffered`는 아직 화면에 반영되지 않았다.
+        // A synchronized update (`?2026`) is in progress, so `buffered` hasn't been reflected on the screen yet.
         let (mut app, _rx) = app(b"hello\x1b[?2026hbuffered");
         assert!(app.sync_deadline().is_some());
         enter_copy(&mut app);
@@ -1914,7 +1914,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(300));
         app.end_stale_sync();
         assert_eq!(history(&app)[0], "hello");
-        // 나온 뒤에는 시간이 넘은 갱신을 끝내 화면에 반영한다.
+        // After leaving, the update that exceeded its time is ended and reflected on the screen.
         app.on_input(b"q");
         assert!(app.sync_deadline().is_some());
         app.end_stale_sync();
@@ -1942,7 +1942,7 @@ mod tests {
         }
     }
 
-    /// 프로젝트 `/p`에 세션이 하나도 없다는 첫 목록을 받은 클라이언트.
+    /// A client that received the first list saying project `/p` has no sessions at all.
     fn empty_app() -> (App, UnboundedReceiver<ToDaemon>) {
         let (tx, rx) = unbounded_channel();
         let mut app = App::new(tx, PathBuf::from("/p"), Size::new(120, 40));
@@ -1950,7 +1950,7 @@ mod tests {
         (app, rx)
     }
 
-    /// 프로젝트 `/p`의 세션이 `names`인 첫 목록을 받은 클라이언트. 첫 줄 세션에 붙고, 그때 보낸 `Attach`는 비워 둔다.
+    /// A client that received the first list where project `/p`'s sessions are `names`. It attaches to the first row's session, and the `Attach` sent then is drained.
     fn started_app(names: &[&str]) -> (App, UnboundedReceiver<ToDaemon>) {
         let (tx, mut rx) = unbounded_channel();
         let mut app = App::new(tx, PathBuf::from("/p"), Size::new(120, 40));
@@ -1961,7 +1961,7 @@ mod tests {
         (app, rx)
     }
 
-    /// 시작 화면이 `/p`에 만들라고 보내는 `New`.
+    /// The `New` the launcher sends to create in `/p`.
     fn new_session(kind: Kind, account: Option<&str>, name: &str) -> ToDaemon {
         use mine_core::session::NewSession;
         ToDaemon::New {
@@ -1985,7 +1985,7 @@ mod tests {
             sent(&mut rx),
             [new_session(Kind::Claude, Some("claude-a"), "t1")]
         );
-        // 만든 세션이 목록에 나타나면 평소처럼 붙고 시작 화면은 닫힌다.
+        // When the created session appears in the list, it attaches as usual and the launcher closes.
         app.on_msg(FromDaemon::Sessions {
             sessions: vec![shell("t1")],
         });
@@ -2003,7 +2003,7 @@ mod tests {
 
     #[test]
     fn b_x_s_start_the_other_kinds_with_the_next_free_name() {
-        // t1과 t3이 있으니 새 이름은 빈 자리 t2다. `⌃a c`로 붙은 세션 위에 시작 화면을 연다.
+        // t1 and t3 exist, so the new name is the free slot t2. `⌃a c` opens the launcher over the attached session.
         for (key, kind, account) in [
             (b"b", Kind::Claude, Some("claude-b")),
             (b"x", Kind::Codex, Some("codex")),
@@ -2028,7 +2028,7 @@ mod tests {
             sent(&mut rx),
             [new_session(Kind::Claude, Some("claude-a"), "t1")]
         );
-        // 데몬이 거절하면 다시 고를 수 있다.
+        // If the daemon refuses, you can pick again.
         app.on_msg(FromDaemon::Error {
             message: "no".into(),
         });
@@ -2045,7 +2045,7 @@ mod tests {
         app.on_input(b"\x1b[A");
         assert!(sent(&mut rx).is_empty());
         assert!(app.m.launcher && app.m.prompt.is_none() && app.pending.is_none());
-        // `⌃a b`는 목록을 접고, `⌃a d`는 나간다.
+        // `⌃a b` collapses the list, and `⌃a d` exits.
         app.on_input(b"\x01b");
         assert!(!app.m.list_open);
         app.on_input(b"\x01d");
@@ -2057,14 +2057,14 @@ mod tests {
         let (mut app, mut rx) = app(b"hello");
         app.on_input(b"\x01c");
         assert!(app.m.launcher && app.m.attached.is_some());
-        // 세션 칸을 가리는 동안 키와 붙여넣기는 세션에 가지 않는다.
+        // While the session pane is covered, keys and paste don't go to the session.
         app.on_input(b"a");
         app.on_action(Action::Paste(b"p".to_vec()));
         assert!(sent(&mut rx).is_empty());
         app.on_input(b"\x1b");
         assert!(!app.m.launcher);
         assert_eq!(app.m.attached.as_deref(), Some("s1"));
-        // 닫은 뒤에는 키가 다시 세션으로 간다. 세션 화면도 그대로다.
+        // After closing, keys go to the session again. The session screen is as it was.
         app.on_input(b"a");
         assert_eq!(sent(&mut rx), [input(b"a")]);
         assert_eq!(app.screen.as_ref().unwrap().lines()[0], "hello");
@@ -2086,7 +2086,7 @@ mod tests {
         assert!(sent(&mut rx).is_empty());
         app.on_input(b"\x1b");
         assert!(app.m.prompt.is_none() && app.m.launcher);
-        // 이름과 모델을 직접 입력해 만든다.
+        // Creates one by typing the name and model.
         app.on_input(b"n");
         app.on_input(b"claude-b mine opus\r");
         let mut spec = new_session(Kind::Claude, Some("claude-b"), "mine");
@@ -2100,8 +2100,8 @@ mod tests {
     #[test]
     fn clicking_an_option_row_starts_it_and_the_rest_of_the_pane_does_nothing() {
         let (mut app, mut rx) = empty_app();
-        // 터미널 칸은 (34, 0)에서 86x39다. 메뉴는 폭 22, 열한 줄이라 (66, 14)에서 시작하고 선택 줄은 네 줄 아래부터다.
-        let (left, top) = (34 + (86 - 22) / 2, (39 - 11) / 2);
+        // The terminal pane is 86x39 at (34, 0). The menu is 24 wide and eleven rows tall, so it starts at (65, 14), and the choice rows begin four rows below.
+        let (left, top) = (34 + (86 - 24) / 2, (39 - 11) / 2);
         app.mouse(ev(MouseKind::Down, left + 3, top + 5));
         assert_eq!(
             sent(&mut rx),
@@ -2110,7 +2110,7 @@ mod tests {
         app.on_msg(FromDaemon::Error {
             message: "no".into(),
         });
-        // 줄 밖, 터미널 칸의 다른 곳, 휠은 아무것도 하지 않는다.
+        // Outside a row, elsewhere in the terminal pane, and the wheel do nothing.
         app.mouse(ev(MouseKind::Down, left - 2, top + 5));
         app.mouse(ev(MouseKind::Down, left + 3, top));
         app.mouse(ev(MouseKind::WheelUp, left + 3, top + 5));
@@ -2119,7 +2119,7 @@ mod tests {
             ..ev(MouseKind::Down, left + 3, top + 5)
         });
         assert!(sent(&mut rx).is_empty());
-        // 줄의 `n`은 프롬프트를 연다.
+        // The `n` row opens the prompt.
         app.mouse(ev(MouseKind::Down, left, top + 8));
         assert!(app.m.prompt.is_some());
     }
@@ -2132,7 +2132,7 @@ mod tests {
         app.mouse(ev(MouseKind::Up, 40, 5));
         app.mouse(ev(MouseKind::WheelUp, 40, 5));
         assert!(sent(&mut rx).is_empty());
-        // 클릭으로 시작한 새 세션은 붙으면서 시작 화면을 닫는다.
+        // A new session started by a click closes the launcher when it attaches.
         app.mouse(ev(MouseKind::Down, 70, 20));
         assert!(matches!(sent(&mut rx)[..], [ToDaemon::New { .. }]));
     }
@@ -2145,7 +2145,7 @@ mod tests {
         assert!(app.m.launcher);
         app.on_input(b"\x01n");
         assert!(!app.m.launcher && app.m.attached.as_deref() == Some("p-b"));
-        // 붙은 세션이 사라졌는데 다른 세션이 없으면 시작 화면이 다시 뜬다.
+        // If the attached session disappears and there is no other session, the launcher shows again.
         app.on_msg(FromDaemon::Sessions {
             sessions: Vec::new(),
         });
@@ -2164,15 +2164,15 @@ mod tests {
     #[test]
     fn launcher_state_is_drawn_into_the_frame() {
         let (mut app, _rx) = empty_app();
-        // 넓은 글자는 칸마다 커서를 옮겨 쓰므로 ASCII 글자로 본다.
+        // Wide characters are written with a cursor move per cell, so look at the ASCII text only.
         let out = frame(&mut app);
         assert!(out.contains("claude-b") && out.contains("shell"), "{out:?}");
-        // 시작 화면의 상태줄 안내.
+        // The status line hint in the launcher.
         assert!(
             out.contains("↵ claude-a · b claude-b · x codex · s shell"),
             "{out:?}"
         );
-        // `n`으로 상태줄 입력을 열면 상태줄에 커서가 보인다.
+        // Opening status line input with `n` shows the cursor in the status line.
         app.on_input(b"n");
         assert!(frame(&mut app).contains("\x1b[?25h"));
     }
@@ -2180,7 +2180,7 @@ mod tests {
     #[test]
     fn hangul_in_the_launcher_is_not_acted_on_and_says_to_switch_to_english() {
         let (mut app, mut rx) = empty_app();
-        // `s`의 한글 자모(ㄴ), 음절, 여러 글자.
+        // `s` as Hangul jamo (ㄴ), a syllable, and several characters.
         for key in ["ㄴ", "한", "한글"] {
             app.m.message.clear();
             app.on_input(key.as_bytes());
@@ -2188,10 +2188,10 @@ mod tests {
         }
         assert!(sent(&mut rx).is_empty());
         assert!(app.m.launcher && app.m.prompt.is_none() && app.pending.is_none());
-        // 영문 키를 누르면 평소대로 시작한다.
+        // Pressing an English key starts as usual.
         app.on_input(b"s");
         assert_eq!(sent(&mut rx), [new_session(Kind::Shell, None, "t1")]);
-        // 한글 아닌 키는 안내 없이 무시한다.
+        // A non-Hangul key is ignored without a hint.
         let (mut app, _rx) = empty_app();
         app.on_input(b"q");
         assert!(app.m.message.is_empty());
@@ -2205,7 +2205,7 @@ mod tests {
         assert_eq!(launching.m.prompt, Some(Prompt::New("한글".into())));
         assert!(launching.m.message.is_empty());
         assert!(sent(&mut rx).is_empty());
-        // 세션에는 그대로 간다.
+        // It goes to the session as is.
         let (mut attached, mut rx) = app(b"");
         attached.on_input("한글ㅊ".as_bytes());
         assert_eq!(sent(&mut rx), [input("한글ㅊ".as_bytes())]);
@@ -2215,13 +2215,13 @@ mod tests {
     #[test]
     fn hangul_after_the_prefix_is_dropped_with_a_hint_and_never_reaches_the_session() {
         let (mut app, mut rx) = app(b"");
-        // `⌃a c`를 한글 입력 상태에서 누른 꼴이다(ㅊ).
+        // The shape of pressing `⌃a c` while in Hangul input (ㅊ).
         app.on_input(b"\x01");
         app.on_input("ㅊ".as_bytes());
         assert_eq!(app.m.message, input::HANGUL_HINT);
         assert!(sent(&mut rx).is_empty());
         assert!(!app.m.launcher && app.m.prompt.is_none());
-        // 접두는 풀렸으니 다음 키는 세션으로 간다. 영문으로 바꿔 누르면 명령이 된다.
+        // The prefix was released, so the next key goes to the session. Switching to English and pressing makes it a command.
         app.on_input(b"x");
         assert_eq!(sent(&mut rx), [input(b"x")]);
         app.on_input(b"\x01c");
@@ -2233,13 +2233,13 @@ mod tests {
         let (mut app, mut rx) = app(&lines(100));
         enter_copy(&mut app);
         let at = copy_line(&app);
-        // `k`(ㅏ)가 위로 가지 않고 상태줄이 안내한다.
+        // `k` (ㅏ) doesn't move up, and the status line shows a hint.
         app.on_input("ㅏ".as_bytes());
         assert_eq!(copy_line(&app), at);
         let status = app.m.status.clone().unwrap();
         assert!(status.contains(input::HANGUL_HINT), "{status}");
         assert!(status.starts_with("Copy mode │"));
-        // 영문 키를 누르면 안내가 걷히고 평소처럼 움직인다.
+        // Pressing an English key clears the hint and moves as usual.
         app.on_input(b"k");
         assert_eq!(copy_line(&app), at - 1);
         assert!(
@@ -2249,7 +2249,7 @@ mod tests {
                 .unwrap()
                 .contains("Switch your keyboard")
         );
-        // 한글 음절도 같고, 휠로도 걷힌다.
+        // A Hangul syllable is the same, and the wheel clears it too.
         app.on_input("한".as_bytes());
         assert!(
             app.m
@@ -2266,7 +2266,7 @@ mod tests {
                 .unwrap()
                 .contains("Switch your keyboard")
         );
-        // 접두 뒤의 한글도 복사 모드 상태줄에 알린다. 복사 모드는 끝나지 않는다.
+        // Hangul after the prefix is also reported in the copy mode status line. Copy mode doesn't end.
         app.on_input("\x01ㅊ".as_bytes());
         assert!(
             app.m
@@ -2276,12 +2276,12 @@ mod tests {
                 .contains(input::HANGUL_HINT)
         );
         assert!(app.copy.is_some());
-        // 검색어를 입력하는 중의 한글은 검색어다.
+        // Hangul while typing a search query is the query.
         app.on_input(b"/");
         app.on_input("한글".as_bytes());
         assert_eq!(app.m.status.as_deref(), Some("/한글"));
         assert!(!app.copy.as_ref().unwrap().mode.hangul);
-        // 한 번에 온 `/한글`도 검색어다. 앞의 한글(`ㅏ/`)은 명령 자리라 알린다.
+        // `/한글` arriving at once is also a query. The leading Hangul (`ㅏ/`) is in the command position, so it's reported.
         app.on_input(b"\r");
         app.on_input("/한".as_bytes());
         assert_eq!(app.m.status.as_deref(), Some("/한"));

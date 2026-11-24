@@ -1,8 +1,8 @@
-//! 클라이언트 raw stdin 해석. 접두 키(`⌃a`)·SGR 마우스·붙여넣기를 `Action`으로 바꾼다.
-//! 순수 함수형 상태 기계이며 I/O를 하지 않는다.
+//! Interpretation of the client's raw stdin. Turns the prefix key (`⌃a`), SGR mouse and paste into `Action`s.
+//! A pure functional state machine that does no I/O.
 //!
-//! 바깥 터미널은 붙은 세션이 켠 키 인코딩(kitty 키보드, modifyOtherKeys)으로 키를 보낸다. 그래서 `⌃a`와
-//! 그 뒤 명령 키는 0x01·글자 바이트로도, `CSI 97;5u`·`CSI 27;5;97~` 같은 인코딩된 키로도 온다.
+//! The outer terminal sends keys in the key encoding the attached session has enabled (kitty keyboard, modifyOtherKeys). So `⌃a` and
+//! the command key after it can arrive as 0x01 and a letter byte, or as encoded keys like `CSI 97;5u` or `CSI 27;5;97~`.
 
 use mine_core::select::{MouseEv, MouseKind};
 
@@ -22,25 +22,25 @@ pub enum Cmd {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
-    /// 그대로 활성 세션에 넘길 바이트.
+    /// Bytes to pass to the active session as they are.
     Pass(Vec<u8>),
     Cmd(Cmd),
     Mouse(MouseEv),
-    /// 붙여넣기 내용(마커 제외).
+    /// Pasted content (markers excluded).
     Paste(Vec<u8>),
-    /// 접두 뒤에 명령 키 대신 한글이 왔다. 버리고(세션에 넘기지 않는다) 영문으로 바꾸라고 알린다.
+    /// Hangul arrived instead of a command key after the prefix. It is discarded (not passed to the session) and the user is told to switch to English.
     Hangul,
 }
 
-/// 한글이 명령 키 자리에 왔을 때 상태줄에 띄우는 안내.
+/// The hint shown in the status line when Hangul arrives where a command key is expected.
 pub const HANGUL_HINT: &str = "Switch your keyboard to English and press again";
 
-/// 한글 자모(U+1100–11FF, U+3130–318F)나 음절(U+AC00–D7A3)인가.
+/// Whether it's a Hangul jamo (U+1100–11FF, U+3130–318F) or syllable (U+AC00–D7A3).
 pub fn is_hangul(c: char) -> bool {
     matches!(c, '\u{1100}'..='\u{11FF}' | '\u{3130}'..='\u{318F}' | '\u{AC00}'..='\u{D7A3}')
 }
 
-/// `bytes`가 한글 한 글자로 시작하는가. 글자가 덜 왔으면 아니다.
+/// Whether `bytes` starts with one Hangul character. If the character hasn't fully arrived, it's not.
 pub fn hangul_at(bytes: &[u8]) -> bool {
     let Some(&lead) = bytes.first() else {
         return false;
@@ -56,32 +56,32 @@ const PREFIX: u8 = 0x01;
 const ESC: u8 = 0x1b;
 const PASTE_START: &[u8] = b"\x1b[200~";
 const PASTE_END: &[u8] = b"\x1b[201~";
-/// 끝나지 않는 CSI 후보(SGR 마우스, 인코딩된 키)를 버퍼에 붙들어 두는 최대 길이.
+/// Maximum length for which an unfinished CSI candidate (SGR mouse, encoded key) is held in the buffer.
 const CSI_MAX: usize = 32;
 
 #[derive(Debug, Default)]
 pub struct InputParser {
-    /// `⌃a`를 받았고 다음 바이트가 명령이다.
+    /// `⌃a` was received and the next byte is the command.
     prefix: bool,
-    /// 붙여넣기 시작 마커를 받았다. 끝 마커까지의 내용이 `paste`에 쌓인다.
+    /// A paste start marker was received. The content up to the end marker accumulates in `paste`.
     in_paste: bool,
     paste: Vec<u8>,
-    /// 다음 `feed`에서 이어 받을 미완성 마커/마우스 시퀀스.
+    /// An incomplete marker or mouse sequence to continue on the next `feed`.
     pending: Vec<u8>,
-    /// 접두 뒤에 버린 UTF-8 문자의 남은 연속 바이트 수. 읽기 경계를 넘어 이어진다.
+    /// Remaining continuation bytes of a UTF-8 character discarded after the prefix. Carries over across read boundaries.
     skip: u8,
 }
 
-/// `ESC`로 시작하는 바이트열의 해석 결과.
+/// The result of interpreting a byte sequence that starts with `ESC`.
 enum Esc {
     PasteStart,
-    /// 소비한 길이와 마우스 이벤트. `None`은 `MouseKind`로 표현하지 못해 삼키는 보고다.
+    /// The consumed length and the mouse event. `None` is a report that can't be expressed as `MouseKind` and is swallowed.
     Mouse(usize, Option<MouseEv>),
-    /// 소비한 길이와 인코딩된 키.
+    /// The consumed length and the encoded key.
     Key(usize, Key),
-    /// 마커, 마우스, 인코딩된 키 시퀀스의 앞부분이다. 더 받아야 한다.
+    /// The beginning of a marker, mouse or encoded key sequence. More must be received.
     Partial,
-    /// 모르는 시퀀스. ESC를 일반 바이트로 내보내고 나머지는 이어서 읽는다.
+    /// An unknown sequence. ESC is emitted as an ordinary byte and the rest is read on.
     Other,
 }
 
@@ -89,14 +89,14 @@ fn classify(rest: &[u8]) -> Esc {
     if rest.starts_with(PASTE_START) {
         return Esc::PasteStart;
     }
-    // 길이 1은 Esc 키 단독이다. 기다리지 않고 바로 전달한다.
+    // A length of 1 is a lone Esc key. Pass it on immediately without waiting.
     if rest.len() > 1 && PASTE_START.starts_with(rest) {
         return Esc::Partial;
     }
     let Some(body) = rest.strip_prefix(b"\x1b[") else {
         return Esc::Other;
     };
-    // SGR 마우스는 `CSI < b ; x ; y M|m`, 인코딩된 키는 `CSI 숫자[:;]… u|~`다. 끝 바이트까지 받아 가른다.
+    // SGR mouse is `CSI < b ; x ; y M|m`; an encoded key is `CSI digits[:;]… u|~`. Read through the final byte and tell them apart.
     let (mouse, params) = match body.strip_prefix(b"<") {
         Some(params) => (true, params),
         None => (false, body),
@@ -121,34 +121,34 @@ fn classify(rest: &[u8]) -> Esc {
     }
 }
 
-/// kitty 수정 키 비트(매개변수에서 1을 뺀 값). 잠금 키(Caps Lock 64, Num Lock 128)는 명령을 가리지 않으므로 뺀다.
+/// kitty modifier bits (the parameter minus 1). Lock keys (Caps Lock 64, Num Lock 128) are excluded because they don't affect the command.
 const SHIFT: u32 = 1;
 const CTRL: u32 = 4;
 const LOCKS: u32 = 64 | 128;
-/// kitty가 수정 키 자체(왼쪽 Shift ~ ISO Level 5 Shift)를 누른 보고에 쓰는 코드(플래그 8).
+/// The code kitty uses to report pressing a modifier key itself (left Shift through ISO Level 5 Shift) (flag 8).
 const MODIFIER_KEYS: std::ops::RangeInclusive<u32> = 57441..=57454;
 
-/// 인코딩된 키 하나. kitty `CSI 코드[:시프트한 코드[:기본 배열 코드]] ; 수정[:이벤트] ; 글자 u`와
-/// modifyOtherKeys `CSI 27 ; 수정 ; 코드 ~`를 같은 꼴로 읽는다.
+/// One encoded key. Reads kitty `CSI code[:shifted code[:base layout code]] ; modifiers[:event] ; text u` and
+/// modifyOtherKeys `CSI 27 ; modifiers ; code ~` in the same shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Key {
-    /// 누른 키의 코드포인트. kitty는 Shift를 누르지 않은 글자로 보낸다.
+    /// The code point of the pressed key. kitty sends the character as it is without Shift pressed.
     code: u32,
-    /// Shift를 누른 글자(kitty 플래그 4).
+    /// The character with Shift pressed (kitty flag 4).
     shifted: Option<u32>,
-    /// US 배열에서 같은 자리 키(kitty 플래그 4). 배열이 US와 다르면 온다. 접두는 `code`가 ASCII가 아닐 때
-    /// (한글 배열 등)만 이것으로 알아본다. AZERTY의 ⌃q처럼 ASCII 글자 키는 그 글자가 먼저다.
+    /// The key at the same position on the US layout (kitty flag 4). It arrives when the layout differs from US. The prefix is recognized with this
+    /// only when `code` isn't ASCII (Hangul layouts, etc.). For ASCII letter keys, like ⌃q on AZERTY, that letter takes precedence.
     base: Option<u32>,
-    /// 키가 만든 글자(kitty 플래그 16).
+    /// The character the key produced (kitty flag 16).
     text: Option<u32>,
-    /// 수정 키 비트. 잠금 키 비트는 뺐다.
+    /// Modifier bits. Lock key bits are excluded.
     mods: u32,
-    /// 1 누름, 2 반복, 3 뗌.
+    /// 1 press, 2 repeat, 3 release.
     event: u32,
 }
 
 impl Key {
-    /// `ESC [` 뒤 매개변수와 끝 바이트로 키를 읽는다. 키 인코딩이 아니면 `None`이다.
+    /// Reads a key from the parameters after `ESC [` and the final byte. `None` if it isn't a key encoding.
     fn parse(params: &[u8], fin: u8) -> Option<Key> {
         let fields: Vec<Vec<Option<u32>>> = std::str::from_utf8(params)
             .ok()?
@@ -181,12 +181,12 @@ impl Key {
         })
     }
 
-    /// 누름이다. 이벤트 종류를 보고하지 않으면(kitty 플래그 2가 없으면) 모두 누름이다.
+    /// A press. If event types aren't reported (kitty flag 2 absent), everything is a press.
     fn press(&self) -> bool {
         self.event == 1
     }
 
-    /// `⌃a` 누름이다.
+    /// A `⌃a` press.
     fn is_prefix(&self) -> bool {
         let a = u32::from(b'a');
         let key = if self.code > 0x7f {
@@ -197,7 +197,7 @@ impl Key {
         self.press() && self.mods == CTRL && key == Some(a)
     }
 
-    /// 접두 뒤 명령표에 넣을 글자. Shift 말고 다른 수정 키가 붙었으면 명령이 아니다.
+    /// The character to look up in the post-prefix command table. If a modifier other than Shift is attached, it isn't a command.
     fn command_byte(&self) -> Option<u8> {
         if self.mods & !SHIFT != 0 {
             return None;
@@ -211,9 +211,9 @@ impl Key {
     }
 }
 
-/// Shift를 누른 US 배열 글자. kitty는 `⇧0`을 `CSI 48;2u`처럼 누르지 않은 글자로 보낸다.
+/// A US-layout character with Shift pressed. kitty sends `⇧0` as the unpressed character, like `CSI 48;2u`.
 ///
-/// ponytail: US 배열만 안다. 다른 배열은 kitty 플래그 4·16이 알려 주는 글자(`shifted`, `text`)로 맞는다.
+/// ponytail: Only the US layout is known. Other layouts match through the characters kitty flags 4 and 16 provide (`shifted`, `text`).
 fn shift_us(code: u32) -> u32 {
     const PLAIN: &[u8] = b"`1234567890-=[]\\;',./";
     const SHIFTED: &[u8] = b"~!@#$%^&*()_+{}|:\"<>?";
@@ -227,7 +227,7 @@ fn shift_us(code: u32) -> u32 {
     }
 }
 
-/// `b;x;y` 파라미터를 읽는다. 형식이 틀리면 `None`이다.
+/// Reads the `b;x;y` parameters. `None` if the format is wrong.
 fn sgr_params(params: &[u8]) -> Option<(u16, u16, u16)> {
     let mut it = std::str::from_utf8(params)
         .ok()?
@@ -237,9 +237,9 @@ fn sgr_params(params: &[u8]) -> Option<(u16, u16, u16)> {
     it.next().is_none().then_some((b, x, y))
 }
 
-/// 눌림은 `M`, 뗌은 `m`이다. 가로 휠(66/67)이나 128 이상 코드처럼 표현하지 못하면 `None`이다.
+/// A press is `M`, a release is `m`. `None` if it can't be represented, such as horizontal wheel (66/67) or codes of 128 and above.
 fn mouse_event(b: u16, x: u16, y: u16, press: bool) -> Option<MouseEv> {
-    let b = b & !(4 | 8 | 16); // 수정 키 비트는 무시한다.
+    let b = b & !(4 | 8 | 16); // Ignore the modifier key bits.
     let kind = match b {
         64 => MouseKind::WheelUp,
         65 => MouseKind::WheelDown,
@@ -272,7 +272,7 @@ fn command(key: u8) -> Option<Cmd> {
     })
 }
 
-/// UTF-8 선두 바이트 뒤에 따라오는 연속 바이트 수. ASCII 등은 0이다.
+/// The number of continuation bytes following a UTF-8 lead byte. 0 for ASCII and the like.
 fn utf8_tail(lead: u8) -> u8 {
     match lead {
         0xC0..=0xDF => 1,
@@ -282,7 +282,7 @@ fn utf8_tail(lead: u8) -> u8 {
     }
 }
 
-/// 쌓인 일반 바이트를 `Pass`로 내보낸다.
+/// Emits the accumulated ordinary bytes as `Pass`.
 fn flush(out: &mut Vec<Action>, plain: &mut Vec<u8>) {
     if !plain.is_empty() {
         out.push(Action::Pass(std::mem::take(plain)));
@@ -294,7 +294,7 @@ impl InputParser {
         Self::default()
     }
 
-    /// stdin에서 읽은 바이트를 먹고, 바이트 순서대로 동작을 돌려준다.
+    /// Consumes the bytes read from stdin and returns the actions in byte order.
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<Action> {
         let mut out = Vec::new();
         let mut plain = Vec::new();
@@ -303,7 +303,7 @@ impl InputParser {
         let mut i = 0;
         while i < buf.len() {
             if self.in_paste {
-                // 끝 마커가 읽기 경계에 걸칠 수 있어, 새로 붙이기 전 끝부분부터 다시 찾는다.
+                // The end marker may straddle a read boundary, so search again from the tail end before appending the new bytes.
                 let from = self.paste.len().saturating_sub(PASTE_END.len() - 1);
                 self.paste.extend_from_slice(&buf[i..]);
                 let Some(at) = self.paste[from..]
@@ -327,11 +327,11 @@ impl InputParser {
                     i += 1;
                     continue;
                 }
-                self.skip = 0; // 잘린 문자다. 이 바이트는 평소처럼 읽는다.
+                self.skip = 0; // A truncated character. Read this byte as usual.
             }
             if b == ESC {
                 match classify(&buf[i..]) {
-                    // 접두는 그대로 둔다. 이어 받을 시퀀스가 명령 키일 수 있다.
+                    // Leave the prefix as is. The sequence still to come may be a command key.
                     Esc::Partial => {
                         self.pending = buf[i..].to_vec();
                         break;
@@ -340,7 +340,7 @@ impl InputParser {
                         self.key(key, &buf[i..i + len], &mut out, &mut plain);
                         i += len;
                     }
-                    // 키가 아닌 ESC 시퀀스는 접두를 풀고 평소처럼 해석한다(붙여넣기·마우스·CSI).
+                    // An ESC sequence that isn't a key releases the prefix and is interpreted as usual (paste, mouse, CSI).
                     Esc::PasteStart => {
                         self.prefix = false;
                         flush(&mut out, &mut plain);
@@ -366,7 +366,7 @@ impl InputParser {
             i += 1;
             if self.prefix {
                 let tail = utf8_tail(b);
-                // 여러 바이트 문자는 끝까지 읽어야 한글인지 가른다. 읽기 경계에 걸쳤으면 다음 읽기로 미룬다.
+                // A multi-byte character must be read to the end to tell whether it's Hangul. If it straddles the read boundary, defer to the next read.
                 if buf.len() < i + usize::from(tail) {
                     self.pending = buf[i - 1..].to_vec();
                     break;
@@ -378,7 +378,7 @@ impl InputParser {
                         flush(&mut out, &mut plain);
                         out.push(Action::Cmd(cmd));
                     }
-                    // 모르는 키는 버린다(세션에 넘기지 않는다). 한글이면 알린다. 여러 바이트 문자는 끝까지 버린다.
+                    // An unknown key is discarded (not passed to the session). If it's Hangul, notify. A multi-byte character is discarded to the end.
                     _ => {
                         if hangul_at(&buf[i - 1..]) {
                             flush(&mut out, &mut plain);
@@ -398,7 +398,7 @@ impl InputParser {
         out
     }
 
-    /// 인코딩된 키 하나(`seq`는 그 바이트). 접두 키와 접두 뒤 명령 키만 읽고, 나머지는 온 그대로 넘긴다.
+    /// One encoded key (`seq` is its bytes). Only the prefix key and the command key after the prefix are read; everything else is passed through as received.
     fn key(&mut self, key: Key, seq: &[u8], out: &mut Vec<Action>, plain: &mut Vec<u8>) {
         if !self.prefix {
             if key.is_prefix() {
@@ -408,19 +408,19 @@ impl InputParser {
             }
             return;
         }
-        // 접두 조합을 이루는 수정 키 누름(`⇧`)이나 누름이 아닌 이벤트는 삼키고 다음 키를 기다린다.
+        // A modifier key press (`⇧`) that makes up the prefix combination, or a non-press event, is swallowed and the next key is awaited.
         if MODIFIER_KEYS.contains(&key.code) || !key.press() {
             return;
         }
         self.prefix = false;
         if key.is_prefix() {
-            // `⌃a ⌃a`: 두 번째 `⌃a`는 세션이 고른 인코딩 그대로 넘긴다.
+            // `⌃a ⌃a`: the second `⌃a` is passed through in the encoding the session chose.
             plain.extend_from_slice(seq);
         } else if let Some(cmd) = key.command_byte().and_then(command) {
             flush(out, plain);
             out.push(Action::Cmd(cmd));
         }
-        // 모르는 키는 버린다.
+        // An unknown key is discarded.
     }
 }
 
@@ -484,7 +484,7 @@ mod tests {
 
     #[test]
     fn escape_alone_passes() {
-        // Esc 단독은 바로 전달한다.
+        // A lone Esc is passed on immediately.
         assert_eq!(p(b"\x1b"), vec![Action::Pass(vec![0x1b])]);
     }
 
@@ -520,7 +520,7 @@ mod tests {
                 row: 2
             })]
         );
-        // 끝나지 않는 후보는 32바이트를 넘으면 그대로 내보낸다.
+        // A candidate that hasn't ended is emitted as is once it exceeds 32 bytes.
         let long = [b"\x1b[<".as_slice(), &[b'1'; 40]].concat();
         assert_eq!(p(&long), vec![Action::Pass(long.clone())]);
     }
@@ -542,16 +542,16 @@ mod tests {
 
     #[test]
     fn prefix_then_multibyte_char_is_dropped_whole() {
-        // 한글이 아닌 여러 바이트 문자(2·3·4바이트)다. 알림도 없이 버린다.
+        // A multi-byte character that isn't Hangul (2-, 3- or 4-byte). Discarded without notice.
         for ch in ["é", "あ", "😀"] {
             let all = [b"\x01".as_slice(), ch.as_bytes()].concat();
-            // 읽기 경계가 어디에 걸려도 연속 바이트가 새지 않는다.
+            // Continuation bytes don't leak wherever the read boundary falls.
             for cut in 0..=all.len() {
                 let mut ip = InputParser::new();
                 assert!(ip.feed(&all[..cut]).is_empty(), "{ch} cut {cut}");
                 assert!(ip.feed(&all[cut..]).is_empty(), "{ch} cut {cut}");
             }
-            // 버린 문자 뒤의 바이트는 평소처럼 전달한다.
+            // Bytes after the discarded character are passed through as usual.
             assert_eq!(
                 p(&[all.as_slice(), b"ls"].concat()),
                 vec![Action::Pass(b"ls".to_vec())],
@@ -573,13 +573,13 @@ mod tests {
             assert!(!is_hangul(c), "{c:?}");
         }
         assert!(hangul_at("한글".as_bytes()) && !hangul_at(b"a") && !hangul_at(b""));
-        // 덜 온 글자는 한글로 치지 않는다.
+        // A partially received character doesn't count as Hangul.
         assert!(!hangul_at(&"한".as_bytes()[..2]));
     }
 
     #[test]
     fn prefix_then_hangul_is_reported_not_passed_to_the_session() {
-        // 자모(ㅊ은 한글 입력의 `c`), 옛 자모 영역, 음절. 읽기 경계가 어디에 걸려도 한 번 알린다.
+        // Jamo (ㅊ is `c` in Hangul input), the old jamo block, and syllables. Notified once wherever the read boundary falls.
         for ch in ["ㅊ", "\u{1100}", "각"] {
             let all = [b"\x01".as_slice(), ch.as_bytes()].concat();
             for cut in 0..=all.len() {
@@ -588,17 +588,17 @@ mod tests {
                 got.extend(ip.feed(&all[cut..]));
                 assert_eq!(got, vec![Action::Hangul], "{ch} cut {cut}");
             }
-            // 알린 뒤의 바이트는 평소처럼 전달한다. 접두는 풀렸다.
+            // Bytes after the notification are passed through as usual. The prefix was released.
             assert_eq!(
                 p(&[all.as_slice(), b"ns"].concat()),
                 vec![Action::Hangul, Action::Pass(b"ns".to_vec())],
                 "{ch}"
             );
         }
-        // 인코딩된 접두 뒤도 같다.
+        // The same after an encoded prefix.
         assert_eq!(p(&cat(&[KITTY_A, "한".as_bytes()])), [Action::Hangul]);
         assert_eq!(p(&cat(&[MOK_A, "ㅊ".as_bytes()])), [Action::Hangul]);
-        // 앞서 온 글자와 순서가 유지된다.
+        // Order with the character that came before is preserved.
         assert_eq!(
             p(&cat(&[b"ab\x01", "ㅊ".as_bytes(), b"c"])),
             [
@@ -622,7 +622,7 @@ mod tests {
         assert!(p(b"\x1b[<66;1;1M").is_empty());
     }
 
-    /// kitty와 modifyOtherKeys로 인코딩된 `⌃a`.
+    /// `⌃a` encoded with kitty and modifyOtherKeys.
     const KITTY_A: &[u8] = b"\x1b[97;5u";
     const MOK_A: &[u8] = b"\x1b[27;5;97~";
 
@@ -634,12 +634,12 @@ mod tests {
     fn encoded_prefix_then_legacy_key_is_a_command() {
         assert_eq!(p(&cat(&[KITTY_A, b"n"])), [Action::Cmd(Cmd::NextSession)]);
         assert_eq!(p(&cat(&[MOK_A, b"d"])), [Action::Cmd(Cmd::Detach)]);
-        // 이벤트 종류를 붙인 누름 형태도 `⌃a`다.
+        // The press form with an event type attached is `⌃a` too.
         assert_eq!(
             p(&cat(&[b"\x1b[97;5:1u", b"p"])),
             [Action::Cmd(Cmd::PrevSession)]
         );
-        // 잠금 키(Caps Lock 64, Num Lock 128) 비트는 가리지 않는다.
+        // Lock key bits (Caps Lock 64, Num Lock 128) don't matter.
         assert_eq!(
             p(&cat(&[b"\x1b[97;69u", b"n"])),
             [Action::Cmd(Cmd::NextSession)]
@@ -652,7 +652,7 @@ mod tests {
             p(&cat(&[KITTY_A, b"\x1b[110u"])),
             [Action::Cmd(Cmd::NextSession)]
         );
-        // Shift 글자는 누르지 않은 키(`⇧0`은 48)로도, 시프트한 글자(41)로도, 함께 온 글자(플래그 16)로도 온다.
+        // A Shift character arrives as the unpressed key (`⇧0` is 48), as the shifted character (41), or as the accompanying text (flag 16).
         for shifted in [
             b"\x1b[48;2u".as_slice(),
             b"\x1b[41;2u",
@@ -670,10 +670,10 @@ mod tests {
             p(&cat(&[KITTY_A, b"\x1b[57;2u"])),
             [Action::Cmd(Cmd::PrevProject)]
         );
-        // `⇧n`은 `N`이라 명령이 아니고, Ctrl이 붙은 키도 명령이 아니다. 둘 다 접두와 함께 버린다.
+        // `⇧n` is `N`, so it isn't a command, and a key with Ctrl isn't either. Both are discarded along with the prefix.
         assert!(p(&cat(&[KITTY_A, b"\x1b[110;2u"])).is_empty());
         assert!(p(&cat(&[KITTY_A, b"\x1b[110;5u"])).is_empty());
-        // 플래그 8은 수정 키 누름도 보낸다. 접두 조합의 일부라 접두를 풀지 않는다.
+        // Flag 8 also sends modifier key presses. They're part of the prefix combination, so they don't release the prefix.
         assert_eq!(
             p(&cat(&[
                 b"\x1b[57442;5u",
@@ -689,12 +689,12 @@ mod tests {
 
     #[test]
     fn base_layout_key_counts_only_for_non_ascii_keys() {
-        // AZERTY의 ⌃q는 US 배열 자리가 a(플래그 4)라도 ⌃q다. 앱이 ⌃q를 잃지 않는다.
+        // ⌃q on AZERTY is ⌃q even if its US-layout position is a (flag 4). The app doesn't lose ⌃q.
         assert_eq!(
             p(b"\x1b[113::97;5un"),
             [Action::Pass(b"\x1b[113::97;5un".to_vec())]
         );
-        // 한글 배열처럼 키 글자가 ASCII가 아니면 US 배열 자리 a로 `⌃a`를 알아본다.
+        // When the key character isn't ASCII, as on a Hangul layout, `⌃a` is recognized by its US-layout position a.
         assert_eq!(p(b"\x1b[12596::97;5un"), [Action::Cmd(Cmd::NextSession)]);
     }
 
@@ -705,14 +705,14 @@ mod tests {
             [Action::Pass(KITTY_A.to_vec())]
         );
         assert_eq!(p(&cat(&[MOK_A, MOK_A])), [Action::Pass(MOK_A.to_vec())]);
-        // 섞여 와도 두 번째 것을 온 그대로 넘긴다.
+        // Even mixed in, the second one is passed through as it arrived.
         assert_eq!(p(&cat(&[b"\x01", MOK_A])), [Action::Pass(MOK_A.to_vec())]);
         assert_eq!(p(&cat(&[KITTY_A, b"\x01"])), [Action::Pass(vec![1])]);
     }
 
     #[test]
     fn other_encoded_keys_pass_unchanged() {
-        // Shift+Enter, Ctrl+c, Esc, modifyOtherKeys Shift+Enter, 뗌 이벤트.
+        // Shift+Enter, Ctrl+c, Esc, modifyOtherKeys Shift+Enter, release event.
         for key in [
             b"\x1b[13;2u".as_slice(),
             b"\x1b[99;5u",
@@ -740,7 +740,7 @@ mod tests {
             (b"\x1b[13;2u", vec![Action::Pass(b"\x1b[13;2u".to_vec())]),
         ];
         for (all, want) in cases {
-            // 읽기 끝의 단독 ESC는 기다리지 않고 Esc 키로 넘긴다(`escape_alone_passes`). 그 자리는 빼고 자른다.
+            // A lone ESC at the end of a read isn't waited for and is passed as the Esc key (`escape_alone_passes`). That spot is excluded when cutting.
             for cut in (0..=all.len()).filter(|&c| c == 0 || all[c - 1] != ESC) {
                 let mut ip = InputParser::new();
                 let mut got = ip.feed(&all[..cut]);

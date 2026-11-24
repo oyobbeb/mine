@@ -1,5 +1,5 @@
-//! 터미널 칸의 마우스 중 화면에 묶인 부분: 드래그 선택과 복사(OSC 52), 선택 반전 그리기.
-//! SGR 다시 만들기와 선택 글자 읽기는 `mine_core::select`가 한다. 좌표는 모두 터미널 칸 안 (칸, 줄) 0부터다. 바깥 화면 좌표는 `ui::hit`이 이미 바꿔 준다.
+//! The parts of the terminal pane's mouse handling that are tied to the screen: drag selection and copy (OSC 52), and drawing the selection inverted.
+//! `mine_core::select` rebuilds SGR and reads the selected text. All coordinates are (column, row) within the terminal pane, 0-based. `ui::hit` has already converted outer screen coordinates.
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -9,18 +9,18 @@ use ratatui::style::Modifier;
 
 use mine_core::select::Selection;
 
-/// 한 번에 복사하는 글자의 최대 바이트.
+/// Maximum bytes copied at once.
 ///
-/// ponytail: 100KB가 넘는 OSC 52는 터미널이 거부하는 일이 많다(base64로 늘면 더 크다). 그래서 글자 경계에서
-/// 잘라 복사하고 알린다. 큰 선택을 나눠 보내거나 다른 경로로 내보내는 일은 필요해질 때 한다.
+/// ponytail: Terminals often reject OSC 52 over 100KB (it grows further with base64). So the text is cut at a character
+/// boundary, copied, and the user is told. Splitting a large selection or sending it another way can wait until it's needed.
 const MAX_COPY: usize = 100_000;
 
-/// 클립보드를 쓰는 OSC 52. 바깥 터미널이 받아 시스템 클립보드에 넣는다.
+/// OSC 52 that writes to the clipboard. The outer terminal receives it and puts it on the system clipboard.
 pub fn osc52(text: &str) -> Vec<u8> {
     format!("\x1b]52;c;{}\x07", STANDARD.encode(text)).into_bytes()
 }
 
-/// 바깥 화면 좌표를 터미널 칸 안으로 눌러 칸 기준 좌표로 바꾼다. 칸 밖으로 끌어도 선택이 이어지게 한다.
+/// Clamps an outer screen coordinate into the terminal pane and converts it to a pane-relative coordinate. Keeps the selection going even when dragged outside the pane.
 pub fn local(term: Rect, col: u16, row: u16) -> (u16, u16) {
     (
         col.saturating_sub(term.x).min(term.width.saturating_sub(1)),
@@ -29,7 +29,7 @@ pub fn local(term: Rect, col: u16, row: u16) -> (u16, u16) {
     )
 }
 
-/// 복사할 OSC 52 바이트와 상태줄 알림. 복사할 글자가 없으면 `None`이다.
+/// The OSC 52 bytes to copy and the status line notice. `None` if there is no text to copy.
 pub fn copy(text: &str) -> Option<(Vec<u8>, String)> {
     if text.is_empty() {
         return None;
@@ -44,7 +44,7 @@ pub fn copy(text: &str) -> Option<(Vec<u8>, String)> {
     Some((osc52(cut), message))
 }
 
-/// 선택 영역을 반전으로 그린다. `ui::draw`가 그린 버퍼에 덧입힌다.
+/// Draws the selection inverted. Overlaid on the buffer drawn by `ui::draw`.
 pub fn paint_selection(buf: &mut Buffer, term: Rect, sel: &Selection) {
     if term.is_empty() {
         return;
@@ -62,12 +62,12 @@ pub fn paint_selection(buf: &mut Buffer, term: Rect, sel: &Selection) {
     }
 }
 
-/// 드래그 선택의 진행 상태. 누르면 시작하고, 끌면 늘어나며, 떼면 선택이 확정된다.
+/// Progress of a drag selection. Pressing starts it, dragging extends it, and releasing finalizes it.
 #[derive(Debug, Default)]
 pub struct Select {
-    /// 누른 칸. 뗄 때까지 있다.
+    /// The pressed cell. Held until release.
     anchor: Option<(u16, u16)>,
-    /// 누른 칸과 다른 칸까지 끌었을 때만 있다. 제자리 클릭은 선택이 아니다.
+    /// Set only after dragging to a cell different from the pressed one. A click in place is not a selection.
     sel: Option<Selection>,
 }
 
@@ -83,14 +83,14 @@ impl Select {
         }
     }
 
-    /// 뗀다. 복사할 선택이 있으면 돌려준다. 선택은 지우지 않아 반전이 남는다.
+    /// Releases. Returns the selection to copy, if any. The selection isn't cleared, so the inversion stays.
     pub fn up(&mut self, at: (u16, u16)) -> Option<Selection> {
         self.drag(at);
         self.anchor.take()?;
         self.sel
     }
 
-    /// 누르고 있는 중인가.
+    /// Whether the button is being held down.
     pub fn dragging(&self) -> bool {
         self.anchor.is_some()
     }
@@ -99,7 +99,7 @@ impl Select {
         self.sel.as_ref()
     }
 
-    /// 진행 중인 것까지 모두 버린다. 그려진 반전이 있었으면 `true`다.
+    /// Discards everything, including what is in progress. Returns `true` if an inversion had been drawn.
     pub fn clear(&mut self) -> bool {
         let shown = self.sel.is_some();
         *self = Select::default();
@@ -136,10 +136,10 @@ mod tests {
         s.down((3, 2));
         s.drag((5, 2));
         assert_eq!(s.selection(), Some(&sel((3, 2), (5, 2))));
-        // 뗄 때 위치까지 늘린다.
+        // Extend to the release position too.
         assert_eq!(s.up((6, 3)), Some(sel((3, 2), (6, 3))));
         assert!(!s.dragging());
-        // 뗀 뒤에도 반전은 남고, 지우면 있었다고 알린다.
+        // The inversion remains after release, and clearing it reports that there was one.
         assert_eq!(s.selection(), Some(&sel((3, 2), (6, 3))));
         assert!(s.clear());
         assert!(!s.clear());
@@ -164,7 +164,7 @@ mod tests {
         s.down((1, 1));
         assert_eq!(s.selection(), None);
         assert_eq!(s.up((1, 1)), None);
-        // 누르지 않았으면 끌기와 뗌은 무시한다.
+        // Drag and release are ignored if there was no press.
         s.drag((2, 2));
         assert_eq!(s.selection(), None);
         assert_eq!(s.up((2, 2)), None);
@@ -180,7 +180,7 @@ mod tests {
 
     #[test]
     fn copy_truncates_big_selections_at_a_char_boundary() {
-        // 가는 3바이트라 100_000바이트 경계(100_000 = 3 * 33333 + 1)가 글자 한가운데다.
+        // 가 is 3 bytes, so the 100_000-byte boundary (100_000 = 3 * 33333 + 1) falls in the middle of a character.
         let text = "가".repeat(40_000);
         let (bytes, msg) = copy(&text).unwrap();
         assert_eq!(msg, "Copied 33333 chars (truncated)");
@@ -203,7 +203,7 @@ mod tests {
         let mut buf = Buffer::empty(Rect::new(0, 0, 10, 5));
         paint_selection(&mut buf, term, &sel((4, 2), (1, 1)));
         let reversed = |x: u16, y: u16| buf[(x, y)].modifier.contains(Modifier::REVERSED);
-        // 위 줄은 (1,1)부터 줄 끝까지, 아래 줄은 줄 처음부터 (4,2)까지다.
+        // The upper row runs from (1,1) to the end of the line, and the lower row from the start of the line to (4,2).
         let on: Vec<(u16, u16)> = (0..10)
             .flat_map(|x| (0..5).map(move |y| (x, y)))
             .filter(|&(x, y)| reversed(x, y))

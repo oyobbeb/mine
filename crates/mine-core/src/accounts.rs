@@ -1,10 +1,10 @@
-//! 계정 id(`claude-a`, `claude-b`, `codex`)를 화면에 보일 짧은 이름으로 바꾼다.
+//! Turns an account id (`claude-a`, `claude-b`, `codex`) into a short name to show on screen.
 //!
-//! 이름은 별칭(`<state>/config.toml`) > 자동(로그인 정보) > id 순으로 정한다. 세션이 쓰는 계정 id는 그대로이고
-//! 화면에 글로 보이는 자리만 이 이름을 쓴다.
+//! The name is chosen by label (`<state>/config.toml`) > auto (login info) > id. The account id a session uses stays the same;
+//! only the places where it is shown as text use this name.
 //!
-//! 자격 증명은 읽거나 저장하지 않는다. Claude의 자동 이름을 위해 `.claude.json`에서 `oauthAccount.emailAddress`
-//! 하나만 읽고, 그 `@` 앞부분과 도메인 첫 마디만 기억한다. `.credentials.json`, 키체인, Codex 인증 파일은 열지 않는다.
+//! Credentials are never read or stored. For Claude's auto name, only `oauthAccount.emailAddress` is read from `.claude.json`,
+//! and only the part before `@` and the first label of the domain are remembered. `.credentials.json`, the keychain and Codex auth files are never opened.
 
 use std::collections::HashMap;
 use std::fs;
@@ -18,25 +18,25 @@ const CLAUDE_A: &str = "claude-a";
 const CLAUDE_B: &str = "claude-b";
 const CODEX: &str = "codex";
 
-/// 계정 id → 화면에 보일 이름. [`Labels::load`]로 읽고, 모르는 id는 id를 그대로 돌려준다.
+/// Account id → name to show on screen. Read with [`Labels::load`]; an unknown id comes back as the id itself.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Labels {
     names: HashMap<String, String>,
 }
 
 impl Labels {
-    /// 별칭 > 자동 > id 순으로 이름을 읽는다. 읽을 수 없는 파일은 없는 것으로 본다.
+    /// Reads names in the order label > auto > id. A file that can't be read counts as missing.
     ///
-    /// `home`은 claude-a의 `.claude.json`이 있는 폴더(`~`)이고, 없으면 claude-a의 자동 이름이 없다.
-    /// 클라이언트가 시작할 때 한 번 부른다(앱은 창이 다시 활성화될 때도).
+    /// `home` is the directory (`~`) that has claude-a's `.claude.json`; without it, claude-a has no auto name.
+    /// Call it once when the client starts (and for the app, also when the window is activated again).
     ///
-    /// ponytail: 파일 감시는 하지 않는다. 계정을 바꾸거나 별칭을 고친 뒤에는 클라이언트를 다시 띄우거나
-    /// (앱은) 창을 다시 활성화한다.
+    /// ponytail: no file watching. After switching accounts or editing a label, restart the client or
+    /// (for the app) activate the window again.
     pub fn load(state: &State, home: Option<&Path>) -> Labels {
         let mut names = HashMap::from([(CODEX.to_string(), "Codex".to_string())]);
         let a = home.and_then(|home| read_identity(&home.join(".claude.json")));
         let b = read_identity(&state.profiles_dir().join(CLAUDE_B).join(".claude.json"));
-        // 두 계정의 앞부분이 같으면 둘 다 도메인을 붙여 가른다.
+        // If the two accounts share the same local part, both get the domain appended to tell them apart.
         let same = matches!((&a, &b), (Some(a), Some(b)) if a.local == b.local);
         for (id, identity) in [(CLAUDE_A, a), (CLAUDE_B, b)] {
             if let Some(identity) = identity {
@@ -52,19 +52,19 @@ impl Labels {
         Labels { names }
     }
 
-    /// `account`의 화면 이름. 모르는 id는 id 그대로다.
+    /// The on-screen name of `account`. An unknown id comes back as the id.
     pub fn get<'a>(&'a self, account: &'a str) -> &'a str {
         self.names.get(account).map_or(account, String::as_str)
     }
 }
 
-/// `.claude.json`의 `oauthAccount.emailAddress`에서 `@` 앞부분. 계정 정보나 이메일이 없으면 `None`이다.
+/// The part before `@` in `.claude.json`'s `oauthAccount.emailAddress`. `None` if there is no account info or no email.
 pub fn auto_label(claude_json: &serde_json::Value) -> Option<String> {
     let claude = ClaudeJson::deserialize(claude_json).ok()?;
     identity(claude).map(|identity| identity.local)
 }
 
-/// `.claude.json`에서 읽는 부분. 이메일 말고 다른 필드는 읽지도 기억하지도 않는다.
+/// The part read from `.claude.json`. Fields other than the email are neither read nor remembered.
 #[derive(Deserialize)]
 struct ClaudeJson {
     #[serde(rename = "oauthAccount")]
@@ -77,16 +77,16 @@ struct OauthAccount {
     email_address: Option<String>,
 }
 
-/// 이메일에서 기억하는 두 조각. 이메일 전체는 들고 있지 않는다.
+/// The two pieces kept from the email. The full email is not held.
 struct Identity {
-    /// `@` 앞부분.
+    /// The part before `@`.
     local: String,
-    /// 도메인 첫 마디(`gmail.com`이면 `gmail`). 없으면 빈 값이다.
+    /// The first label of the domain (`gmail` for `gmail.com`). Empty if there is none.
     domain: String,
 }
 
 impl Identity {
-    /// 같은 앞부분을 가르는 `앞부분@도메인첫마디`. 도메인이 없으면 앞부분이다.
+    /// `local@first-domain-label`, which tells same local parts apart. Just the local part if there is no domain.
     fn with_domain(self) -> String {
         if self.domain.is_empty() {
             self.local
@@ -105,20 +105,20 @@ fn identity(claude: ClaudeJson) -> Option<Identity> {
     })
 }
 
-/// `path`의 `.claude.json`에서 이메일 조각만 읽는다. 없거나 깨졌으면 `None`이다.
+/// Reads only the email pieces from the `.claude.json` at `path`. `None` if it is missing or broken.
 fn read_identity(path: &Path) -> Option<Identity> {
     let bytes = fs::read(path).ok()?;
     let claude = serde_json::from_slice::<ClaudeJson>(&bytes).ok()?;
     identity(claude)
 }
 
-/// 화면에 쓸 글. 앞뒤 공백을 떼고, 비었거나 제어 문자가 있으면 화면을 깰 수 있어 쓰지 않는다.
+/// Text to show on screen. Trims surrounding whitespace; if it is empty or has control characters it could break the display, so it isn't used.
 fn clean(text: &str) -> Option<String> {
     let text = text.trim();
     (!text.is_empty() && !text.chars().any(char::is_control)).then(|| text.to_string())
 }
 
-/// `<state>/config.toml`의 별칭. 파일이 없거나 읽을 수 없으면 없는 것으로 보고, 문법이 틀리면 경고를 남기고 없는 것으로 본다.
+/// Labels from `<state>/config.toml`. A missing or unreadable file counts as none, and a syntax error logs a warning and counts as none.
 fn read_aliases(state: &State) -> HashMap<String, String> {
     let path = state.root.join("config.toml");
     let Ok(text) = fs::read_to_string(&path) else {
@@ -133,8 +133,8 @@ fn read_aliases(state: &State) -> HashMap<String, String> {
     })
 }
 
-/// `config.toml`의 `[accounts.<id>] label`들. 문자열이 아니거나 쓸 수 없는 항목은 건너뛴다.
-/// 문법이 틀리면 로그에 남길 사유(줄 번호와 오류 종류)를 준다. 파일 내용은 담지 않는다.
+/// The `[accounts.<id>] label` entries of `config.toml`. Entries that aren't strings or can't be used are skipped.
+/// On a syntax error, gives a reason to log (line number and error kind). The file contents are not included.
 fn parse_aliases(text: &str) -> Result<HashMap<String, String>, String> {
     let table: toml::Table = text.parse().map_err(|e: toml::de::Error| {
         let line = e.span().map_or(0, |span| {
@@ -165,7 +165,7 @@ mod tests {
 
     use super::*;
 
-    /// 임시 홈과 상태 폴더. 사용자의 진짜 `~/.claude.json`은 읽지 않는다.
+    /// Temporary home and state directory. The user's real `~/.claude.json` is never read.
     struct Env {
         _dir: tempfile::TempDir,
         home: PathBuf,
@@ -191,12 +191,12 @@ mod tests {
             fs::write(path, text).unwrap();
         }
 
-        /// claude-a의 `.claude.json`.
+        /// claude-a's `.claude.json`.
         fn claude_a(&self, email: &str) {
             Env::write(self.home.join(".claude.json"), &claude_json(email));
         }
 
-        /// claude-b의 `.claude.json`.
+        /// claude-b's `.claude.json`.
         fn claude_b(&self, email: &str) {
             let dir = self.state.profiles_dir().join("claude-b");
             Env::write(dir.join(".claude.json"), &claude_json(email));
@@ -223,7 +223,7 @@ mod tests {
     fn auto_label_takes_email_local_part() {
         let v = json!({"oauthAccount": {"emailAddress": "yb@example.com"}});
         assert_eq!(auto_label(&v), Some("yb".to_string()));
-        // 계정 정보가 없거나, 이메일이 없거나, 이메일 꼴이 아니면 자동 이름이 없다.
+        // With no account info, no email, or something that isn't shaped like an email, there is no auto name.
         assert_eq!(auto_label(&json!({})), None);
         assert_eq!(auto_label(&json!({"oauthAccount": {}})), None);
         assert_eq!(auto_label(&json!({"oauthAccount": null})), None);
@@ -247,21 +247,21 @@ mod tests {
         let env = Env::new();
         env.claude_a("yb@gmail.com");
         env.claude_b("work@acme.xyz");
-        env.config("[accounts.claude-a]\nlabel = \"개인\"\n");
+        env.config("[accounts.claude-a]\nlabel = \"personal\"\n");
         let labels = env.load();
-        // 별칭이 있는 계정은 별칭, `.claude.json`만 있는 계정은 자동 이름이다.
-        assert_eq!(labels.get("claude-a"), "개인");
+        // An account with a label shows the label; one with only a `.claude.json` shows the auto name.
+        assert_eq!(labels.get("claude-a"), "personal");
         assert_eq!(labels.get("claude-b"), "work");
 
-        // 아무것도 없는 계정은 id를 쓴다.
+        // An account with nothing uses its id.
         let empty = Env::new();
         let labels = empty.load();
         assert_eq!(labels.get("claude-a"), "claude-a");
         assert_eq!(labels.get("claude-b"), "claude-b");
-        // 모르는 id와 계정이 없는 shell의 빈 말도 그대로다.
+        // An unknown id and the empty string for a shell with no account come back unchanged too.
         assert_eq!(labels.get("shell"), "shell");
         assert_eq!(labels.get(""), "");
-        // 홈을 모르면 claude-a는 자동 이름이 없다.
+        // Without a home, claude-a has no auto name.
         let bare = Env::new();
         bare.claude_a("yb@gmail.com");
         assert_eq!(Labels::load(&bare.state, None).get("claude-a"), "claude-a");
@@ -277,13 +277,13 @@ mod tests {
         assert_eq!(labels.get("claude-a"), "yb@gmail");
         assert_eq!(labels.get("claude-b"), "yb@acme");
 
-        // 이름이 다르면 늘리지 않는다.
+        // If the names differ, don't expand.
         env.claude_b("other@acme.xyz");
         let labels = env.load();
         assert_eq!(labels.get("claude-a"), "yb");
         assert_eq!(labels.get("claude-b"), "other");
 
-        // 한쪽만 있으면 겹칠 일이 없다.
+        // With only one side present, there is nothing to overlap.
         let one = Env::new();
         one.claude_b("yb@acme.xyz");
         assert_eq!(one.load().get("claude-b"), "yb");
@@ -305,21 +305,21 @@ mod tests {
             assert_eq!(labels.get("claude-a"), "yb", "{broken:?}");
             assert_eq!(labels.get("codex"), "Codex", "{broken:?}");
         }
-        // 읽을 수 없는 config(폴더이거나 UTF-8이 아님)도 없는 것으로 본다.
+        // A config that can't be read (a directory, or not UTF-8) also counts as none.
         fs::remove_file(env.state.root.join("config.toml")).unwrap();
         fs::create_dir(env.state.root.join("config.toml")).unwrap();
         assert_eq!(env.load().get("claude-a"), "yb");
         fs::remove_dir(env.state.root.join("config.toml")).unwrap();
         fs::write(env.state.root.join("config.toml"), [0xff, 0xfe, 0xfd]).unwrap();
         assert_eq!(env.load().get("claude-a"), "yb");
-        // 깨진 `.claude.json`은 자동 이름이 없는 것이다.
+        // A broken `.claude.json` means there is no auto name.
         Env::write(env.home.join(".claude.json"), "{not json");
         assert_eq!(env.load().get("claude-a"), "claude-a");
     }
 
     #[test]
     fn bad_config_warning_never_quotes_the_file() {
-        // 경고는 로그에 남는다. 깨진 줄에 이메일이 있어도 파일 내용은 담지 않는다.
+        // The warning goes to the log. Even if the broken line has an email, the file contents are not included.
         let text = "[accounts.claude-a]\nlabel = \"yb@gmail.com\n";
         let warning = parse_aliases(text).unwrap_err();
         assert!(warning.contains("line 2"), "{warning}");
@@ -333,7 +333,7 @@ mod tests {
     fn codex_defaults_to_codex() {
         let env = Env::new();
         assert_eq!(env.load().get("codex"), "Codex");
-        // 별칭이 있으면 별칭이다.
+        // A label wins if there is one.
         env.config("[accounts.codex]\nlabel = \"gpt\"\n");
         assert_eq!(env.load().get("codex"), "gpt");
     }
@@ -344,21 +344,21 @@ mod tests {
         env.claude_a("yb@gmail.com");
         env.claude_b("work@acme.xyz");
         env.config(
-            "[accounts.claude-a]\nlabel = \"  개인  \"\n\
+            "[accounts.claude-a]\nlabel = \"  personal  \"\n\
              [accounts.claude-b]\nlabel = 7\n\
              [accounts.codex]\nlabel = \"   \"\n\
-             [accounts.work]\nlabel = \"회사\"\n\
+             [accounts.work]\nlabel = \"office\"\n\
              [accounts.bad]\nlabel = \"a\\nb\"\n\
              [hosts]\nbox = \"ssh\"\n",
         );
         let labels = env.load();
-        assert_eq!(labels.get("claude-a"), "개인");
-        // 문자열이 아니거나 빈 별칭, 제어 문자가 든 별칭은 건너뛰어 자동 이름을 쓴다.
+        assert_eq!(labels.get("claude-a"), "personal");
+        // Labels that aren't strings, are empty, or contain control characters are skipped and the auto name is used.
         assert_eq!(labels.get("claude-b"), "work");
         assert_eq!(labels.get("codex"), "Codex");
         assert_eq!(labels.get("bad"), "bad");
-        // 다른 계정 id의 별칭도 받는다.
-        assert_eq!(labels.get("work"), "회사");
+        // Labels for other account ids are accepted too.
+        assert_eq!(labels.get("work"), "office");
     }
 
     #[test]

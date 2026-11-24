@@ -1,9 +1,9 @@
-//! 세션 화면 상태. PTY 출력을 먹여 칸을 유지하고, 같은 크기의 새 `Screen`이
-//! 똑같은 화면을 되살릴 수 있는 바이트열(스냅숏)을 만든다.
+//! Session screen state. Feeds in PTY output to keep the cells, and builds a byte sequence (snapshot) from which a new `Screen` of the same size
+//! can restore the exact same screen.
 //!
-//! 안쪽 앱의 터미널 질의(DA1, 커서 위치 DSR, OSC 10/11 색, kitty 키보드 모드)에 대한 답은
-//! `Replies`가 모아 두고 `take_replies`로 꺼낸다. 데몬만 꺼낸 답을 보관 프로세스에 입력으로 보낸다.
-//! 클라이언트의 `Screen`은 꺼내서 버린다(같은 질의에 두 번 답하지 않도록).
+//! Answers to the inner app's terminal queries (DA1, cursor position DSR, OSC 10/11 colors, kitty keyboard mode)
+//! are collected by `Replies` and taken out with `take_replies`. Only the daemon sends the taken answers to the holder process as input.
+//! A client's `Screen` takes them out and throws them away (so the same query isn't answered twice).
 
 use std::fmt::Write as _;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -16,10 +16,10 @@ use alacritty_terminal::term::cell::{Cell, Flags, Hyperlink};
 use alacritty_terminal::term::{Config, MIN_COLUMNS, MIN_SCREEN_LINES, Term, TermMode};
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor, Rgb};
 
-/// 화면 위로 밀려난 줄을 몇 줄까지 간직하는가.
+/// How many lines pushed off the top of the screen are kept.
 pub const SCROLLBACK: usize = 10_000;
 
-/// `Term`에 크기를 알려 주는 구조체. 최소 크기 아래로는 내려가지 않는다.
+/// Struct that tells `Term` the size. It never goes below the minimum size.
 #[derive(Clone, Copy)]
 struct Size {
     cols: usize,
@@ -49,8 +49,8 @@ impl Dimensions for Size {
     }
 }
 
-/// 색 질의(OSC 10/11/12)에 답하는 처음 기본 전경색과 배경색. 클라이언트가 바깥 터미널의 실제 색을 알려 주면
-/// `set_default_colors`로 바꾼다. 앱이 OSC로 바꾼 색이 있으면 그 색이 먼저다.
+/// Initial default foreground and background colors that answer color queries (OSC 10/11/12). When the client reports the outer terminal's actual colors,
+/// they are replaced with `set_default_colors`. A color the app changed with OSC takes precedence.
 const DEFAULT_FG: Rgb = Rgb {
     r: 0xff,
     g: 0xff,
@@ -62,19 +62,19 @@ const DEFAULT_BG: Rgb = Rgb {
     b: 0x34,
 };
 
-/// 읽기 경계에 걸린 modifyOtherKeys 시퀀스 앞부분을 붙들어 두는 최대 길이.
+/// Maximum length of the start of a modifyOtherKeys sequence held back when it straddles a read boundary.
 const MOK_MAX: usize = 16;
 
-/// 꺼내지 않고 쌓아 둘 답의 최대 개수. 꺼내지 않는 `Screen`(테스트 등)에서도 무한히 늘지 않게 막는다.
+/// Maximum number of answers kept without being taken out. Keeps a `Screen` that never takes them out (tests, etc.) from growing without bound.
 const MAX_PENDING_REPLIES: usize = 256;
 
-/// 질의에 대한 답 하나. 색 답은 꺼낼 때 그 시점 색으로 채운다.
+/// One answer to a query. Color answers are filled in with the color at the time they are taken out.
 enum Reply {
     Text(String),
     Color(usize, Arc<dyn Fn(Rgb) -> String + Send + Sync>),
 }
 
-/// `Term`이 보내는 사건 중 PTY로 돌려보낼 답만 모으는 수신자.
+/// Receiver that collects only those events from `Term` that need an answer sent back to the PTY.
 #[derive(Clone, Default)]
 pub struct Replies(Arc<Mutex<Vec<Reply>>>);
 
@@ -92,21 +92,21 @@ impl EventListener for Replies {
     }
 }
 
-/// 세션 하나의 화면. 데몬이 PTY 출력을 `feed`로 먹이고, 붙는 클라이언트에는 `snapshot`을 보낸다.
+/// The screen of one session. The daemon feeds PTY output with `feed` and sends `snapshot` to clients that attach.
 pub struct Screen {
     term: Term<Replies>,
     parser: Processor,
     replies: Replies,
-    /// 대체 화면에 있는 동안 가려진 주 화면(스크롤백 포함). `Term`은 비활성 화면을 내주지 않으므로
-    /// 진입한 순간에 복사해 두고, 스냅숏이 대체 화면 뒤의 주 화면을 되살릴 때 쓴다.
+    /// The main screen hidden while on the alternate screen (including scrollback). `Term` doesn't hand out the inactive screen,
+    /// so it is copied at the moment of entry and used when a snapshot restores the main screen behind the alternate screen.
     primary: Option<Grid<Cell>>,
-    /// 색 질의에 답하는 기본 전경색(커서 색도 같다)과 배경색.
+    /// Default foreground (the cursor color is the same) and background that answer color queries.
     default_fg: Rgb,
     default_bg: Rgb,
-    /// 안쪽 앱이 정한 xterm modifyOtherKeys 단계(`CSI > 4 ; N m`). vte는 읽지만 alacritty `Term`은 기억하지 않아
-    /// 출력에서 따로 찾는다.
+    /// The xterm modifyOtherKeys level the inner app set (`CSI > 4 ; N m`). vte reads it but the alacritty `Term` doesn't remember it,
+    /// so it is looked for separately in the output.
     modify_other_keys: u8,
-    /// 읽기 경계에 걸린 그 시퀀스의 앞부분. 다음 `feed`에서 이어 읽는다.
+    /// The start of that sequence that straddled a read boundary. Continued on the next `feed`.
     mok_tail: Vec<u8>,
 }
 
@@ -114,7 +114,7 @@ impl Screen {
     pub fn new(cols: u16, rows: u16) -> Screen {
         let config = Config {
             scrolling_history: SCROLLBACK,
-            // 안쪽 앱이 켠 kitty 키보드 모드를 mode()로 읽고 스냅숏으로 되살리기 위해 켠다.
+            // Turned on so the kitty keyboard mode the inner app set can be read with mode() and restored from the snapshot.
             kitty_keyboard: true,
             ..Config::default()
         };
@@ -131,7 +131,7 @@ impl Screen {
         }
     }
 
-    /// 색 질의에 답하는 기본 전경색과 배경색을 바꾼다. 커서 색은 전경색을 따른다.
+    /// Changes the default foreground and background colors that answer color queries. The cursor color follows the foreground.
     pub fn set_default_colors(&mut self, fg: Rgb, bg: Rgb) {
         self.default_fg = fg;
         self.default_bg = bg;
@@ -139,23 +139,23 @@ impl Screen {
 
     pub fn feed(&mut self, bytes: &[u8]) {
         self.track_modify_other_keys(bytes);
-        // 대체 화면 진입(`CSI ? 1049 h` 등)은 `h`로, 나감은 `l`로 끝난다. 그 바이트마다 끊어,
-        // 진입 직후 주 화면이 아직 그대로일 때 붙잡고, 한 번에 나갔다 다시 들어와도 놓치지 않는다.
+        // Entering the alternate screen (`CSI ? 1049 h`, etc.) ends in `h` and leaving ends in `l`. Split at each of those bytes
+        // so the main screen is captured right after entry while it is still unchanged, and nothing is missed even if it leaves and re-enters in one go.
         for chunk in bytes.split_inclusive(|&b| b == b'h' || b == b'l') {
             self.parser.advance(&mut self.term, chunk);
             self.track_alt();
         }
     }
 
-    /// 출력에서 modifyOtherKeys 단계를 정하는 시퀀스를 찾아 기억한다. 전체 초기화(`ESC c`)는 0으로 돌린다.
+    /// Finds and remembers the sequence in the output that sets the modifyOtherKeys level. A full reset (`ESC c`) returns it to 0.
     ///
-    /// ponytail: vte 상태 기계를 따라가지 않고 ESC만 훑는다. 동기화 갱신(`?2026`) 안에서 바꾼 단계는 화면보다
-    /// 먼저 반영되고, DCS 안에 낀 같은 바이트도 센다. 둘 다 키 인코딩에는 해가 없다.
+    /// ponytail: doesn't follow the vte state machine, only scans for ESC. A level changed inside a synchronized update (`?2026`) is applied
+    /// before the screen, and the same bytes inside a DCS are counted too. Neither harms key encoding.
     fn track_modify_other_keys(&mut self, bytes: &[u8]) {
         let mut i = 0;
         if !self.mok_tail.is_empty() {
-            // 걸친 앞부분은 다음 덩이의 앞 `MOK_MAX`바이트하고만 잇는다. 덩이 전체를 복사하지 않는다.
-            // 앞부분에는 첫 ESC 말고 ESC가 없으므로, 시퀀스가 아니면 덩이를 처음부터 훑으면 된다.
+            // The straddling start is joined only with the first `MOK_MAX` bytes of the next chunk. The whole chunk is not copied.
+            // The start has no ESC other than the first, so if it isn't a sequence, the chunk can just be scanned from the beginning.
             let tail = std::mem::take(&mut self.mok_tail);
             let joined = [tail.as_slice(), &bytes[..bytes.len().min(MOK_MAX)]].concat();
             match mok_seq(&joined) {
@@ -163,7 +163,7 @@ impl Screen {
                     self.modify_other_keys = level;
                     i = len - tail.len();
                 }
-                // `MOK_MAX`보다 짧을 때만 앞부분이므로 덩이를 다 이은 것이다.
+                // Only when it is shorter than `MOK_MAX` is it a start, so the chunk has been joined in full.
                 Mok::Partial => {
                     self.mok_tail = joined;
                     return;
@@ -187,7 +187,7 @@ impl Screen {
         }
     }
 
-    /// 지금 화면이 대체 화면인지에 맞춰 가려진 주 화면 복사본을 만들거나 버린다.
+    /// Makes or drops the copy of the hidden main screen to match whether the screen is now the alternate screen.
     fn track_alt(&mut self) {
         let alt = self.term.mode().contains(TermMode::ALT_SCREEN);
         match (alt, self.primary.is_some()) {
@@ -197,7 +197,7 @@ impl Screen {
         }
     }
 
-    /// 지금까지 먹인 출력의 터미널 질의에 대한 답(PTY에 쓸 바이트). 꺼낸 답은 비운다.
+    /// Answers to the terminal queries in the output fed so far (bytes to write to the PTY). The answers taken out are cleared.
     pub fn take_replies(&mut self) -> Vec<u8> {
         let pending = std::mem::take(
             &mut *self
@@ -220,7 +220,7 @@ impl Screen {
         out.into_bytes()
     }
 
-    /// 색 질의에 답할 색. 앱이 정한 색이 먼저고, 없으면 기본 전경·배경색이다. 그 밖의 색 번호는 답하지 않는다.
+    /// The color to answer a color query with. A color the app set comes first, otherwise the default foreground or background. Other color numbers are not answered.
     fn color(&self, index: usize) -> Option<Rgb> {
         let fallback = match index {
             i if i == NamedColor::Background as usize => self.default_bg,
@@ -232,12 +232,12 @@ impl Screen {
         Some(self.term.colors()[index].unwrap_or(fallback))
     }
 
-    /// 동기화 갱신(`CSI ? 2026 h`) 중이면 그 갱신이 끝나야 할 시각. 이때까지 끝나지 않으면 `end_sync`를 부른다.
+    /// If a synchronized update (`CSI ? 2026 h`) is in progress, the time that update must end by. If it hasn't ended by then, call `end_sync`.
     pub fn sync_deadline(&self) -> Option<Instant> {
         self.parser.sync_timeout().sync_timeout()
     }
 
-    /// 끝나지 않은 동기화 갱신을 끝내고 모아 둔 출력을 화면에 반영한다. 세션이 멈춘 화면에 갇히지 않게 한다.
+    /// Ends an unfinished synchronized update and applies the output collected to the screen. Keeps the session from getting stuck on a frozen screen.
     pub fn end_sync(&mut self) {
         self.parser.stop_sync(&mut self.term);
         self.track_alt();
@@ -247,15 +247,15 @@ impl Screen {
         let size = Size::new(cols, rows);
         self.term.resize(size);
         if let Some(primary) = &mut self.primary {
-            // `Term`이 비활성 주 화면에 하는 것과 같이 줄 바꿈을 다시 맞춘다.
+            // Re-fit the line wrapping the same way `Term` does for the inactive main screen.
             primary.resize(true, size.rows, size.cols);
         }
     }
 
-    /// 스크롤백 + 보이는 칸(SGR 포함) + 모드 + 커서. 같은 크기의 새 `Screen`에 먹이면 화면이 되살아난다.
+    /// Scrollback + visible cells (with SGR) + modes + cursor. Feeding it to a new `Screen` of the same size brings the screen back.
     pub fn snapshot(&self) -> Vec<u8> {
         let mut w = Writer::new();
-        // `2J`는 비어 있는 주 화면에서도 빈 줄 하나를 스크롤백에 밀어 넣으므로 `3J`로 스크롤백을 비운다.
+        // `2J` pushes one blank line into scrollback even on an empty main screen, so `3J` clears the scrollback.
         w.out.push_str("\x1b[0m\x1b[H\x1b[2J\x1b[3J");
         let grid = self.term.grid();
         let mode = *self.term.mode();
@@ -266,7 +266,7 @@ impl Screen {
                 w.pen(&primary.cursor.template);
             }
             w.out.push_str("\x1b[?1049h");
-            // 진입할 때 비워지는 대체 화면의 바탕색은 그때 펜에 달렸다. 기본색으로 다시 비우고 그린다.
+            // The background color of the alternate screen, which is cleared on entry, was tied to the pen at that time. Clear it again with the default color and draw.
             w.plain();
             w.out.push_str("\x1b[2J");
         }
@@ -277,7 +277,7 @@ impl Screen {
         w.out.into_bytes()
     }
 
-    /// 보이는 줄. 오른쪽 공백은 뗀다. 스크롤해 둔 위치와 무관하게 실제 화면이다.
+    /// Visible lines. Trailing whitespace is trimmed. It is the real screen regardless of the scrolled position.
     pub fn lines(&self) -> Vec<String> {
         let grid = self.term.grid();
         (0..grid.screen_lines())
@@ -285,7 +285,7 @@ impl Screen {
             .collect()
     }
 
-    /// 스크롤백 + 보이는 줄, 오래된 것부터.
+    /// Scrollback + visible lines, oldest first.
     pub fn history_text(&self) -> Vec<String> {
         let grid = self.term.grid();
         (grid.topmost_line().0..=grid.bottommost_line().0)
@@ -293,7 +293,7 @@ impl Screen {
             .collect()
     }
 
-    /// `(col, row)`, 0부터.
+    /// `(col, row)`, 0-based.
     pub fn cursor(&self) -> (u16, u16) {
         let point = self.term.grid().cursor.point;
         (point.column.0 as u16, point.line.0 as u16)
@@ -303,17 +303,17 @@ impl Screen {
         *self.term.mode()
     }
 
-    /// 안쪽 앱이 마지막으로 정한 xterm modifyOtherKeys 단계(0~2).
+    /// The xterm modifyOtherKeys level the inner app last set (0-2).
     pub fn modify_other_keys(&self) -> u8 {
         self.modify_other_keys
     }
 
-    /// 켜진 kitty 키보드 플래그(1 모호한 키 구분, 2 이벤트 종류, 4 다른 키, 8 모든 키를 이스케이프로, 16 글자 함께).
+    /// The kitty keyboard flags that are on (1 disambiguate keys, 2 event types, 4 alternate keys, 8 all keys as escapes, 16 associated text).
     pub fn kitty_flags(&self) -> u8 {
         kitty_bits(self.mode())
     }
 
-    /// 양수 = 과거로.
+    /// Positive = toward the past.
     pub fn scroll(&mut self, delta: i32) {
         self.term.scroll_display(Scroll::Delta(delta));
     }
@@ -322,10 +322,10 @@ impl Screen {
         &self.term
     }
 
-    /// 대체 화면이 막 열린 지금, 가려진 주 화면을 복사한다.
+    /// Now that the alternate screen has just opened, copies the hidden main screen.
     ///
-    /// `swap_alt`로 주 화면을 잠시 꺼냈다가 되돌리면 대체 화면이 비워지므로,
-    /// 대체 화면은 미리 복사해 두었다가 되돌려 놓는다.
+    /// Swapping the main screen out briefly with `swap_alt` and back clears the alternate screen,
+    /// so the alternate screen is copied beforehand and put back.
     fn copy_primary(&mut self) -> Grid<Cell> {
         let alt = self.term.grid().clone();
         self.term.swap_alt();
@@ -336,7 +336,7 @@ impl Screen {
     }
 }
 
-/// SGR로 나타내는 칸 속성. 기본값이면 `0`만 내보낸다.
+/// Cell attributes expressed in SGR. If they are the default, only `0` is emitted.
 #[derive(Clone, Copy, PartialEq)]
 struct Pen {
     fg: Color,
@@ -345,7 +345,7 @@ struct Pen {
     underline: Option<Color>,
 }
 
-/// 펜이 되살리는 플래그. 넓은 글자나 줄 이음 같은 칸 구조 플래그는 뺀다.
+/// Flags the pen restores. Cell structure flags such as wide chars and line joins are left out.
 const PEN_FLAGS: Flags = Flags::BOLD
     .union(Flags::DIM)
     .union(Flags::ITALIC)
@@ -385,7 +385,7 @@ impl Pen {
         }
     }
 
-    /// 이 펜을 통째로 정하는 SGR. 앞의 속성은 `0`으로 지운다.
+    /// The SGR that sets this pen entirely. Earlier attributes are cleared with `0`.
     fn write_sgr(&self, out: &mut String) {
         out.push_str("\x1b[0");
         push_color(out, self.fg, 38);
@@ -402,7 +402,7 @@ impl Pen {
     }
 }
 
-/// 이름 있는 색의 0~15번 번호. 기본색 계열은 `None`.
+/// The index 0-15 of a named color. `None` for the default-color family.
 fn named_index(name: NamedColor) -> Option<u8> {
     use NamedColor::*;
     Some(match name {
@@ -426,7 +426,7 @@ fn named_index(name: NamedColor) -> Option<u8> {
     })
 }
 
-/// 색 하나를 SGR 매개변수(앞에 `;`)로 쓴다. `kind`는 38(전경), 48(배경), 58(밑줄). 기본색은 쓰지 않는다.
+/// Writes one color as an SGR parameter (preceded by `;`). `kind` is 38 (foreground), 48 (background) or 58 (underline). The default color is not written.
 fn push_color(out: &mut String, color: Color, kind: u8) {
     let _ = match color {
         Color::Named(name) => {
@@ -442,7 +442,7 @@ fn push_color(out: &mut String, color: Color, kind: u8) {
     };
 }
 
-/// 스냅숏 바이트를 쌓으면서, 터미널에 이미 켜 둔 펜과 하이퍼링크를 기억해 바뀔 때만 내보낸다.
+/// Accumulates snapshot bytes, remembering the pen and hyperlink already set on the terminal so it emits only what changes.
 struct Writer {
     out: String,
     pen: Pen,
@@ -458,7 +458,7 @@ impl Writer {
         }
     }
 
-    /// 칸의 속성과 하이퍼링크로 상태를 맞춘다. 글자는 쓰지 않는다.
+    /// Matches the state to the cell's attributes and hyperlink. Does not write the character.
     fn pen(&mut self, cell: &Cell) {
         let pen = Pen::of(cell);
         if pen != self.pen {
@@ -471,7 +471,7 @@ impl Writer {
                 self.out.push_str("\x1b]8;;\x1b\\");
             }
             if let Some(link) = &link {
-                // 자동으로 붙은 id는 원래 없던 값이므로 내보내지 않는다.
+                // An automatically assigned id was not there originally, so it isn't emitted.
                 let id = link.id();
                 let params = if id.ends_with("_alacritty") {
                     String::new()
@@ -484,7 +484,7 @@ impl Writer {
         }
     }
 
-    /// 펜만 기본으로 돌린다. 하이퍼링크는 줄을 넘어도 이어지므로 그대로 둔다.
+    /// Resets only the pen to default. A hyperlink continues across lines, so it is left as is.
     fn reset_pen(&mut self) {
         if self.pen != Pen::DEFAULT {
             self.out.push_str("\x1b[0m");
@@ -492,13 +492,13 @@ impl Writer {
         }
     }
 
-    /// 펜과 하이퍼링크를 모두 기본으로 돌린다.
+    /// Resets both the pen and the hyperlink to default.
     fn plain(&mut self) {
         self.pen(&Cell::default());
     }
 
     fn cell(&mut self, cell: &Cell) {
-        // 넓은 글자의 뒤 칸, 그리고 넓은 글자가 다음 줄로 넘어가며 남긴 칸은 앞 글자가 만든다.
+        // The trailing cell of a wide char, and the cell left behind when a wide char wraps to the next line, are made by the preceding char.
         if cell
             .flags
             .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
@@ -512,7 +512,7 @@ impl Writer {
         }
     }
 
-    /// 스크롤백과 보이는 줄을 위에서부터 그린다. 마지막 줄이 맨 아래에 놓이면서 앞줄이 스크롤백으로 밀린다.
+    /// Draws the scrollback and visible lines from the top. The last line ends up at the bottom, pushing earlier lines into scrollback.
     fn grid(&mut self, grid: &Grid<Cell>) {
         let cols = grid.columns();
         let bottom = grid.bottommost_line().0;
@@ -520,7 +520,7 @@ impl Writer {
         let mut after_wrap = false;
         for line in grid.topmost_line().0..=bottom {
             let row = &grid[Line(line)];
-            // 줄 바꿈으로 이어진 줄은 끝까지 그려 자동 줄 바꿈이 이어 받게 한다(줄 이음 표시를 보존한다).
+            // A line continued by a wrap is drawn to the end so auto-wrap carries on from it (this preserves the line-join flag).
             let wrapped = row[Column(cols - 1)].flags.contains(Flags::WRAPLINE);
             let mut len = if wrapped {
                 cols
@@ -528,12 +528,12 @@ impl Writer {
                 content_len(row, cols)
             };
             if after_wrap {
-                // 앞줄의 줄 바꿈 대기는 글자를 하나 써야 풀린다. 이어진 줄이 비었어도 첫 칸은 쓴다.
+                // The pending wrap of the previous line is released only by writing a char. Even if the continued line is empty, the first cell is written.
                 len = len.max(1);
             }
-            // 줄 끝의 빈자리는 다음 줄이 그 넓은 글자로 시작할 때만 건너뛴다(글자를 쓰면 클라이언트가 스스로 넘긴다).
-            // 이어진 줄을 다시 썼다면 공백으로 채워 줄 바꿈 대기를 만든다. 아니면 다음 줄 첫 칸이 이 줄 끝에 쓰인다.
-            // 되살린 칸은 빈자리 표시를 잃는다. 이어진 줄을 복사할 때 공백이 최대 하나 더 끼는 값이다.
+            // The empty slot at the end of a line is skipped only when the next line starts with that wide char (if the char is written, the client wraps it itself).
+            // If the continued line was written again, fill with spaces to create the pending wrap. Otherwise the next line's first cell would be written at the end of this line.
+            // A restored cell loses its empty-slot marker. This is a value where copying a continued line gets at most one extra space.
             let next_wide = line < bottom
                 && grid[Line(line + 1)][Column(0)]
                     .flags
@@ -548,12 +548,12 @@ impl Writer {
                 }
             }
             if after_wrap && len < cols {
-                // 자동 줄 바꿈은 새 줄을 첫 글자의 펜 바탕색으로 채운다. 그리지 않은 칸은 기본으로 되돌린다.
+                // Auto-wrap fills the new line with the background color of the first char's pen. Cells that weren't drawn are reset to default.
                 self.reset_pen();
                 self.out.push_str("\x1b[K");
             }
             if line < bottom && !wrapped {
-                // 새 줄의 바탕색이 펜을 따라가므로 줄바꿈 전에 펜을 지운다.
+                // The new line's background color follows the pen, so clear the pen before the line break.
                 self.reset_pen();
                 self.out.push_str("\r\n");
             }
@@ -561,12 +561,12 @@ impl Writer {
         }
     }
 
-    /// 주어진 화면의 커서를 되살린다.
+    /// Restores the cursor of the given screen.
     fn cursor(&mut self, grid: &Grid<Cell>) {
         let point = grid.cursor.point;
         let (row, mut col) = (point.line.0 + 1, point.column.0 + 1);
         if grid.cursor.input_needs_wrap {
-            // 마지막 칸을 쓴 직후라 다음 글자가 줄을 넘긴다. 그 칸을 다시 써서 같은 대기 상태를 만든다.
+            // The last cell was just written, so the next char wraps the line. Rewrite that cell to create the same pending state.
             let line = &grid[point.line];
             if line[point.column].flags.contains(Flags::WIDE_CHAR_SPACER) {
                 col -= 1;
@@ -596,17 +596,17 @@ impl Writer {
     }
 }
 
-/// `ESC`로 시작하는 출력이 modifyOtherKeys를 정하는 시퀀스인가.
+/// Whether output starting with `ESC` is a sequence that sets modifyOtherKeys.
 enum Mok {
-    /// 단계와 시퀀스 길이.
+    /// Level and sequence length.
     Set(u8, usize),
-    /// 앞부분만 왔다.
+    /// Only the start arrived.
     Partial,
     No,
 }
 
-/// `CSI > 4 [; N] m`을 vte처럼 읽는다. 빈 값과 0은 기본값(첫째 1, 둘째 0)이고 셋째부터는 무시한다.
-/// 0~2 밖의 단계와 4가 아닌 자원(modifyCursorKeys 등)은 vte처럼 무시한다.
+/// Reads `CSI > 4 [; N] m` the way vte does. Empty and 0 are the default (1 for the first, 0 for the second), and from the third on is ignored.
+/// A level outside 0-2 and a resource other than 4 (modifyCursorKeys, etc.) are ignored, like vte.
 fn mok_seq(buf: &[u8]) -> Mok {
     const HEAD: &[u8] = b"\x1b[>";
     if buf.starts_with(b"\x1bc") {
@@ -645,8 +645,8 @@ fn mok_seq(buf: &[u8]) -> Mok {
     }
 }
 
-/// 입력 해석에 영향을 주는 DEC 비공개 모드. 마우스 모드끼리, 1005와 1006은 서로 배타라
-/// 켜진 것 하나만 `h`가 나가므로 순서와 무관하게 같은 상태가 된다.
+/// DEC private modes that affect input interpretation. The mouse modes are mutually exclusive, as are 1005 and 1006,
+/// so only the one that is on emits `h`, and the state ends up the same regardless of order.
 const MODES: [(TermMode, u16); 11] = [
     (TermMode::APP_CURSOR, 1),
     (TermMode::LINE_WRAP, 7),
@@ -661,7 +661,7 @@ const MODES: [(TermMode, u16); 11] = [
     (TermMode::BRACKETED_PASTE, 2004),
 ];
 
-/// kitty 키보드 프로토콜 플래그 비트.
+/// Bits of the kitty keyboard protocol flags.
 const KITTY_FLAGS: [(TermMode, u8); 5] = [
     (TermMode::DISAMBIGUATE_ESC_CODES, 1),
     (TermMode::REPORT_EVENT_TYPES, 2),
@@ -670,7 +670,7 @@ const KITTY_FLAGS: [(TermMode, u8); 5] = [
     (TermMode::REPORT_ASSOCIATED_TEXT, 16),
 ];
 
-/// `mode`에 켜진 kitty 키보드 플래그를 프로토콜 비트로 모은다.
+/// Gathers the kitty keyboard flags on in `mode` into protocol bits.
 fn kitty_bits(mode: TermMode) -> u8 {
     KITTY_FLAGS
         .iter()
@@ -679,17 +679,17 @@ fn kitty_bits(mode: TermMode) -> u8 {
         .sum()
 }
 
-/// OSC 8에 그대로 실어도 안전한 링크인가(제어 문자가 끼면 시퀀스를 깰 수 있다).
+/// Whether a link is safe to carry in OSC 8 as is (control characters could break the sequence).
 fn link_is_plain(link: &Hyperlink) -> bool {
     !link.uri().chars().any(char::is_control) && !link.id().chars().any(char::is_control)
 }
 
-/// 칸의 글자를 그대로 내보내도 되는 글자로 바꾼다. 탭 칸(`\t`)은 커서를 움직이므로 공백으로 쓴다.
+/// Turns a cell's char into one that is fine to emit as is. A tab cell (`\t`) moves the cursor, so it is written as a space.
 fn printable(c: char) -> char {
     if c.is_control() { ' ' } else { c }
 }
 
-/// 오른쪽 끝의 아무 속성 없는 빈칸을 뺀 줄 길이.
+/// The line length without trailing blank cells that have no attributes.
 fn content_len(row: &Row<Cell>, cols: usize) -> usize {
     (0..cols)
         .rev()
@@ -729,18 +729,18 @@ mod tests {
         f
     }
 
-    /// 스크롤백을 포함한 모든 칸(속성, 줄 이음 표시까지)이 같은지 본다. 다르면 첫 불일치 칸만 알린다.
+    /// Checks that all cells including scrollback (attributes, even the line-join flags) are the same. If they differ, reports only the first mismatching cell.
     fn assert_same_cells(f: &Screen, s: &Screen) {
         let (gf, gs) = (f.term().grid(), s.term().grid());
         assert_eq!(
             (gf.topmost_line(), gf.columns(), gf.screen_lines()),
             (gs.topmost_line(), gs.columns(), gs.screen_lines()),
-            "크기가 다르다"
+            "sizes differ"
         );
         for line in gs.topmost_line().0..=gs.bottommost_line().0 {
             for col in 0..gs.columns() {
                 let (cf, cs) = (&gf[Line(line)][Column(col)], &gs[Line(line)][Column(col)]);
-                assert_eq!(cf, cs, "줄 {line}, 칸 {col}");
+                assert_eq!(cf, cs, "row {line}, col {col}");
             }
         }
     }
@@ -816,7 +816,7 @@ mod tests {
         let row = &f.term().grid()[Line(0)];
         let a = row[Column(0)].hyperlink().expect("a");
         assert_eq!((a.id(), a.uri()), ("a1", "https://a.example"));
-        // 같은 주소라도 따로 연 링크는 다른 링크로 남는다.
+        // A link opened separately stays a different link even with the same address.
         let (b, c) = (row[Column(2)].hyperlink(), row[Column(4)].hyperlink());
         assert_eq!(b.as_ref().map(|l| l.uri()), Some("https://b.example"));
         assert_ne!(b, c);
@@ -843,7 +843,7 @@ mod tests {
     #[test]
     fn snapshot_keeps_soft_wraps() {
         let mut s = Screen::new(40, 10);
-        // 100칸 한 줄, 그리고 마지막 칸에 안 들어가는 넓은 글자로 넘어가는 줄.
+        // A 100-cell line, and a line that wraps onto a wide char that doesn't fit in the last cell.
         s.feed("x".repeat(100).as_bytes());
         s.feed(format!("\r\n{}한글\r\nend", "a".repeat(39)).as_bytes());
         let f = rebuilt(&s);
@@ -879,7 +879,7 @@ mod tests {
 
     #[test]
     fn snapshot_keeps_empty_row_after_wrapped_row() {
-        // 줄이 40칸을 채워 다음 줄로 넘어간 뒤, 넘어간 글자를 지워 이어진 줄이 비는 경우.
+        // A line fills 40 cells and wraps to the next, then the wrapped char is erased so the continued line is empty.
         let mut s = Screen::new(40, 10);
         s.feed(format!("{}b\x08 \x08\r\nnext", "a".repeat(40)).as_bytes());
         let f = rebuilt(&s);
@@ -887,7 +887,7 @@ mod tests {
         assert_eq!(f.lines()[1], "");
         assert_same_cells(&f, &s);
 
-        // 스크롤백이 있어도 보이는 줄이 밀리지 않는다.
+        // Visible lines don't shift even with scrollback.
         let mut s = Screen::new(40, 10);
         for i in 0..20 {
             s.feed(format!("l{i}\r\n").as_bytes());
@@ -897,7 +897,7 @@ mod tests {
         assert_eq!(f.lines(), s.lines());
         assert_same_cells(&f, &s);
 
-        // 이어진 빈 줄이 맨 아래 줄이어도 줄 이음 표시가 남는다.
+        // The line-join flag remains even if the empty continued line is the bottom line.
         let mut s = Screen::new(40, 10);
         s.feed(format!("\x1b[9;1H{}b\x08 \x08", "a".repeat(40)).as_bytes());
         let f = rebuilt(&s);
@@ -905,29 +905,29 @@ mod tests {
         assert_eq!(f.cursor(), s.cursor());
     }
 
-    /// 모든 줄의 글자와 줄 이음 표시(마지막 칸의 `WRAPLINE`)가 같은지 본다.
+    /// Checks that the chars of every line and the line-join flag (`WRAPLINE` on the last cell) are the same.
     fn assert_same_rows_and_wraps(f: &Screen, s: &Screen) {
         assert_eq!(f.lines(), s.lines());
         let (gf, gs) = (f.term().grid(), s.term().grid());
         assert_eq!(
             gf.topmost_line(),
             gs.topmost_line(),
-            "스크롤백 길이가 다르다"
+            "scrollback lengths differ"
         );
         let last = Column(gs.columns() - 1);
         for line in gs.topmost_line().0..=gs.bottommost_line().0 {
             assert_eq!(
                 gf[Line(line)][last].flags.contains(Flags::WRAPLINE),
                 gs[Line(line)][last].flags.contains(Flags::WRAPLINE),
-                "줄 {line}의 줄 이음 표시"
+                "line-join flag of row {line}"
             );
         }
     }
 
     #[test]
     fn snapshot_keeps_rows_after_leading_wide_spacer_when_next_row_was_rewritten() {
-        // 마지막 칸에 안 들어간 넓은 글자가 다음 줄로 넘어가며 앞 줄 끝에 빈자리를 남긴 뒤,
-        // 이어진 줄을 지워 그 글자가 사라진 경우. 아래 줄이 한 줄 밀리면 안 된다.
+        // A wide char that didn't fit in the last cell wraps to the next line and leaves an empty slot at the end of the previous line, then
+        // the continued line is erased and that char disappears. The line below must not shift up by one.
         let mut s = Screen::new(40, 10);
         s.feed(format!("{}한\r\x1b[K\r\nnext", "a".repeat(39)).as_bytes());
         assert_eq!(s.lines()[2], "next");
@@ -936,8 +936,8 @@ mod tests {
         assert_eq!(f.lines()[2], "next");
         assert_eq!(f.cursor(), s.cursor());
 
-        // 이어진 줄을 지운 뒤 다른 글자를 써도 빈자리 표시와 줄 이음 표시가 둘 다 남는다.
-        // 첫 경우와 같은 분기를 이어진 줄이 비어 있지 않을 때 확인한다.
+        // After erasing the continued line, even if another char is written, both the empty-slot marker and the line-join flag remain.
+        // Checks the same branch as the first case when the continued line is not empty.
         let mut s = Screen::new(40, 10);
         s.feed(format!("{}한\r\x1b[K", "a".repeat(39)).as_bytes());
         s.feed(b"x\r\nnext");
@@ -946,8 +946,8 @@ mod tests {
         let f = rebuilt(&s);
         assert_same_rows_and_wraps(&f, &s);
 
-        // 넓은 글자를 지우지 않고 덮어쓰면 알라크리티가 빈자리 표시를 지워, 줄 이음 표시만 있는 공백이 남는다.
-        // 이 경우는 칸까지 똑같이 되살아난다.
+        // Overwriting a wide char without erasing it makes alacritty clear the empty-slot marker, leaving a space that has only the line-join flag.
+        // In this case even the cells are restored identically.
         let mut s = Screen::new(40, 10);
         s.feed(format!("{}한\rx\r\nnext", "a".repeat(39)).as_bytes());
         let flags = s.term().grid()[Line(0)][Column(39)].flags;
@@ -957,7 +957,7 @@ mod tests {
         assert_same_cells(&f, &s);
         assert_same_rows_and_wraps(&f, &s);
 
-        // 스크롤백이 있어도 보이는 줄이 밀리지 않는다.
+        // Visible lines don't shift even with scrollback.
         let mut s = Screen::new(40, 10);
         for i in 0..20 {
             s.feed(format!("l{i}\r\n").as_bytes());
@@ -966,7 +966,7 @@ mod tests {
         let f = rebuilt(&s);
         assert_same_rows_and_wraps(&f, &s);
 
-        // 이어진 줄이 여전히 그 넓은 글자로 시작하면 지금처럼 칸까지 똑같이 되살린다.
+        // If the continued line still starts with that wide char, even the cells are restored identically as now.
         let mut s = Screen::new(40, 10);
         s.feed(format!("{}한글\r\nend", "a".repeat(39)).as_bytes());
         let f = rebuilt(&s);
@@ -976,7 +976,7 @@ mod tests {
 
     #[test]
     fn snapshot_wrap_does_not_leak_background() {
-        // 이어진 줄의 첫 칸 펜 바탕색이 자동 줄 바꿈으로 새 줄 전체에 번지면 안 된다.
+        // The first cell's pen background color on a continued line must not spread over the whole new line through auto-wrap.
         let mut s = Screen::new(40, 10);
         for i in 0..20 {
             s.feed(format!("l{i}\r\n").as_bytes());
@@ -1005,7 +1005,7 @@ mod tests {
         let mut f = rebuilt(&s);
         assert_eq!(f.cursor(), (6, 2));
         assert!(!f.mode().contains(TermMode::SHOW_CURSOR));
-        // 이어지는 출력은 같은 펜과 링크로 나온다.
+        // Output that follows comes out with the same pen and link.
         s.feed(b"y");
         f.feed(b"y");
         assert_same_cells(&f, &s);
@@ -1051,17 +1051,17 @@ mod tests {
         let mut s = Screen::new(40, 10);
         s.feed(b"\x1b[>4;1m");
         assert_eq!(s.modify_other_keys(), 1);
-        // 단계를 빼면 0이다(vte와 같다).
+        // Without a level it is 0 (same as vte).
         s.feed(b"\x1b[>4m");
         assert_eq!(s.modify_other_keys(), 0);
-        // 다른 `CSI > … m`(modifyCursorKeys 등)와 SGR은 단계를 바꾸지 않는다.
+        // Other `CSI > … m` (modifyCursorKeys, etc.) and SGR don't change the level.
         s.feed(b"\x1b[>4;2m\x1b[>1;0m\x1b[4;0m\x1b[>4;9m");
         assert_eq!(s.modify_other_keys(), 2);
-        // 전체 초기화(RIS)는 0으로 돌린다. 이것도 읽기 경계에 걸칠 수 있다.
+        // A full reset (RIS) returns it to 0. This too can straddle a read boundary.
         s.feed(b"\x1b");
         s.feed(b"c");
         assert_eq!(s.modify_other_keys(), 0);
-        // 걸친 앞부분 뒤로 긴 덩이가 와도 끝까지 훑는다.
+        // Even if a long chunk comes after the straddling start, it is scanned to the end.
         let long = "x".repeat(5000);
         s.feed(b"\x1b[>4;");
         s.feed(format!("2m{long}\x1b[>4;1m").as_bytes());
@@ -1079,7 +1079,7 @@ mod tests {
         let f = rebuilt(&s);
         assert_eq!(f.modify_other_keys(), 2);
         assert_eq!(f.kitty_flags(), 13);
-        // 끈 상태도 되살린다.
+        // The off state is restored too.
         let mut s = Screen::new(40, 10);
         s.feed(b"\x1b[>4;2m\x1b[>4;0m");
         let mut f = Screen::new(40, 10);
@@ -1095,13 +1095,13 @@ mod tests {
             s.feed(format!("before {i}\r\n").as_bytes());
         }
         s.feed(b"\x1b[31mprompt$ \x1b[0m\x1b[?1049h\x1b[2;3Halt screen\x1b[7mbar");
-        // 복사하느라 대체 화면을 건드리지 않았다.
+        // The alternate screen wasn't touched by the copying.
         assert_eq!(s.lines()[1], "  alt screenbar");
         let mut f = rebuilt(&s);
         assert!(f.mode().contains(TermMode::ALT_SCREEN));
         assert_same_cells(&f, &s);
         assert_eq!(f.cursor(), s.cursor());
-        // 대체 화면을 나서면 가려져 있던 주 화면과 스크롤백이 돌아온다.
+        // Leaving the alternate screen brings back the hidden main screen and scrollback.
         s.feed(b"\x1b[?1049l");
         f.feed(b"\x1b[?1049l");
         assert!(!f.mode().contains(TermMode::ALT_SCREEN));
@@ -1113,7 +1113,7 @@ mod tests {
 
     #[test]
     fn snapshot_in_alt_screen_after_exit_and_reentry_in_one_feed() {
-        // 한 번에 들어온 바이트 안에서 나갔다 다시 들어가면, 그 사이에 주 화면에 쓴 글이 복사본에 있어야 한다.
+        // If it leaves and re-enters within the bytes that arrived at once, the text written on the main screen in between must be in the copy.
         let mut s = Screen::new(40, 10);
         s.feed(b"p0\r\n");
         s.feed(b"\x1b[?1049h");
@@ -1170,7 +1170,7 @@ mod tests {
         s.feed(b"\x1b[c\x1b]11;?\x07\x1b]10;?\x1b\\\x1b[>1u\x1b[?u");
         let want = "\x1b[?6c\x1b]11;rgb:2828/2c2c/3434\x07\x1b]10;rgb:ffff/ffff/ffff\x1b\\\x1b[?1u";
         assert_eq!(String::from_utf8(s.take_replies()).unwrap(), want);
-        // 앱이 OSC로 바꾼 색으로 답한다.
+        // Answers with the color the app changed via OSC.
         s.feed(b"\x1b]11;rgb:01/02/03\x07\x1b]11;?\x07");
         assert_eq!(s.take_replies(), b"\x1b]11;rgb:0101/0202/0303\x07");
     }
@@ -1213,7 +1213,7 @@ mod tests {
         s.end_sync();
         assert!(s.sync_deadline().is_none());
         assert_eq!(s.lines()[0], "frame");
-        // 끝난 동기화 갱신은 데드라인이 없다.
+        // A finished synchronized update has no deadline.
         s.feed(b"\x1b[?2026h!\x1b[?2026l");
         assert!(s.sync_deadline().is_none());
         assert_eq!(s.lines()[0], "frame!");

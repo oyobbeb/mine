@@ -1,4 +1,4 @@
-//! 아이콘 줄과 상태별 세션 목록의 화면 모델. 입출력 없이 데이터만 계산한다.
+//! Screen model for the project rail and the state-grouped session list. Only computes data, with no I/O.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -8,12 +8,12 @@ use anyhow::{Result, bail};
 use crate::project::project_key;
 use crate::session::{Kind, NewSession, SessionInfo, SessionState, validate_name};
 
-/// 프로젝트 아이콘 색. `RailItem::color`가 이 배열의 인덱스다.
+/// Project icon colors. `RailItem::color` is an index into this array.
 pub const PROJECT_COLORS: [&str; 6] = [
     "#61afef", "#98c379", "#e06c75", "#d19a66", "#a9b1d6", "#7dcfff",
 ];
 
-/// 아이콘 줄의 한 칸. `project`가 `None`이면 모든 프로젝트(∗)다.
+/// One cell of the project rail. If `project` is `None`, it is all projects (∗).
 #[derive(Clone, Debug, PartialEq)]
 pub struct RailItem {
     pub project: Option<PathBuf>,
@@ -22,7 +22,7 @@ pub struct RailItem {
     pub approval: bool,
 }
 
-/// 목록의 상태 묶음. `rows`는 `sessions` 슬라이스의 인덱스다.
+/// A state group of the list. `rows` are indexes into the `sessions` slice.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Group {
     pub state: SessionState,
@@ -30,11 +30,11 @@ pub struct Group {
     pub collapsed: bool,
 }
 
-/// 모든 프로젝트 칸의 색. `PROJECT_COLORS`에서 가장 눈에 띄지 않는 회청색이다.
+/// Color of the all-projects cell. The least eye-catching blue-gray in `PROJECT_COLORS`.
 const ALL_COLOR: usize = 4;
 
-/// 아이콘 줄을 만든다. 첫 칸은 모든 프로젝트(∗)이고, 그 뒤에 프로젝트를 폴더 이름순으로 둔다.
-/// 세션이 없어도 `current`는 넣는다. `approval`은 그 프로젝트에 승인 대기 세션이 있으면 켜진다.
+/// Builds the project rail. The first cell is all projects (∗), followed by projects ordered by directory name.
+/// `current` is included even if it has no sessions. `approval` is on if the project has a Needs approval session.
 pub fn rail(sessions: &[SessionInfo], current: &Path) -> Vec<RailItem> {
     let mut projects: BTreeMap<&Path, bool> = BTreeMap::new();
     projects.entry(current).or_insert(false);
@@ -59,7 +59,7 @@ pub fn rail(sessions: &[SessionInfo], current: &Path) -> Vec<RailItem> {
     std::iter::once(all).chain(items).collect()
 }
 
-/// 폴더 이름의 첫 글자를 소문자로. 이름이 없으면 `?`다.
+/// The first letter of the directory name, lowercased. `?` if there is no name.
 fn initial(root: &Path) -> char {
     root.file_name()
         .and_then(|name| name.to_string_lossy().chars().next())
@@ -67,7 +67,7 @@ fn initial(root: &Path) -> char {
         .unwrap_or('?')
 }
 
-/// 프로젝트 폴더 이름. 이름이 없는 경로(루트)는 경로 전체다.
+/// The project directory name. A path with no name (the root) gives the whole path.
 pub fn folder_name(root: &Path) -> String {
     root.file_name().map_or_else(
         || root.display().to_string(),
@@ -75,13 +75,13 @@ pub fn folder_name(root: &Path) -> String {
     )
 }
 
-/// `project_key` 해시 앞 8자리를 색 개수로 나눈 나머지.
+/// The first 8 digits of the `project_key` hash modulo the number of colors.
 fn color(root: &Path) -> usize {
     let key = project_key(root);
     u64::from_str_radix(&key[..8], 16).map_or(0, |n| (n % PROJECT_COLORS.len() as u64) as usize)
 }
 
-/// 목록 묶음의 상태 순서. [`Group::state`]는 늘 이 넷 중 하나다(Ended는 Done 묶음에 든다).
+/// State order of the list groups. [`Group::state`] is always one of these four (Ended goes in the Done group).
 pub const STATES: [SessionState; 4] = [
     SessionState::Approval,
     SessionState::Working,
@@ -89,8 +89,8 @@ pub const STATES: [SessionState; 4] = [
     SessionState::Idle,
 ];
 
-/// 상태별 묶음. Approval, Working, Done(Ended 포함), Idle 순서이고 빈 묶음은 뺀다.
-/// 묶음 안은 이름순이다. Idle만 처음에 접혀 있다. `filter`가 있으면 그 프로젝트 세션만 남긴다.
+/// State groups. In the order Approval, Working, Done (including Ended), Idle, and empty groups are left out.
+/// Within a group, rows are ordered by name. Only Idle starts collapsed. If `filter` is set, only that project's sessions remain.
 pub fn groups(sessions: &[SessionInfo], filter: Option<&Path>) -> Vec<Group> {
     let mut rows: [Vec<usize>; 4] = Default::default();
     for (i, s) in sessions.iter().enumerate() {
@@ -123,8 +123,8 @@ pub fn groups(sessions: &[SessionInfo], filter: Option<&Path>) -> Vec<Group> {
         .collect()
 }
 
-/// 기본 접힘(`groups`)에 클라이언트 상태를 얹는다. `toggled`에 든 상태의 묶음은 기본과 반대로 접거나 펴고,
-/// 붙은 세션(`attached`, `sessions` 인덱스)이 든 묶음은 늘 펼친다.
+/// Layers client state over the default collapsing (`groups`). A group whose state is in `toggled` is collapsed or expanded opposite to the default,
+/// and a group containing the attached session (`attached`, an index into `sessions`) is always expanded.
 pub fn expand(
     mut groups: Vec<Group>,
     toggled: &[SessionState],
@@ -139,8 +139,8 @@ pub fn expand(
     groups
 }
 
-/// 접힌 묶음을 뺀, 화면에 보이는 줄의 순서. 목록이 그리는 묶음(`expand`를 거친 것)을 받는다.
-/// `⌃a n/p`가 이 순서로 움직인다.
+/// The order of the rows visible on screen, without collapsed groups. Takes the groups the list draws (the ones that went through `expand`).
+/// `⌃a n/p` moves in this order.
 pub fn order(groups: &[Group]) -> Vec<usize> {
     groups
         .iter()
@@ -149,10 +149,10 @@ pub fn order(groups: &[Group]) -> Vec<usize> {
         .collect()
 }
 
-/// `⌃a c` 입력 형식.
+/// Format of the `⌃a c` input.
 pub const NEW_USAGE: &str = "<claude-a|claude-b|codex|shell> <name> [model]";
 
-/// `"<claude-a|claude-b|codex|shell> <이름> [모델]"`을 새 세션 명세로 바꾼다.
+/// Turns `"<claude-a|claude-b|codex|shell> <name> [model]"` into a new session spec.
 pub fn parse_new(input: &str, project: &Path) -> Result<NewSession> {
     let tokens: Vec<&str> = input.split_whitespace().collect();
     let Some(&first) = tokens.first() else {
@@ -224,11 +224,11 @@ mod tests {
         assert_eq!(r[1].initial, 'k');
         assert!(r[1].approval);
         assert!(!r[2].approval);
-        // 색은 project_key 해시 앞 8자리를 6으로 나눈 나머지다(shasum으로 따로 구한 값).
+        // The color is the first 8 digits of the project_key hash modulo 6 (a value worked out separately with shasum).
         assert_eq!((r[1].color, r[2].color), (1, 5));
-        // 모든 프로젝트 칸은 어느 프로젝트에든 승인 대기가 있으면 켜진다.
+        // The all-projects cell is on if any project has a Needs approval session.
         assert!(r[0].approval);
-        // 이름순으로 정렬하고, 같은 프로젝트의 세션이 여럿이어도 한 칸이다.
+        // Sorted by name, and several sessions of the same project are still one cell.
         let r = rail(
             &[
                 s("/p/mine", "a", Working),
@@ -260,7 +260,7 @@ mod tests {
         assert_eq!(r[1].project, Some(PathBuf::from("/p/mine")));
         assert_eq!(r[1].initial, 'm');
         assert!(!r[1].approval);
-        // 이름이 없는 경로(루트)는 '?'로 보인다.
+        // A path with no name (the root) shows as '?'.
         assert_eq!(rail(&[], Path::new("/"))[1].initial, '?');
     }
 
@@ -282,7 +282,7 @@ mod tests {
         assert_eq!(states(&g), vec![Approval, Working, Done, Idle]);
         assert!(g[3].collapsed && !g[0].collapsed);
         assert_eq!(g[2].rows, vec![3]);
-        // Done과 Ended는 한 묶음이고, 같은 묶음 안에서는 이름순이다. 빈 묶음은 뺀다.
+        // Done and Ended are one group, and within a group rows are ordered by name. Empty groups are left out.
         let ss = [
             s("/p", "zeta", Done),
             s("/p", "alpha", Ended),
@@ -330,11 +330,11 @@ mod tests {
         ];
         let g = groups(&ss, None);
         assert_eq!(order(&g), vec![1]);
-        // 사용자가 대기 묶음을 펼치면 그 줄도 순서에 든다.
+        // If the user expands the Idle group, those rows are in the order too.
         assert_eq!(order(&expand(g.clone(), &[Idle], None)), vec![1, 0, 2]);
-        // 처음에 펼친 묶음은 접을 수 있다.
+        // A group that started expanded can be collapsed.
         assert!(order(&expand(g.clone(), &[Working], None)).is_empty());
-        // 붙은 세션의 묶음은 기본이나 사용자 접힘과 상관없이 펼친다.
+        // The group of the attached session is expanded regardless of the default or the user's collapsing.
         assert_eq!(order(&expand(g.clone(), &[], Some(2))), vec![1, 0, 2]);
         assert_eq!(order(&expand(g, &[Idle, Working], Some(2))), vec![0, 2]);
     }

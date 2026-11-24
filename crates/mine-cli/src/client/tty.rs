@@ -1,5 +1,5 @@
-//! 바깥 터미널 다루기. raw 모드·대체 화면·마우스·붙여넣기 설정과 되돌리기, 시작할 때 한 번 하는 색 질의,
-//! 표준 입력 읽기 스레드.
+//! Handling the outer terminal: raw mode, alternate screen, mouse and paste settings and restoring them, the one-time
+//! color query at startup, and the stdin reader thread.
 
 use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -9,25 +9,25 @@ use alacritty_terminal::vte::ansi::Rgb;
 use ratatui::crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use tokio::sync::mpsc;
 
-/// 대체 화면, SGR 마우스(누름 1000·끌기 1002·SGR 형식 1006), bracketed paste(2004)를 켠다.
-/// 움직임만 보고하는 1003은 이벤트가 쏟아지므로 켜지 않는다.
-/// 끝으로 kitty 키보드 단을 하나 쌓는다(`CSI > 0 u`). 세션을 따라 거는 플래그는 이 단에만 쓴다.
+/// Enables the alternate screen, SGR mouse (press 1000, drag 1002, SGR format 1006) and bracketed paste (2004).
+/// 1003, which reports motion only, is not enabled because it floods us with events.
+/// Finally pushes one kitty keyboard level (`CSI > 0 u`). Flags set per session go on this level only.
 const ENTER: &[u8] = b"\x1b[?1049h\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?2004h\x1b[>0u";
-/// 세션을 따라 건 키 인코딩 모드(DECCKM, 숫자판, modifyOtherKeys)를 기본값으로 돌리고, 쌓은 kitty 단을 꺼내
-/// 바깥 터미널의 원래 단으로 돌아간다. 그다음 `ENTER`를 거꾸로 끄고 커서를 다시 보인다.
-/// kitty 단은 화면마다 따로라 대체 화면을 나가기 전에 꺼낸다.
+/// Resets the per-session key encoding modes (DECCKM, numeric keypad, modifyOtherKeys) to their defaults, pops the pushed kitty level
+/// to return to the outer terminal's original one, then turns `ENTER` off in reverse and shows the cursor again.
+/// The kitty level is per screen, so it is popped before leaving the alternate screen.
 const LEAVE: &[u8] = b"\x1b[?1l\x1b>\x1b[>4;0m\x1b[<u\
     \x1b[?2004l\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?1049l\x1b[?25h";
-/// 기본 전경색·배경색 질의 뒤에 DA1을 붙인다. 터미널은 차례로 답하고 DA1에는 모두 답하므로,
-/// DA1 답이 오면 앞의 답도 (있다면) 다 왔다.
+/// Appends DA1 after the default foreground and background color queries. The terminal answers in order and always answers DA1,
+/// so once the DA1 reply arrives, the earlier replies (if any) have all arrived.
 const QUERY: &[u8] = b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\\x1b[c";
-/// 질의 답을 기다리는 최대 시간.
+/// Maximum time to wait for query replies.
 const PROBE_WAIT: Duration = Duration::from_millis(200);
 
-/// 바깥 터미널이 설정된 상태인가. 패닉 훅과 drop이 둘 다 되돌리려 해도 한 번만 되돌린다.
+/// Whether the outer terminal is currently configured. Ensures it is restored only once even if both the panic hook and drop try to restore it.
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 
-/// 바깥 터미널을 설정한 동안 살아 있는 가드. 버려지면(패닉으로 풀릴 때도) 원래대로 되돌린다.
+/// A guard that lives while the outer terminal is configured. When dropped (including when unwinding from a panic) it restores the original state.
 pub struct Tty;
 
 impl Tty {
@@ -35,7 +35,7 @@ impl Tty {
         enable_raw_mode()?;
         ACTIVE.store(true, Ordering::SeqCst);
         let tty = Tty;
-        // 패닉 메시지가 대체 화면과 함께 지워지지 않게, 기본 훅이 쓰기 전에 되돌린다.
+        // Restore before the default hook writes, so the panic message isn't erased along with the alternate screen.
         let hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             restore();
@@ -63,10 +63,10 @@ fn restore() {
     }
 }
 
-/// 바깥 터미널에 기본 전경·배경색을 한 번 묻는다. raw 모드로 바꾼 뒤, 표준 입력 읽기 스레드를 띄우기 전에 부른다.
+/// Asks the outer terminal once for its default foreground and background colors. Call it after switching to raw mode and before starting the stdin reader thread.
 ///
-/// 이 스레드에서 `PROBE_WAIT`까지만 읽고 돌아오므로 남는 읽기 스레드가 없다(첫 키를 먹지 않는다).
-/// 둘 다 답하지 않으면 색은 `None`이다. 함께 돌려주는 바이트는 그사이 들어온 답 아닌 입력이고, 입력 해석기에 먼저 먹인다.
+/// Reads on this thread only up to `PROBE_WAIT` and returns, so no reader thread is left behind (the first key isn't swallowed).
+/// If neither is answered, the colors are `None`. The bytes returned alongside are input that arrived in the meantime and isn't a reply; feed them to the input parser first.
 pub fn probe_colors() -> (Option<(Rgb, Rgb)>, Vec<u8>) {
     let mut out = io::stdout();
     if out.write_all(QUERY).and_then(|()| out.flush()).is_err() {
@@ -80,8 +80,8 @@ pub fn probe_colors() -> (Option<(Rgb, Rgb)>, Vec<u8>) {
             break;
         }
         let mut chunk = [0u8; 1024];
-        // SAFETY: chunk는 chunk.len()바이트를 쓸 수 있는 버퍼다. 표준 입력은 아직 아무도 읽지 않아
-        // `io::stdin()`의 버퍼를 건너뛰어도 잃는 바이트가 없다.
+        // SAFETY: chunk is a buffer that can hold chunk.len() bytes. Nobody has read stdin yet,
+        // so skipping `io::stdin()`'s buffer loses no bytes.
         let n = unsafe { libc::read(0, chunk.as_mut_ptr().cast(), chunk.len()) };
         let Ok(n) = usize::try_from(n) else { break };
         if n == 0 {
@@ -93,9 +93,9 @@ pub fn probe_colors() -> (Option<(Rgb, Rgb)>, Vec<u8>) {
     (p.fg.zip(p.bg), p.rest)
 }
 
-/// 표준 입력이 `wait` 안에 읽을 수 있게 되면 참이다. macOS의 poll(2)은 tty에서 믿을 수 없어 select(2)를 쓴다.
+/// True if stdin becomes readable within `wait`. macOS's poll(2) can't be trusted on a tty, so select(2) is used.
 fn readable(wait: Duration) -> bool {
-    // SAFETY: 0으로 채운 fd_set에 표준 입력(0, FD_SETSIZE보다 작다) 하나만 넣고 select에 넘긴다.
+    // SAFETY: Put only stdin (0, less than FD_SETSIZE) into a zero-filled fd_set and pass it to select.
     unsafe {
         let mut set: libc::fd_set = std::mem::zeroed();
         libc::FD_ZERO(&mut set);
@@ -114,7 +114,7 @@ fn readable(wait: Duration) -> bool {
     }
 }
 
-/// 표준 입력을 읽어 넘기는 스레드를 띄운다. 입력이 끝나거나 오류가 나면 끝나고, 받는 쪽은 `None`을 받는다.
+/// Starts a thread that reads stdin and forwards it. It ends when input ends or errors, and the receiving side gets `None`.
 pub fn spawn_stdin_reader() -> mpsc::UnboundedReceiver<Vec<u8>> {
     let (tx, rx) = mpsc::unbounded_channel();
     std::thread::spawn(move || {
@@ -136,14 +136,14 @@ pub fn spawn_stdin_reader() -> mpsc::UnboundedReceiver<Vec<u8>> {
     rx
 }
 
-/// 질의하는 동안 읽은 바이트를 나눈 결과.
+/// The result of splitting the bytes read during the query.
 #[derive(Debug, Default)]
 struct Probe {
     fg: Option<Rgb>,
     bg: Option<Rgb>,
-    /// DA1 답까지 왔다.
+    /// The DA1 reply has also arrived.
     done: bool,
-    /// 답이 아닌 바이트(사용자 입력). 순서를 지킨다.
+    /// Bytes that aren't replies (user input). Order is preserved.
     rest: Vec<u8>,
 }
 
@@ -169,7 +169,7 @@ fn parse_probe(bytes: &[u8]) -> Probe {
     p
 }
 
-/// `ESC ] 10|11 ; <색> (BEL | ESC \)`이면 길이, 번호(10 전경, 11 배경), 색(형식이 틀리면 `None`).
+/// For `ESC ] 10|11 ; <color> (BEL | ESC \)`: the length, the number (10 foreground, 11 background), and the color (`None` if the format is wrong).
 fn colour_reply(b: &[u8]) -> Option<(usize, u8, Option<Rgb>)> {
     let which = match b.get(..5)? {
         b"\x1b]10;" => 10,
@@ -186,7 +186,7 @@ fn colour_reply(b: &[u8]) -> Option<(usize, u8, Option<Rgb>)> {
     Some((5 + end + term_len, which, parse_rgb(&body[..end])))
 }
 
-/// `ESC [ ? <숫자와 ;> c`이면 그 길이.
+/// For `ESC [ ? <digits and ;> c`: its length.
 fn da1_reply(b: &[u8]) -> Option<usize> {
     let body = b.strip_prefix(b"\x1b[?")?;
     let n = body
@@ -195,7 +195,7 @@ fn da1_reply(b: &[u8]) -> Option<usize> {
     (body[n] == b'c').then_some(3 + n + 1)
 }
 
-/// `rgb:R/G/B`(성분마다 16진 1~4자리)를 8비트 성분으로 줄인다.
+/// Reduces `rgb:R/G/B` (1–4 hex digits per component) to 8-bit components.
 fn parse_rgb(s: &[u8]) -> Option<Rgb> {
     let s = std::str::from_utf8(s).ok()?.strip_prefix("rgb:")?;
     let mut parts = s.split('/').map(|v| {
@@ -225,21 +225,21 @@ mod tests {
         assert_eq!(p.fg, Some(rgb(0xff, 0xfe, 0x00)));
         assert_eq!(p.bg, Some(rgb(0x28, 0x2c, 0x34)));
         assert!(p.done);
-        // 답이 아닌 바이트(사용자가 그새 누른 키)는 순서대로 남긴다.
+        // Bytes that aren't replies (keys the user pressed in the meantime) are kept in order.
         assert_eq!(p.rest, b"x\x1b[Ay");
     }
 
     #[test]
     fn probe_without_answers_keeps_everything() {
-        // 시간 안에 끝나지 않은 답은 입력으로 남긴다.
+        // A reply that didn't finish in time is kept as input.
         let p = parse_probe(b"ab\x1b]11;rgb:1");
         assert_eq!((p.fg, p.bg, p.done), (None, None, false));
         assert_eq!(p.rest, b"ab\x1b]11;rgb:1");
-        // DA1만 오면 색은 없다.
+        // If only DA1 arrives, there are no colors.
         let p = parse_probe(b"\x1b[?1;2c");
         assert_eq!((p.fg, p.bg, p.done), (None, None, true));
         assert!(p.rest.is_empty());
-        // 형식이 틀린 색 답은 색으로 치지 않고 버린다.
+        // A color reply with a wrong format isn't counted as a color and is discarded.
         let p = parse_probe(b"\x1b]10;rgb:zz/00/00\x07\x1b]11;rgb:1/2/3\x07");
         assert_eq!((p.fg, p.bg), (None, Some(rgb(0x11, 0x22, 0x33))));
         assert!(p.rest.is_empty());

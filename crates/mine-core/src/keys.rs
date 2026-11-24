@@ -1,20 +1,20 @@
-//! 세션이 켠 키 인코딩 모드. 바깥 터미널에 같은 모드를 걸 때 쓴다.
+//! Key-encoding modes a session has turned on. Used to apply the same modes to the outer terminal.
 
 use alacritty_terminal::term::TermMode;
 
 use crate::screen::Screen;
 
-/// 바깥 터미널(Ghostty)에 건 키 인코딩 모드. 붙은 세션이 켠 모드를 따라 걸어, 키가 세션이 바란 인코딩으로 온다.
-/// 그래야 Claude Code의 Shift+Enter가 CR이 아닌 인코딩된 키로 간다.
+/// Key-encoding modes applied to the outer terminal (Ghostty). They follow the modes the attached session turned on, so keys arrive in the encoding the session asked for.
+/// That way Claude Code's Shift+Enter is sent as an encoded key instead of CR.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct KeyModes {
-    /// DECCKM(`CSI ? 1 h`): 화살표를 `ESC O A`로 보낸다.
+    /// DECCKM (`CSI ? 1 h`): send arrow keys as `ESC O A`.
     pub app_cursor: bool,
-    /// DECKPAM(`ESC =`): 숫자판을 응용 모드로 보낸다.
+    /// DECKPAM (`ESC =`): send the numeric keypad in application mode.
     pub app_keypad: bool,
-    /// xterm modifyOtherKeys 단계(0~2).
+    /// xterm modifyOtherKeys level (0-2).
     pub modify_other_keys: u8,
-    /// kitty 키보드 플래그.
+    /// kitty keyboard flags.
     pub kitty: u8,
 }
 

@@ -1,5 +1,5 @@
-//! 실행 화면: 붙은 세션이 없거나 ⌘N·＋·새 작업을 눌렀을 때 가운데에 그리는, 키 하나로 세션을 시작하는 메뉴.
-//! 1단계 TUI의 시작 화면(`mine-cli` `client::launcher`)과 같은 내용이다. 상태와 `New` 전송은 `Model`이 한다.
+//! The launcher: the menu, drawn in the center, that starts a session with a single key. It shows when no session is attached or when ⌘N, ＋ or New task is pressed.
+//! Same content as the stage 1 TUI's launcher (`mine-cli` `client::launcher`). `Model` handles the state and sending `New`.
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
@@ -16,7 +16,7 @@ use crate::sidebar::account_chip;
 use crate::theme::*;
 use crate::workspace::Workspace;
 
-/// 메뉴 줄: (선택, 키 표시). 줄 이름은 [`label`]이다.
+/// A menu row: (choice, key label). The row name is [`label`].
 const ROWS: [(Choice, &str); 5] = [
     (Choice::ClaudeA, "↵"),
     (Choice::ClaudeB, "b"),
@@ -25,22 +25,22 @@ const ROWS: [(Choice, &str); 5] = [
     (Choice::Typed, "n"),
 ];
 
-/// 메뉴 폭과 이름 칸 폭. 칩이 이름 칸 뒤에 같은 자리로 맞는다.
+/// Menu width and name-column width. The chip lines up at the same position after the name column.
 const MENU_W: f32 = 340.;
 const LABEL_W: f32 = 150.;
 
-/// 화면에 그리는 메뉴 줄의 글: (선택, 키 표시, 줄 이름). 줄 이름은 [`Choice::label`]이라 계정 줄만 `labels`의
-/// 이름이다. 그리기와 테스트가 같은 글을 쓴다.
+/// The text of a menu row as drawn on screen: (choice, key label, row name). The row name is [`Choice::label`], so only
+/// the account rows carry the names from `labels`. Drawing and tests use the same text.
 fn row_texts(labels: &Labels) -> Vec<(Choice, &'static str, String)> {
     ROWS.iter()
         .map(|&(choice, key)| (choice, key, choice.label(labels).to_string()))
         .collect()
 }
 
-/// 한 키가 고르는 줄. 꾸밈키(⇧ 포함)가 붙은 키와 그 밖의 키는 무시한다.
+/// The row that one key picks. Keys with modifiers (including ⇧) and any other key are ignored.
 ///
-/// GPUI는 입력기를 거치지 않는 키(포커스가 글 입력 칸이 아닐 때)를 배열의 영문 키로 알린다. 그래서 TUI와 달리
-/// 한/영이 한글이어도 `s`가 `s`로 온다.
+/// GPUI reports keys that bypass the input method (when focus isn't in a text input) as the layout's English key. So,
+/// unlike in the TUI, `s` arrives as `s` even when the keyboard is switched to Hangul.
 pub fn choice_of_key(k: &Keystroke) -> Option<Choice> {
     if k.modifiers.modified() {
         return None;
@@ -55,12 +55,12 @@ pub fn choice_of_key(k: &Keystroke) -> Option<Choice> {
     })
 }
 
-/// 꾸밈키 없는 Esc.
+/// Esc without modifiers.
 pub fn is_escape(k: &Keystroke) -> bool {
     k.key == "escape" && !k.modifiers.modified()
 }
 
-/// 가운데를 채우는 실행 화면. 머리(프로젝트 이름과 `~` 경로), "새 세션", 메뉴 줄, 입력 상자, 안내 순서다.
+/// The launcher that fills the center. Order: header (project name and `~` path), "New session", menu rows, input box, hint.
 pub fn render(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
     let m = &ws.model;
     let project = m.project();
@@ -100,7 +100,7 @@ pub fn render(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
         })
         .collect::<Vec<_>>();
     let typed = ws.typed_input().filter(|_| m.typing).map(|input| {
-        // 입력 상자는 부모 글 크기를 따른다. 뿌리(16px)가 아니라 메뉴와 같은 13px로 둔다.
+        // The input box follows the parent's text size. Set it to 13px like the menu, not the root's 16px.
         v_flex()
             .mt_2()
             .gap_1()
@@ -146,7 +146,7 @@ pub fn render(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
         )
 }
 
-/// 메뉴 한 줄: `↵  claude-a   [A]`. 누르면 그 줄을 고른다. 이름 자리에는 계정 이름이 온다.
+/// One menu row: `↵  claude-a   [A]`. Clicking picks that row. The account name goes in the name slot.
 fn row(
     k: usize,
     choice: Choice,
@@ -210,7 +210,7 @@ mod tests {
         ] {
             assert_eq!(k(ignored), None, "{ignored}");
         }
-        // 줄마다 보이는 키가 그 줄을 고른다(Enter는 `↵`).
+        // The key shown on each row picks that row (Enter is `↵`).
         for (choice, shown) in ROWS {
             let source = if shown == "↵" { "enter" } else { shown };
             assert_eq!(k(source), Some(choice), "{shown}");
@@ -221,7 +221,7 @@ mod tests {
 
     #[test]
     fn rows_name_the_kinds_like_the_tui() {
-        // 이름을 읽기 전의 기본값은 종류 말이다.
+        // The default before the name is read is the kind word.
         let rows = row_texts(&Labels::default());
         let names: Vec<_> = rows.iter().map(|(_, _, name)| name.as_str()).collect();
         assert_eq!(
@@ -234,7 +234,7 @@ mod tests {
                 "Custom name and model"
             ]
         );
-        // 칩은 claude-a·claude-b·codex 줄에만 붙는다.
+        // Chips go only on the claude-a, claude-b and codex rows.
         let chips: Vec<_> = rows
             .iter()
             .map(|(choice, ..)| chip(choice.word()).map(|(letter, _)| letter))
@@ -244,8 +244,9 @@ mod tests {
 
     #[test]
     fn rows_show_account_labels_and_keep_keys_and_choices() {
-        // claude-a는 별칭, codex는 자동 이름이다. claude-b는 정한 것이 없어 id다. shell의 별칭은 쓰지 않는다.
-        let config = "[accounts.claude-a]\nlabel = \"개인\"\n[accounts.shell]\nlabel = \"쉘\"\n";
+        // claude-a has a label, codex has an automatic name. claude-b has nothing set, so it shows the id. shell's label is not used.
+        let config =
+            "[accounts.claude-a]\nlabel = \"personal\"\n[accounts.shell]\nlabel = \"sh\"\n";
         let rows = row_texts(&labels_from(config));
         let shown: Vec<_> = rows
             .iter()
@@ -254,14 +255,14 @@ mod tests {
         assert_eq!(
             shown,
             [
-                ("↵", "개인"),
+                ("↵", "personal"),
                 ("b", "claude-b"),
                 ("x", "Codex"),
                 ("s", "shell"),
                 ("n", "Custom name and model"),
             ]
         );
-        // 줄을 고르는 값은 이름과 무관하게 종류 말 그대로다(세션의 계정 id가 된다).
+        // The value that picks a row is the kind word as is, regardless of the name (it becomes the session's account id).
         let words: Vec<_> = rows.iter().map(|(choice, ..)| choice.word()).collect();
         assert_eq!(
             words,

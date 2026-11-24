@@ -1,5 +1,5 @@
-//! 앱 단축키. 표는 계획의 Global Constraints를 따른다. ⌘C·⌘V(Task 5·6)와 ⌘F(Task 6)는 터미널 칸이 묶는다.
-//! 터미널 칸이 포커스를 가지면 ⌘ 없는 키는 모두 세션으로 간다.
+//! App shortcuts. The table follows the plan's Global Constraints. The terminal pane binds ⌘C·⌘V (Tasks 5·6) and
+//! ⌘F (Task 6). When the terminal pane has focus, every key without ⌘ goes to the session.
 
 use gpui::{Action, KeyBinding, actions};
 
@@ -17,15 +17,15 @@ actions!(
     ]
 );
 
-/// ⌘1–⌘9: 탭 고르기. 값은 0부터 센 탭 자리다.
+/// ⌘1–⌘9: select a tab. The value is the 0-based tab slot.
 #[derive(Clone, Debug, PartialEq, Action)]
 #[action(namespace = mine, no_json)]
 pub struct SelectTab(pub usize);
 
-/// 단축키가 걸리는 뿌리 뷰(`Workspace`)의 키 문맥.
+/// The key context of the root view (`Workspace`) where the shortcuts apply.
 pub const CONTEXT: &str = "Workspace";
 
-/// 앱이 묶는 단축키. ⌘Q만 어디서나 듣고, 나머지는 포커스가 뿌리 뷰 안에 있을 때 듣는다.
+/// The shortcuts the app binds. Only ⌘Q is heard everywhere; the rest are heard when focus is inside the root view.
 pub fn bindings() -> Vec<KeyBinding> {
     let ws = Some(CONTEXT);
     let mut keys = vec![
@@ -34,7 +34,7 @@ pub fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-w", CloseSession, ws),
         KeyBinding::new("cmd-[", PrevSession, ws),
         KeyBinding::new("cmd-]", NextSession, ws),
-        // ⌘⇧[·⌘⇧]: macOS는 ⇧로 바뀐 글자를 키로 알리고 ⇧는 뗀다(US 배열에서 `{`·`}`).
+        // ⌘⇧[·⌘⇧]: macOS reports the character changed by ⇧ as the key and drops the ⇧ (`{`·`}` on a US layout).
         KeyBinding::new("cmd-{", PrevProject, ws),
         KeyBinding::new("cmd-}", NextProject, ws),
         KeyBinding::new("cmd-b", ToggleSidebar, ws),
@@ -76,7 +76,7 @@ mod tests {
                 "{keys} → {action}: {got:?}"
             );
         }
-        // ⌘1–⌘9는 0부터 센 탭 자리를 고른다.
+        // ⌘1–⌘9 select a 0-based tab slot.
         let all = bindings();
         for n in 1..=9 {
             let keys = format!("cmd-{n}");
@@ -91,7 +91,7 @@ mod tests {
 
     #[test]
     fn cmd_shift_bracket_arrives_as_brace_and_steps_projects() {
-        // macOS는 ⌘⇧[를 ⇧ 없이 `{`로 알린다(GPUI `parse_keystroke`). 그 키가 이전 프로젝트를 고른다.
+        // macOS reports ⌘⇧[ as `{` without ⇧ (GPUI `parse_keystroke`). That key selects the previous project.
         let typed = |key: &str| Keystroke {
             modifiers: Modifiers {
                 platform: true,

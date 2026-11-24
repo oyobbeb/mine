@@ -1,4 +1,4 @@
-//! CLI 훅 이벤트를 세션 폴더의 `events.jsonl`에 쌓고, 그 기록으로 세션 상태를 계산한다.
+//! Accumulates CLI hook events in the session directory's `events.jsonl` and computes the session state from that record.
 
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
@@ -17,26 +17,26 @@ use crate::session::SessionState;
 
 const EVENTS_FILE: &str = "events.jsonl";
 
-/// 데몬에 알리는 연결과 쓰기에 줄 수 있는 시간. 훅이 순정 CLI를 오래 붙잡으면 안 된다.
+/// How long the connection to the daemon and the write may take. A hook must not hold up the stock CLI for long.
 const POKE_TIMEOUT: Duration = Duration::from_millis(200);
 
-/// 세션 상태를 바꾸는 사건 종류.
+/// Kinds of events that change the session state.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
 pub enum EventKind {
-    /// 사용자가 프롬프트를 보냈다.
+    /// The user sent a prompt.
     Prompt,
-    /// 에이전트의 턴이 끝났다.
+    /// The agent's turn ended.
     Stop,
-    /// 에이전트가 승인을 기다린다.
+    /// The agent is waiting for approval.
     Approval,
-    /// 사용자가 세션에 입력했다. 데몬이 승인 대기 중일 때만 기록한다.
+    /// The user typed into the session. Recorded only while the daemon sees it waiting for approval.
     Input,
 }
 
-/// `events.jsonl`의 한 줄.
+/// One line of `events.jsonl`.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Event {
-    /// 유닉스 시각(밀리초).
+    /// Unix time (milliseconds).
     pub ms: u64,
     pub kind: EventKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -45,16 +45,16 @@ pub struct Event {
     pub resume_id: Option<String>,
 }
 
-/// 지금 시각(유닉스 밀리초).
+/// The current time (Unix milliseconds).
 pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64)
 }
 
-/// 훅 페이로드를 이벤트로 바꾼다. 하위 에이전트 훅이나 모르는 훅은 `None`이다.
+/// Turns a hook payload into an event. A subagent hook or an unknown hook gives `None`.
 pub fn parse_hook(payload: &Value, now_ms: u64) -> Option<Event> {
-    // 하위 에이전트의 턴은 세션 상태에 섞지 않는다.
+    // A subagent's turn is not mixed into the session state.
     match payload.get("agent_id") {
         None | Some(Value::Null) => {}
         Some(Value::String(s)) if s.is_empty() => {}
@@ -77,7 +77,7 @@ pub fn parse_hook(payload: &Value, now_ms: u64) -> Option<Event> {
     })
 }
 
-/// `dir/events.jsonl`에 이벤트 한 줄을 붙인다. 여러 훅 프로세스가 겹쳐도 섞이지 않게 잠근다.
+/// Appends one event line to `dir/events.jsonl`. Locks so that overlapping hook processes don't interleave.
 pub fn append(dir: &Path, ev: &Event) -> Result<()> {
     let path = dir.join(EVENTS_FILE);
     let mut line = serde_json::to_vec(ev)?;
@@ -89,14 +89,14 @@ pub fn append(dir: &Path, ev: &Event) -> Result<()> {
         .with_context(|| format!("Couldn't open {}", path.display()))?;
     file.lock()
         .with_context(|| format!("Couldn't lock {}", path.display()))?;
-    // 잠금은 파일을 닫을 때 풀린다.
+    // The lock is released when the file is closed.
     file.write_all(&line)
         .and_then(|()| file.flush())
         .with_context(|| format!("Couldn't write {}", path.display()))
 }
 
-/// `dir/events.jsonl`의 이벤트를 쓴 순서대로 읽는다. 파일이 없으면 빈 목록이다.
-/// 해석할 수 없는 줄(쓰다 끊긴 마지막 줄 등)은 건너뛴다.
+/// Reads the events in `dir/events.jsonl` in the order they were written. An empty list if the file is missing.
+/// Lines that can't be parsed (such as a last line cut off mid-write) are skipped.
 pub fn read_all(dir: &Path) -> Result<Vec<Event>> {
     let path = dir.join(EVENTS_FILE);
     let text = match fs::read_to_string(&path) {
@@ -110,10 +110,10 @@ pub fn read_all(dir: &Path) -> Result<Vec<Event>> {
         .collect())
 }
 
-/// 이벤트 기록에서 (상태, 대기 문구, resume id)를 계산한다.
+/// Computes (state, waiting text, resume id) from the event record.
 ///
-/// 마지막 의미 있는 이벤트가 상태를 정한다. `viewed_ms`는 사용자가 세션을 마지막으로 연 시각이고,
-/// 마지막 `Stop`과 같거나 그 뒤면 끝남(안 읽음)이 아니라 대기다.
+/// The last meaningful event decides the state. `viewed_ms` is when the user last opened the session,
+/// and if it is at or after the last `Stop`, the state is Idle rather than Done (unread).
 pub fn fold(
     events: &[Event],
     viewed_ms: Option<u64>,
@@ -135,7 +135,7 @@ pub fn fold(
                 state = SessionState::Approval;
                 waiting = ev.text.clone();
             }
-            // 승인 대기 중에 사용자가 입력하면 다시 작업 중이다. 다른 상태에서는 아무 일도 없다.
+            // If the user types while waiting for approval, it is Working again. In other states nothing happens.
             EventKind::Input => {
                 if state == SessionState::Approval {
                     state = SessionState::Working;
@@ -157,10 +157,10 @@ pub fn fold(
     (state, waiting, resume_id)
 }
 
-/// 데몬에 `Hello`와 `Poke`를 보낸다. 연결이나 쓰기가 `POKE_TIMEOUT`을 넘기면 포기한다.
+/// Sends `Hello` and `Poke` to the daemon. Gives up if the connection or the write exceeds `POKE_TIMEOUT`.
 fn poke(state: &State, id: &str) -> Result<()> {
     let sock = state.daemon_sock();
-    // std에는 연결 제한 시간이 없어서 별도 스레드에서 연결하고 기다린다.
+    // std has no connect timeout, so connect and wait on a separate thread.
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let _ = tx.send(UnixStream::connect(sock));
@@ -172,11 +172,11 @@ fn poke(state: &State, id: &str) -> Result<()> {
     Ok(())
 }
 
-/// 훅이 부르는 `mine _event <세션 폴더>`의 본체.
+/// The body of `mine _event <session dir>`, which hooks run.
 ///
-/// 표준 입력의 훅 페이로드를 읽어 `events.jsonl`에 기록하고 데몬에 알린다.
-/// 훅이 순정 CLI를 막거나 실패시키면 안 되므로, 읽을 수 없거나 해석할 수 없는 페이로드와
-/// 무시할 훅은 오류 없이 끝내고, 데몬 쪽 오류도 모두 삼킨다. 기록 자체가 실패하면 `Err`다.
+/// Reads the hook payload from stdin, records it in `events.jsonl`, and tells the daemon.
+/// A hook must not block or fail the stock CLI, so a payload that can't be read or parsed and
+/// a hook to ignore finish without an error, and all errors on the daemon side are swallowed. If the recording itself fails, it is `Err`.
 pub fn run_event_cmd(state: &State, dir: &Path, mut stdin: impl Read) -> Result<()> {
     let mut input = Vec::new();
     if stdin.read_to_end(&mut input).is_err() {
@@ -246,12 +246,12 @@ mod tests {
     #[test]
     fn stop_seen_is_idle() {
         assert_eq!(fold(&[ev(2, Stop)], Some(3)).0, SessionState::Idle);
-        // 열어 본 뒤 새 Stop이 오면 다시 안 읽은 끝남이다.
+        // After it was opened, a new Stop makes it an unread Done again.
         assert_eq!(
             fold(&[ev(2, Stop), ev(4, Prompt), ev(5, Stop)], Some(3)).0,
             SessionState::Done
         );
-        // 열어 본 시각이 Stop보다 이르면 아직 안 읽었다.
+        // If the time it was opened is earlier than the Stop, it is still unread.
         assert_eq!(fold(&[ev(2, Stop)], Some(1)).0, SessionState::Done);
     }
 
@@ -266,15 +266,18 @@ mod tests {
 
     #[test]
     fn approval_carries_message() {
-        let events = [ev(1, Prompt), ev_text(2, Approval, "npm run deploy 승인?")];
+        let events = [
+            ev(1, Prompt),
+            ev_text(2, Approval, "Approve npm run deploy?"),
+        ];
         let (state, waiting, _) = fold(&events, None);
         assert_eq!(state, SessionState::Approval);
-        assert_eq!(waiting.as_deref(), Some("npm run deploy 승인?"));
+        assert_eq!(waiting.as_deref(), Some("Approve npm run deploy?"));
     }
 
     #[test]
     fn waiting_clears_when_state_moves_on() {
-        let approval = ev_text(2, Approval, "승인?");
+        let approval = ev_text(2, Approval, "Approve?");
         assert_eq!(fold(&[approval.clone(), ev(3, Stop)], None).1, None);
         assert_eq!(fold(&[approval.clone(), ev(3, Prompt)], None).1, None);
         assert_eq!(fold(&[approval, ev(3, Input)], None).1, None);
@@ -317,7 +320,7 @@ mod tests {
     #[test]
     fn subagent_events_ignored() {
         assert!(parse_hook(&json!({"hook_event_name":"Stop","agent_id":"a"}), 0).is_none());
-        // 값이 비어 있거나 null이면 하위 에이전트가 아니다.
+        // If the value is empty or null, it is not a subagent.
         assert!(parse_hook(&json!({"hook_event_name":"Stop","agent_id":null}), 0).is_some());
         assert!(parse_hook(&json!({"hook_event_name":"Stop","agent_id":""}), 0).is_some());
     }
@@ -325,7 +328,7 @@ mod tests {
     #[test]
     fn hook_names_map_to_event_kinds() {
         let p = parse_hook(
-            &json!({"hook_event_name":"UserPromptSubmit","prompt":"안녕","session_id":"s1"}),
+            &json!({"hook_event_name":"UserPromptSubmit","prompt":"hello","session_id":"s1"}),
             7,
         )
         .unwrap();
@@ -334,22 +337,22 @@ mod tests {
             Event {
                 ms: 7,
                 kind: Prompt,
-                text: Some("안녕".into()),
+                text: Some("hello".into()),
                 resume_id: Some("s1".into()),
             }
         );
         let s = parse_hook(
-            &json!({"hook_event_name":"Stop","last_assistant_message":"끝"}),
+            &json!({"hook_event_name":"Stop","last_assistant_message":"done"}),
             8,
         )
         .unwrap();
-        assert_eq!((s.kind, s.text.as_deref()), (Stop, Some("끝")));
+        assert_eq!((s.kind, s.text.as_deref()), (Stop, Some("done")));
         let n = parse_hook(
-            &json!({"hook_event_name":"Notification","message":"승인?"}),
+            &json!({"hook_event_name":"Notification","message":"Approve?"}),
             9,
         )
         .unwrap();
-        assert_eq!((n.kind, n.text.as_deref()), (Approval, Some("승인?")));
+        assert_eq!((n.kind, n.text.as_deref()), (Approval, Some("Approve?")));
         assert!(parse_hook(&json!({"hook_event_name":"PreToolUse"}), 0).is_none());
         assert!(parse_hook(&json!({"prompt":"x"}), 0).is_none());
         assert!(parse_hook(&json!("Stop"), 0).is_none());
@@ -377,7 +380,7 @@ mod tests {
         assert_eq!(read_all(t.path()).unwrap(), vec![]);
         let a = Event {
             resume_id: Some("s1".into()),
-            ..ev_text(1, Prompt, "줄바꿈\n포함 \"따옴표\"")
+            ..ev_text(1, Prompt, "line break\nincluded \"quotes\"")
         };
         let b = ev(2, Stop);
         append(t.path(), &a).unwrap();
@@ -490,7 +493,7 @@ mod tests {
     struct Broken;
     impl Read for Broken {
         fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
-            Err(std::io::Error::other("깨진 입력"))
+            Err(std::io::Error::other("broken input"))
         }
     }
 
@@ -506,7 +509,7 @@ mod tests {
     fn run_event_cmd_does_not_hang_on_a_stuck_daemon() {
         let t = tmp();
         let (state, dir) = state_in(&t);
-        // 받지 않는 데몬: 연결은 되지만 아무것도 읽지 않는다.
+        // A daemon that doesn't receive: the connection succeeds but nothing is read.
         let _listener = UnixListener::bind(state.daemon_sock()).unwrap();
         let payload = br#"{"hook_event_name":"Stop"}"#;
         let started = std::time::Instant::now();

@@ -1,4 +1,5 @@
-//! 가운데 위 탭 줄: 고른 프로젝트의 세션을 이름순으로 놓고 끝에 "＋"를 둔다. 탭에는 상태 기호, 이름, 칩이 붙는다.
+//! The tab strip at the top of the center: the selected project's sessions in name order, with a "＋" at the end.
+//! Each tab carries a status symbol, a name, and a chip.
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
@@ -13,17 +14,17 @@ use crate::sidebar::{account_chip, state_color};
 use crate::theme::*;
 use crate::workspace::Workspace;
 
-/// 탭 줄 높이.
+/// Height of the tab strip.
 pub const HEIGHT: f32 = 36.;
 
 pub fn render(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
     let m = &ws.model;
     let launcher = m.launcher_open();
-    // 전체를 보면 프로젝트마다 t1이 있어 이름만으로는 탭을 가릴 수 없다. 이때는 폴더 이름을 앞에 흐리게 붙인다.
+    // With all projects shown, every project has a t1, so the name alone can't tell the tabs apart. In that case the folder name is put in front, dimmed.
     let all = m.filter.is_none();
     let tabs = m.tabs().into_iter().enumerate().map(|(k, i)| {
         let s = &m.sessions[i];
-        // 실행 화면이 덮고 있으면 "＋"가 고른 탭이다.
+        // When the launcher covers the view, "＋" is the selected tab.
         let selected = !launcher && m.attached.as_ref() == Some(&s.meta.id);
         let id = s.meta.id.clone();
         h_flex()

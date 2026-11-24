@@ -1,4 +1,4 @@
-//! 클라이언트 화면. 아이콘 줄·목록·터미널 칸·상태줄의 배치와 그리기, 마우스 위치 해석만 맡는다.
+//! The client screen. Handles only the layout and drawing of the project rail, list, terminal pane and status line, and interpreting mouse positions.
 
 use std::path::{Path, PathBuf};
 
@@ -21,7 +21,7 @@ use mine_core::screen::Screen;
 use mine_core::session::{SessionInfo, SessionState};
 use mine_core::view::{self, Group, NEW_USAGE, PROJECT_COLORS, RailItem};
 
-/// 별칭 설정(`config.toml` 내용)으로 만든 이름들. 화면 문자열 테스트가 쓴다. 홈이 없으니 자동 이름은 codex뿐이다.
+/// Names built from a label config (the contents of `config.toml`). Used by the on-screen string tests. There's no home, so codex is the only automatic name.
 #[cfg(test)]
 pub(super) fn labels_from(config: &str) -> Labels {
     let dir = tempfile::tempdir().unwrap();
@@ -32,37 +32,37 @@ pub(super) fn labels_from(config: &str) -> Labels {
     Labels::load(&state, None)
 }
 
-/// 화면에 그릴 클라이언트 상태.
+/// Client state to draw on screen.
 pub struct Model {
     pub sessions: Vec<SessionInfo>,
-    /// 선택한 프로젝트. `None`이면 전체(∗)다.
+    /// The selected project. `None` means all (∗).
     pub filter: Option<PathBuf>,
-    /// `mine`을 실행한 프로젝트. 세션이 없어도 아이콘 줄에 있다.
+    /// The project `mine` was run in. It's in the project rail even if it has no sessions.
     pub current_project: PathBuf,
-    /// 붙은 세션 id.
+    /// The attached session id.
     pub attached: Option<String>,
     pub list_open: bool,
     pub prompt: Option<Prompt>,
-    /// 상태줄 오른쪽에 키 안내 대신 띄울 알림. 비어 있으면 키 안내다.
+    /// A notice to show on the right of the status line in place of the key hints. If empty, the key hints show.
     pub message: String,
-    /// 사용자가 머리를 눌러 기본(대기만 접힘)과 반대로 접거나 편 묶음의 상태.
+    /// State of groups the user collapsed or expanded by clicking the header, opposite to the default (only idle is collapsed).
     pub toggled: Vec<SessionState>,
-    /// 복사 모드처럼 상태줄 전체를 대신할 글. 있으면 세션 경로·키 안내·알림 대신 이것을 그리고, 세션 커서는 숨긴다.
+    /// Text to replace the whole status line, like copy mode. If set, it's drawn instead of the session path, key hints and notice, and the session cursor is hidden.
     pub status: Option<String>,
-    /// 시작 화면(`launcher`)을 터미널 칸에 그린다. 붙은 세션이 없을 때와 `⌃a c`로 연 동안 참이다.
+    /// Draws the launcher (`launcher`) in the terminal pane. True when no session is attached and while it's open via `⌃a c`.
     pub launcher: bool,
-    /// 계정 id를 글로 보일 때 쓰는 이름. 클라이언트가 시작할 때 읽는다.
+    /// Names used to show an account id as text. Read by the client at startup.
     pub labels: Labels,
 }
 
 impl Model {
-    /// 새 세션을 만들 프로젝트. 선택한 프로젝트, 전체(∗)면 `mine`을 실행한 프로젝트다.
+    /// The project to create new sessions in. The selected project; if All (∗), the project `mine` was run in.
     pub fn project(&self) -> &Path {
         self.filter.as_deref().unwrap_or(&self.current_project)
     }
 
-    /// 목록에 그리는 묶음. 기본 접힘에 `toggled`를 얹고, 붙은 세션의 묶음은 늘 펼친다.
-    /// 목록 그리기·`hit`·`⌃a n/p`가 모두 이 묶음을 쓴다.
+    /// The groups drawn in the list. `toggled` applied on top of the default collapsing, and the attached session's group is always expanded.
+    /// List drawing, `hit` and `⌃a n/p` all use these groups.
     pub fn visible_groups(&self) -> Vec<Group> {
         let attached = self
             .attached
@@ -75,7 +75,7 @@ impl Model {
         )
     }
 
-    /// `visible_groups`의 `i`번째 묶음을 접거나 편다(`Hit::Group`).
+    /// Collapses or expands the `i`-th group of `visible_groups` (`Hit::Group`).
     pub fn toggle_group(&mut self, i: usize) {
         let Some(state) = self.visible_groups().into_iter().nth(i).map(|g| g.state) else {
             return;
@@ -89,16 +89,16 @@ impl Model {
     }
 }
 
-/// 상태줄에서 받는 입력.
+/// Input taken in the status line.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Prompt {
-    /// 시작 화면의 `n`: 새 세션 명세를 입력 중이다.
+    /// `n` in the launcher: a new session spec is being typed.
     New(String),
-    /// `⌃a x`: 이 세션 id를 닫을지 묻는다.
+    /// `⌃a x`: asks whether to close this session id.
     ConfirmKill(String),
 }
 
-/// 화면 칸 배치.
+/// Placement of the screen areas.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Areas {
     pub rail: Rect,
@@ -107,20 +107,20 @@ pub struct Areas {
     pub status: Rect,
 }
 
-/// 마우스 위치가 가리키는 것. `Rail`은 아이콘 줄 항목, `Group`은 묶음 머리(`Model::visible_groups` 인덱스),
-/// `Row`는 `Model::sessions` 인덱스, `Term`은 터미널 칸 안 좌표(0부터)다.
+/// What a mouse position points at. `Rail` is a project rail item, `Group` is a group header (index into `Model::visible_groups`),
+/// `Row` is an index into `Model::sessions`, and `Term` is coordinates inside the terminal pane (0-based).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Hit {
     Rail(usize),
     Group(usize),
     Row(usize),
-    /// 시작 화면의 선택 줄.
+    /// A chosen row in the launcher.
     Launch(Choice),
     Term(u16, u16),
     None,
 }
 
-/// 세션 화면에서 하이퍼링크가 걸린 연속 칸. `x`, `y`는 바깥 화면 좌표다.
+/// A run of cells in the session screen with a hyperlink. `x` and `y` are outer screen coordinates.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LinkRun {
     pub x: u16,
@@ -131,7 +131,7 @@ pub struct LinkRun {
 
 const RAIL_W: u16 = 4;
 const LIST_W: u16 = 30;
-/// 목록 줄 오른쪽 끝의 빈 칸. 칩이 터미널 칸에 붙지 않게 띄운다.
+/// Blank space at the right end of a list row. Keeps the chip from touching the terminal pane.
 const GUTTER: usize = 1;
 const KEYS: &str = "⌃a n/p sessions · ( ) projects · c new · x close · b list · d detach";
 
@@ -139,7 +139,7 @@ const fn rgb(hex: u32) -> Color {
     Color::Rgb((hex >> 16) as u8, (hex >> 8) as u8, hex as u8)
 }
 
-/// 아이콘과 칩의 글자색.
+/// Text color for icons and chips.
 const DARK: Color = rgb(0x1e2128);
 const ALL_BG: Color = rgb(0x3a3d45);
 const ALL_FG: Color = rgb(0xd0d3da);
@@ -153,14 +153,14 @@ pub(super) const HEAD: Color = rgb(0x8a8f99);
 const COUNT: Color = rgb(0x5f646e);
 const SELECTED_BG: Color = rgb(0x2f323a);
 const WAITING: Color = rgb(0xc9a85c);
-/// 패널 바탕(목업 `project-rail.html`). 상태줄은 아이콘 줄과 같은 바탕이다.
+/// Panel background (mockup `project-rail.html`). The status line has the same background as the project rail.
 const RAIL_BG: Color = rgb(0x1b1d23);
 const LIST_BG: Color = rgb(0x23252b);
-/// 아이콘 줄·목록의 오른쪽 끝 열 바탕. 패널과 옆 칸을 가른다.
+/// Background of the rightmost column of the project rail and list. Separates the panel from the neighboring pane.
 const BORDER: Color = rgb(0x2c2f36);
 const LIST_FG: Color = rgb(0xd0d3da);
 
-/// 아래 한 줄은 상태줄, 왼쪽부터 아이콘 줄 4칸, (펼쳤으면) 목록 30칸, 나머지가 터미널 칸이다.
+/// The bottom row is the status line; from the left, 4 columns of project rail, (if expanded) 30 columns of list, and the rest is the terminal pane.
 pub fn layout(area: Rect, list_open: bool) -> Areas {
     let body = area.height.saturating_sub(1);
     let rail_w = RAIL_W.min(area.width);
@@ -207,14 +207,14 @@ pub fn draw(f: &mut Frame, m: &Model, screen: Option<&Screen>) {
             f.set_cursor_position(pos);
         }
     }
-    // 입력 중이면 상태줄이 커서를 가져간다.
+    // While typing, the status line takes the cursor.
     draw_status(f, a.status, m);
 }
 
 pub fn hit(a: &Areas, m: &Model, col: u16, row: u16) -> Hit {
     let pos = Position::new(col, row);
     if a.rail.contains(pos) {
-        // 줄 0은 여백이고 항목 i는 줄 i+1이다.
+        // Row 0 is a margin and item i is row i+1.
         let n = view::rail(&m.sessions, &m.current_project).len();
         return match usize::from(row - a.rail.y).checked_sub(1) {
             Some(i) if i < n => Hit::Rail(i),
@@ -231,7 +231,7 @@ pub fn hit(a: &Areas, m: &Model, col: u16, row: u16) -> Hit {
         };
     }
     if a.term.contains(pos) {
-        // 시작 화면이 세션 칸을 덮는 동안은 선택 줄만 누를 수 있다.
+        // While the launcher covers the session pane, only the chosen rows can be clicked.
         if m.launcher {
             return launcher::hit(a.term, col, row, &m.labels).map_or(Hit::None, Hit::Launch);
         }
@@ -240,8 +240,8 @@ pub fn hit(a: &Areas, m: &Model, col: u16, row: u16) -> Hit {
     Hit::None
 }
 
-/// 아이콘 줄·목록·상태줄 바탕을 칠한다. 글자를 그리기 전에 부른다.
-/// 글자가 없는 칸까지 칠해 패널로 읽히고, 투명한 창에서도 비치지 않는다.
+/// Paints the project rail, list and status line backgrounds. Call it before drawing text.
+/// It also paints cells with no text so they read as a panel and don't show through on a transparent window.
 fn paint_panels(buf: &mut Buffer, a: &Areas) {
     buf.set_style(a.rail, Style::new().fg(LIST_FG).bg(RAIL_BG));
     if let Some(list) = a.list {
@@ -250,10 +250,10 @@ fn paint_panels(buf: &mut Buffer, a: &Areas) {
     buf.set_style(a.status, Style::new().fg(LIST_FG).bg(RAIL_BG));
 }
 
-/// 아이콘 줄과 목록의 오른쪽 끝 열 바탕을 경계색으로 바꿔 옆 칸과 가른다.
-/// 선택한 줄의 바탕까지 덮도록 글자를 그린 뒤에 부른다.
+/// Changes the background of the rightmost column of the project rail and list to the border color, separating them from the neighboring pane.
+/// Call it after drawing the text, so it covers even the background of the selected row.
 ///
-/// ponytail: 글자를 덮지 않게 바탕만 바꾼 한 칸짜리 띠다. 얇은 선 글자는 필요해지면 한다.
+/// ponytail: A one-cell strip that changes only the background so it doesn't cover text. A thin line glyph can wait until it's needed.
 fn paint_edges(buf: &mut Buffer, a: &Areas) {
     for r in [Some(a.rail), a.list].into_iter().flatten() {
         let edge = Rect::new(r.right().saturating_sub(1), r.y, r.width.min(1), r.height);
@@ -261,12 +261,12 @@ fn paint_edges(buf: &mut Buffer, a: &Areas) {
     }
 }
 
-/// 터미널 칸(`area`)에 보이는 세션 화면의 하이퍼링크 구간. 줄을 넘지 않고, 같은 링크가 이어지는 칸끼리 묶는다.
+/// Hyperlink spans of the session screen visible in the terminal pane (`area`). They don't cross lines, and cells where the same link continues are grouped.
 pub fn link_runs(sc: &Screen, area: Rect) -> Vec<LinkRun> {
     let mut runs: Vec<LinkRun> = Vec::new();
     let mut open = None;
     for (x, y, cell) in visible_cells(sc, area) {
-        // 제어 문자가 든 주소는 바깥 터미널의 OSC 8을 깰 수 있으므로 링크로 치지 않는다.
+        // An address containing control characters can break the outer terminal's OSC 8, so it isn't treated as a link.
         let link = cell
             .hyperlink()
             .filter(|l| !l.uri().chars().any(char::is_control));
@@ -292,7 +292,7 @@ fn draw_rail(buf: &mut Buffer, area: Rect, items: &[RailItem], selected: usize) 
     if area.width < RAIL_W {
         return;
     }
-    // 칸 0은 선택 표시, 칸 1~2는 아이콘(넓은 글자면 둘을 채운다), 칸 3은 승인 대기 배지다.
+    // Cell 0 is the selection marker, cells 1–2 are the icon (a wide character fills both), and cell 3 is the needs-approval badge.
     for (i, (item, y)) in items.iter().zip(area.y + 1..area.bottom()).enumerate() {
         if i == selected {
             buf[(area.x, y)].set_symbol("▌").set_fg(MARK);
@@ -317,21 +317,21 @@ fn project_color(i: usize) -> Color {
         .unwrap_or(Color::Reset)
 }
 
-/// 목록의 한 줄.
+/// One row of the list.
 enum Item {
     Title,
-    /// `visible_groups` 인덱스와 그 묶음.
+    /// The `visible_groups` index and that group.
     Head(usize, Group),
     Session(usize),
-    /// 승인 대기 세션 아래의 대기 문구.
+    /// The waiting text under a session that needs approval.
     Waiting(usize),
-    /// 이 프로젝트에 세션이 하나도 없다.
+    /// This project has no sessions at all.
     Empty,
     NewHint,
 }
 
 impl Item {
-    /// 이 줄을 누르면 붙을 세션.
+    /// The session to attach to when this row is clicked.
     fn session(&self) -> Option<usize> {
         match self {
             Item::Session(i) | Item::Waiting(i) => Some(*i),
@@ -340,7 +340,7 @@ impl Item {
     }
 }
 
-/// 목록 줄 순서. 맨 위 프로젝트 이름, 상태 묶음마다 머리와 (펼쳤으면) 세션 줄(없으면 `(세션 없음)`), 맨 아래 새 세션 안내.
+/// List row order. The project name at the top, then for each status group a header and (if expanded) session rows (`(no sessions)` if none), and the new session hint at the bottom.
 fn items(m: &Model) -> Vec<Item> {
     let mut out = vec![Item::Title];
     let groups = m.visible_groups();
@@ -404,7 +404,7 @@ fn item_line(m: &Model, rail: &[RailItem], item: &Item, width: usize) -> Line<'s
     }
 }
 
-/// 세션 줄. 전체 보기면 앞에 프로젝트 색 `■`, 끝난 세션이면 이름 뒤에 `종료됨`, 끝에 계정 칩.
+/// A session row. In the All view, a project-colored `■` first; for a session that has ended, `Exited` after the name; and the account chip at the end.
 fn session_line(m: &Model, rail: &[RailItem], i: usize, width: usize) -> Line<'static> {
     let s = &m.sessions[i];
     let mut left = vec![Span::raw("  ")];
@@ -421,7 +421,7 @@ fn session_line(m: &Model, rail: &[RailItem], i: usize, width: usize) -> Line<'s
         + ended.as_ref().map_or(0, Span::width)
         + chip.as_ref().map_or(0, Span::width)
         + GUTTER;
-    // 세션 이름은 ASCII라 글자 수가 곧 너비다.
+    // Session names are ASCII, so the character count is the width.
     let name: String = s
         .meta
         .name
@@ -444,7 +444,7 @@ fn session_line(m: &Model, rail: &[RailItem], i: usize, width: usize) -> Line<'s
     }
 }
 
-/// 계정 칩. claude-a `A` 노랑, claude-b `B` 보라, codex `C` 청록. 그 밖(shell)은 없다.
+/// Account chip. claude-a `A` yellow, claude-b `B` purple, codex `C` teal. None for anything else (shell).
 pub(super) fn chip(account: Option<&str>) -> Option<Span<'static>> {
     let (letter, bg) = match account? {
         "claude-a" => ("A", YELLOW),
@@ -460,7 +460,7 @@ fn spans_width(spans: &[Span]) -> usize {
     spans.iter().map(Span::width).sum()
 }
 
-/// `left` 뒤를 공백으로 채워 `right`를 오른쪽 끝(`GUTTER` 앞)에 둔다. 선택 줄 바탕이 끝까지 가도록 `GUTTER`도 채운다.
+/// Pads after `left` with spaces and puts `right` at the right end (before `GUTTER`). Fills `GUTTER` too so the selected row's background runs all the way.
 fn fill(mut left: Vec<Span<'static>>, right: Option<Span<'static>>, width: usize) -> Line<'static> {
     let used = spans_width(&left) + right.as_ref().map_or(0, Span::width) + GUTTER;
     left.push(Span::raw(" ".repeat(width.saturating_sub(used))));
@@ -469,8 +469,8 @@ fn fill(mut left: Vec<Span<'static>>, right: Option<Span<'static>>, width: usize
     Line::from(left)
 }
 
-/// 터미널 칸에 보이는 세션 칸과 그 바깥 화면 좌표. 넓은 글자의 뒤 칸(앞 글자가 덮는다)과
-/// 칸 끝에 걸려 반만 보일 넓은 글자는 뺀다.
+/// The session cells visible in the terminal pane and their outer screen coordinates. Excludes the trailing cell of a wide character (covered by the leading character) and
+/// a wide character that would be only half visible at the edge of the pane.
 fn visible_cells(sc: &Screen, area: Rect) -> impl Iterator<Item = (u16, u16, &TermCell)> {
     let grid = sc.term().grid();
     let offset = grid.display_offset() as i32;
@@ -493,7 +493,7 @@ fn draw_term(buf: &mut Buffer, area: Rect, sc: &Screen) {
     }
 }
 
-/// 칸의 글자와 그 위에 얹힌 결합 문자. 탭 같은 제어 문자 칸은 공백이다.
+/// A cell's character and the combining characters stacked on it. A control-character cell such as a tab is a space.
 fn symbol(cell: &TermCell) -> String {
     let mut s = String::from(if cell.c.is_control() { ' ' } else { cell.c });
     s.extend(cell.zerowidth().unwrap_or_default());
@@ -529,7 +529,7 @@ fn style(cell: &TermCell) -> Style {
     }
 }
 
-/// 0~15번 색. 바깥 터미널의 색표를 그대로 쓰도록 이름 있는 색으로 보낸다.
+/// Colors 0–15. Sent as named colors so the outer terminal's color table is used as is.
 const ANSI: [Color; 16] = [
     Color::Black,
     Color::Red,
@@ -549,7 +549,7 @@ const ANSI: [Color; 16] = [
     Color::White,
 ];
 
-/// alacritty 색을 ratatui 색으로. 기본 전경·배경색은 바깥 터미널의 기본색(`Reset`)이다.
+/// alacritty color to ratatui color. The default foreground and background are the outer terminal's default colors (`Reset`).
 fn color(c: TermColor) -> Color {
     use NamedColor::*;
     let i = match c {
@@ -578,7 +578,7 @@ fn color(c: TermColor) -> Color {
     ANSI[i]
 }
 
-/// 세션 커서 위치. 스크롤해 과거를 보고 있거나 앱이 커서를 숨겼으면 없다.
+/// The session cursor position. None if scrolled back into the past or the app hid the cursor.
 fn term_cursor(sc: &Screen, area: Rect) -> Option<Position> {
     if sc.term().grid().display_offset() != 0 || !sc.mode().contains(TermMode::SHOW_CURSOR) {
         return None;
@@ -587,7 +587,7 @@ fn term_cursor(sc: &Screen, area: Rect) -> Option<Position> {
     (x < area.width && y < area.height).then(|| Position::new(area.x + x, area.y + y))
 }
 
-/// `mine │ <위치> │ <계정>`과 오른쪽 키 안내(또는 알림). 입력 중이면 그 입력과 안내를 보여 준다.
+/// `mine │ <location> │ <account>` and the key hints (or notice) on the right. While typing, shows that input and the hints.
 fn draw_status(f: &mut Frame, area: Rect, m: &Model) {
     if let Some(text) = &m.status {
         f.render_widget(Paragraph::new(text.as_str()), area);
@@ -628,7 +628,7 @@ fn draw_status(f: &mut Frame, area: Rect, m: &Model) {
                         left.push(Span::raw(m.labels.get(account).to_string()));
                     }
                 }
-                // 붙은 세션이 없으면 선택한 프로젝트의 전체 경로를 보여 준다(아이콘 이름 띄우기 대신).
+                // With no attached session, show the selected project's full path (instead of showing the icon name).
                 None => left.push(Span::raw(
                     m.filter
                         .as_ref()
@@ -649,7 +649,7 @@ fn draw_status(f: &mut Frame, area: Rect, m: &Model) {
     };
     let left_w = spans_width(&left) as u16;
     f.render_widget(Paragraph::new(Line::from(left)), area);
-    // 오른쪽 끝에 붙이되, 왼쪽과 겹치면 왼쪽 뒤에서 시작해 잘리게 둔다.
+    // Put it at the right end, but if it overlaps the left side, start after the left side and let it be cut off.
     let right_w = right.width() as u16;
     let x = area
         .right()
@@ -741,7 +741,7 @@ mod tests {
         &buf[(x, y)]
     }
 
-    /// 한 줄의 글자. 넓은 글자가 가린 다음 칸은 건너뛰고, 오른쪽 공백은 뗀다.
+    /// The characters of one row. Skips the next cell covered by a wide character and strips trailing spaces.
     fn row_text(buf: &Buffer, y: u16) -> String {
         let mut out = String::new();
         let mut x = 0;
@@ -764,7 +764,7 @@ mod tests {
         (0..buf.area.height)
             .map(|y| row_text(buf, y))
             .find(|row| row.contains(needle))
-            .unwrap_or_else(|| panic!("{needle}이 없다:\n{}", text(buf)))
+            .unwrap_or_else(|| panic!("{needle} not found:\n{}", text(buf)))
     }
 
     fn kyoto() -> Model {
@@ -774,7 +774,7 @@ mod tests {
                 "billing",
                 Approval,
                 "claude-b",
-                Some("npm run deploy 승인?"),
+                Some("Approve npm run deploy?"),
             ),
             s("/p/kyoto", "ui", Working, "codex", None),
         ])
@@ -785,7 +785,7 @@ mod tests {
         let m = kyoto();
         let buf = render(&m, 100, 20);
         assert!(text(&buf).contains("◆ Needs approval"));
-        assert!(text(&buf).contains("npm run deploy 승인?"));
+        assert!(text(&buf).contains("Approve npm run deploy?"));
         assert_eq!(cell(&buf, 1, 1).symbol(), "∗");
         assert!(row_of(&buf, "billing").ends_with("B"));
     }
@@ -793,7 +793,7 @@ mod tests {
     #[test]
     fn rail_marks_selection_badge_and_colors() {
         let buf = render(&kyoto(), 100, 20);
-        // 줄 0은 여백, ∗는 줄 1, kyoto는 줄 2다. 선택한 kyoto 왼쪽에 표시, 승인 대기라 오른쪽에 배지.
+        // Row 0 is a margin, ∗ is row 1, and kyoto is row 2. The marker is left of the selected kyoto, and since it needs approval, the badge is on the right.
         assert_eq!(cell(&buf, 0, 1).symbol(), " ");
         assert_eq!(cell(&buf, 0, 2).symbol(), "▌");
         assert_eq!(cell(&buf, 1, 2).symbol(), "k");
@@ -801,7 +801,7 @@ mod tests {
         assert_eq!(cell(&buf, 3, 2).fg, Color::Rgb(0xe5, 0xc0, 0x7b));
         assert_eq!(cell(&buf, 1, 1).bg, Color::Rgb(0x3a, 0x3d, 0x45));
         assert_eq!(cell(&buf, 1, 2).fg, Color::Rgb(0x1e, 0x21, 0x28));
-        // kyoto의 색은 PROJECT_COLORS[1]이다(view 테스트 참고). 아이콘 두 칸이 같은 바탕이다.
+        // kyoto's color is PROJECT_COLORS[1] (see the view tests). Both icon cells have the same background.
         assert_eq!(cell(&buf, 1, 2).bg, Color::Rgb(0x98, 0xc3, 0x79));
         assert_eq!(cell(&buf, 2, 2).bg, cell(&buf, 1, 2).bg);
     }
@@ -864,7 +864,7 @@ mod tests {
     fn y_of(buf: &Buffer, needle: &str) -> u16 {
         (0..buf.area.height)
             .find(|&y| row_text(buf, y).contains(needle))
-            .unwrap_or_else(|| panic!("{needle}이 없다:\n{}", text(buf)))
+            .unwrap_or_else(|| panic!("{needle} not found:\n{}", text(buf)))
     }
 
     #[test]
@@ -879,13 +879,13 @@ mod tests {
         assert!(!text(&buf).contains("shellx"));
         let head = y_of(&buf, "○ Idle");
         let Hit::Group(g) = hit(&a, &m, list_x, head) else {
-            panic!("대기 묶음 머리가 아니다");
+            panic!("not an Idle group header");
         };
         m.toggle_group(g);
         let buf = render(&m, 100, 20);
         assert!(row_text(&buf, head).contains("▾ ○ Idle"));
         assert_eq!(hit(&a, &m, list_x, y_of(&buf, "shellx")), Hit::Row(1));
-        // 한 번 더 누르면 다시 접힌다.
+        // Pressing once more collapses it again.
         m.toggle_group(g);
         assert!(!text(&render(&m, 100, 20)).contains("shellx"));
     }
@@ -899,7 +899,7 @@ mod tests {
         let buf = render(&m, 100, 20);
         assert!(text(&buf).contains("▾ ○ Idle"));
         assert_eq!(hit(&a, &m, list_x, y_of(&buf, "shellx")), Hit::Row(0));
-        // 사용자가 접어도 붙은 세션의 묶음은 펼친 채다.
+        // Even if the user collapses it, the attached session's group stays expanded.
         m.toggle_group(0);
         assert!(text(&render(&m, 100, 20)).contains("▾ ○ Idle"));
     }
@@ -940,24 +940,24 @@ mod tests {
     #[test]
     fn status_line_and_launcher_hint_show_account_labels() {
         let mut m = kyoto();
-        m.labels = labels_from("[accounts.claude-b]\nlabel = \"회사\"\n");
+        m.labels = labels_from("[accounts.claude-b]\nlabel = \"Work\"\n");
         m.attached = Some("k-billing".into());
         let status = row_text(&render(&m, 140, 20), 19);
         assert!(
-            status.starts_with("mine │ /p/kyoto/billing │ 회사"),
+            status.starts_with("mine │ /p/kyoto/billing │ Work"),
             "{status}"
         );
         assert!(!status.contains("claude-b"), "{status}");
-        // codex 세션은 자동 이름이다.
+        // A codex session has an automatic name.
         m.attached = Some("k-ui".into());
         let status = row_text(&render(&m, 140, 20), 19);
         assert!(status.starts_with("mine │ /p/kyoto/ui │ Codex"), "{status}");
-        // 시작 화면의 줄과 키 안내도 같은 이름이다.
+        // The launcher rows and key hints use the same names.
         m.launcher = true;
         let buf = render(&m, 140, 20);
         assert!(row_of(&buf, "↵").contains("↵  claude-a"));
-        assert!(row_of(&buf, "b  회사").ends_with("B"));
-        assert!(row_text(&buf, 19).ends_with("↵ claude-a · b 회사 · x Codex · s shell"));
+        assert!(row_of(&buf, "b  Work").ends_with("B"));
+        assert!(row_text(&buf, 19).ends_with("↵ claude-a · b Work · x Codex · s shell"));
     }
 
     #[test]
@@ -994,7 +994,7 @@ mod tests {
         let (status, pos) = drawn(&m);
         assert!(status.starts_with("mine │ /p/kyoto/billing"), "{status}");
         assert_eq!(pos, Position::new(term_x + 2, 0));
-        // 상태줄 전체가 그 글로 바뀌고, 세션 커서는 옮기지 않는다.
+        // The whole status line is replaced by that text, and the session cursor isn't moved.
         m.status = Some("Copy mode │ 1/3 │ v select".into());
         let (status, pos) = drawn(&m);
         assert_eq!(status, "Copy mode │ 1/3 │ v select");
@@ -1022,7 +1022,7 @@ mod tests {
                     url: "https://x.example".into(),
                     text: "한x".into()
                 },
-                // 주소가 같아도 따로 연 링크는 다른 구간이다.
+                // Links opened separately are different spans even with the same address.
                 LinkRun {
                     x: 14,
                     y: 3,
@@ -1031,7 +1031,7 @@ mod tests {
                 },
             ]
         );
-        // 칸이 화면보다 좁으면 잘린 만큼만 돌려준다.
+        // If the pane is narrower than the screen, only the clipped part is returned.
         let runs = link_runs(&sc, Rect::new(0, 0, 6, 3));
         assert_eq!(runs[0].text, "a.");
     }
@@ -1045,29 +1045,29 @@ mod tests {
         let rail = Color::Rgb(0x1b, 0x1d, 0x23);
         let list = Color::Rgb(0x23, 0x25, 0x2b);
         let border = Color::Rgb(0x2c, 0x2f, 0x36);
-        // 글자가 없는 아래쪽 칸까지 칠한다.
+        // Paint down to the cells below that have no text.
         for y in [0, 5, 28] {
             assert_eq!((bg(0, y), bg(2, y)), (rail, rail), "rail y={y}");
             assert_eq!((bg(4, y), bg(20, y)), (list, list), "list y={y}");
-            // 아이콘 줄의 오른쪽 끝 열과 목록의 오른쪽 끝 열이 경계다.
+            // The rightmost column of the project rail and the rightmost column of the list are the border.
             assert_eq!((bg(3, y), bg(33, y)), (border, border), "border y={y}");
         }
-        // 터미널 칸은 칠하지 않는다. 상태줄은 아이콘 줄과 같은 바탕이다.
+        // The terminal pane isn't painted. The status line has the same background as the project rail.
         assert_eq!(bg(34, 10), Color::Reset);
         assert_eq!((bg(0, 29), bg(35, 29), bg(60, 29)), (rail, rail, rail));
-        // 선택한 줄은 목록 바탕 위에 선택색이고, 마지막 열은 그래도 경계다.
+        // The selected row has the selection color over the list background, and its last column is still the border.
         assert_eq!(bg(10, 2), Color::Rgb(0x2f, 0x32, 0x3a));
         assert_eq!(bg(33, 2), border);
-        // 글자색: 목록 글자, 제목(굵게), 묶음 머리, 대기 문구.
+        // Text colors: list text, title (bold), group header, waiting text.
         let fg = |x, y| cell(&buf, x, y).fg;
-        // 목록은 4열부터다: 빈 칸, 세션 이름(`billing`은 6열), 제목, 묶음 머리, 대기 문구.
+        // The list starts at column 4: a blank cell, session name (`billing` is column 6), title, group header, waiting text.
         assert_eq!(fg(10, 8), Color::Rgb(0xd0, 0xd3, 0xda));
         assert_eq!(fg(6, 2), Color::Rgb(0xd0, 0xd3, 0xda));
         assert_eq!(fg(4, 0), Color::Rgb(0xe6, 0xe6, 0xe6));
         assert!(cell(&buf, 4, 0).modifier.contains(Modifier::BOLD));
         assert_eq!(fg(4, 1), Color::Rgb(0x8a, 0x8f, 0x99));
         assert_eq!(fg(8, 3), Color::Rgb(0xc9, 0xa8, 0x5c));
-        // 상태줄 글자는 바탕 위에서 읽히는 색이다.
+        // The status line text has a color readable over the background.
         assert_eq!(fg(0, 29), Color::Rgb(0xd0, 0xd3, 0xda));
     }
 
@@ -1086,12 +1086,12 @@ mod tests {
     fn empty_project_list_says_so_in_muted_text() {
         let buf = render(&model(vec![]), 100, 20);
         assert_eq!(row_text(&buf, 0).trim(), "kyoto");
-        // 줄 앞쪽은 아이콘 줄이다. 목록은 4열부터고 세션 줄처럼 두 칸 들여 쓴다.
+        // The front of the row is the project rail. The list starts at column 4 and is indented two cells like session rows.
         assert!(row_text(&buf, 1).ends_with("  (no sessions)"));
         assert_eq!(cell(&buf, 6, 1).symbol(), "(");
         assert_eq!(cell(&buf, 6, 1).fg, Color::Rgb(0x6b, 0x70, 0x7a));
         assert!(text(&buf).contains("＋ New session  ⌃a c"));
-        // 세션이 있으면 보이지 않는다. 다른 프로젝트 세션만 있으면 이 프로젝트는 빈 것이다.
+        // It isn't visible when there are sessions. If there are only other projects' sessions, this project is empty.
         assert!(!text(&render(&kyoto(), 100, 20)).contains("(no sessions)"));
         let other = model(vec![s("/p/mine", "core", Working, "codex", None)]);
         assert!(text(&render(&other, 100, 20)).contains("(no sessions)"));
@@ -1105,18 +1105,18 @@ mod tests {
         m.launcher = true;
         let a = layout(Rect::new(0, 0, 100, 20), true);
         let buf = render_with_screen(&m, &sc, 100, 20);
-        // 세션 화면 대신 시작 화면이 터미널 칸에 그려진다.
+        // The launcher is drawn in the terminal pane instead of the session screen.
         assert!(!text(&buf).contains("hello"));
         assert!(row_of(&buf, "claude-a").contains("↵  claude-a"));
         assert!(row_text(&buf, 19).ends_with("↵ claude-a · b claude-b · x codex · s shell"));
-        // 마우스: 선택 줄은 `Launch`, 칸의 나머지는 세션에 넘기지 않는다.
+        // Mouse: a chosen row is `Launch`; the rest of the pane isn't passed to the session.
         let y = y_of(&buf, "claude-b");
         let x = (0..100)
             .find(|&x| cell(&buf, x, y).symbol() == "b")
             .unwrap();
         assert_eq!(hit(&a, &m, x, y), Hit::Launch(Choice::ClaudeB));
         assert_eq!(hit(&a, &m, a.term.x, a.term.y), Hit::None);
-        // 끄면 세션 화면과 평소 안내로 돌아온다.
+        // Turning it off returns to the session screen and the usual hints.
         m.launcher = false;
         m.attached = Some("k-x".into());
         let buf = render_with_screen(&m, &sc, 100, 20);

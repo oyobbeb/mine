@@ -84,7 +84,7 @@ fn parse_kind(s: &str) -> Result<Kind, String> {
     }
 }
 
-/// `--project` 또는 현재 폴더에서 프로젝트 루트를 찾는다.
+/// Finds the project root from `--project` or the current directory.
 fn project_root(cli_project: Option<PathBuf>, state: &paths::State) -> Result<PathBuf> {
     let start = match cli_project {
         Some(dir) => dir,
@@ -93,7 +93,7 @@ fn project_root(cli_project: Option<PathBuf>, state: &paths::State) -> Result<Pa
     project::project_root(&start, state)
 }
 
-/// 요청을 보내고 `Sessions` 답을 받는다.
+/// Sends the request and receives the `Sessions` reply.
 fn request_sessions(state: &paths::State, msg: &ToDaemon) -> Result<Vec<SessionInfo>> {
     match Conn::connect_or_spawn(state)?.request(msg)? {
         FromDaemon::Sessions { sessions } => Ok(sessions),
@@ -101,7 +101,7 @@ fn request_sessions(state: &paths::State, msg: &ToDaemon) -> Result<Vec<SessionI
     }
 }
 
-/// 탭과 줄바꿈이 줄 형식을 깨지 않게 공백으로 바꾼다. 비어 있으면 `-`다.
+/// Replaces tabs and newlines with spaces so they can't break the line format. An empty value becomes `-`.
 fn field(s: &str) -> String {
     let s: String = s
         .chars()
@@ -110,7 +110,7 @@ fn field(s: &str) -> String {
     if s.is_empty() { "-".to_string() } else { s }
 }
 
-/// `mine ls`의 한 줄.
+/// One line of `mine ls`.
 fn ls_line(info: &SessionInfo) -> String {
     let (symbol, word) = match info.state {
         SessionState::Approval => ("◆", "approval"),
@@ -136,7 +136,7 @@ fn ls_line(info: &SessionInfo) -> String {
     .join("\t")
 }
 
-/// `K=V`를 첫 `=` 기준으로 나눈다.
+/// Splits `K=V` at the first `=`.
 fn parse_env(s: &str) -> Result<(String, String), String> {
     match s.split_once('=') {
         Some((key, value)) if !key.is_empty() => Ok((key.to_string(), value.to_string())),
@@ -147,7 +147,7 @@ fn parse_env(s: &str) -> Result<(String, String), String> {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
-        // 보관 프로세스는 상태 폴더를 쓰지 않으므로 HOME이 없어도 뜬다.
+        // The holder process doesn't use the state directory, so it starts even without HOME.
         Some(Cmd::Hold {
             sock,
             exit,
@@ -155,7 +155,7 @@ fn main() -> Result<()> {
             env,
             argv,
         }) => hold::run(&sock, &exit, &cwd, env, argv)?,
-        // 훅은 순정 CLI를 막거나 실패시키면 안 되므로 어떤 오류도 종료 코드에 반영하지 않는다.
+        // A hook must not block or fail the stock CLI, so no error is reflected in the exit code.
         Some(Cmd::Event { dir }) => {
             let _ = paths::State::from_env()
                 .and_then(|state| hooks::run_event_cmd(&state, &dir, std::io::stdin().lock()));
@@ -200,7 +200,7 @@ fn main() -> Result<()> {
             request_sessions(&state, &ToDaemon::Kill { id })
                 .with_context(|| format!("Couldn't close the session: {name}"))?;
         }
-        // 명령이 없으면 클라이언트 화면이다. 프로젝트는 `mine new`와 같은 방법으로 찾는다.
+        // With no command it's the client screen. The project is found the same way as for `mine new`.
         None => {
             let state = paths::State::from_env()?;
             let project = project_root(cli.project, &state)?;

@@ -1,18 +1,18 @@
-//! 데몬(`mine daemon`). 세션 목록과 화면을 쥐고 보관 프로세스와 클라이언트 사이를 잇는다.
+//! The daemon (`mine daemon`). It holds the session list and screens, and connects holder processes and clients.
 //!
-//! - 보관 프로세스(`mine hold`)마다 연결 하나에 읽기 작업과 쓰기 작업을 하나씩 둔다. 출력은 세션 `Screen`에
-//!   먹이고 그 세션을 보는 클라이언트에 보낸다. 안쪽 앱의 터미널 질의에 대한 답은 데몬이 보관 프로세스로
-//!   돌려보낸다(붙은 클라이언트가 없어도 답한다).
-//! - 클라이언트마다 읽기 작업과 쓰기 작업을 하나씩 둔다. 보낼 메시지는 `QUEUE_CAP`개까지 쌓고, 넘치면 끊는다.
-//! - `List`를 보낸 클라이언트는 그 뒤로 목록이 바뀔 때마다 `Sessions`를 받는다. `List`·`New`·`Kill`에는
-//!   요청한 클라이언트에 `Sessions`(또는 `Error`)로 직접 답한다. 구독하지 않은 헤드리스 연결이 다른 사건의
-//!   알림을 자기 요청의 답으로 잘못 읽지 않게 하려는 것이다.
-//! - 클라이언트가 `Colors`로 바깥 터미널의 기본색을 알려 주면 모든 세션 화면(앞으로 붙일 화면 포함)이
-//!   안쪽 앱의 색 질의에 그 색으로 답한다.
-//! - 데몬이 다시 뜨면 `sessions/*/meta.json`을 훑어 살아 있는 보관 프로세스에 다시 붙고, 보관 프로세스의
-//!   출력 버퍼로 80x24 화면을 다시 만든다. 첫 `Attach`가 클라이언트 크기로 바꾼다.
+//! - For each holder process (`mine hold`) there is one connection with one read task and one write task. Output is
+//!   fed to the session's `Screen` and sent to the clients viewing that session. The daemon sends the answers to terminal
+//!   queries from the inner app back to the holder process (it answers even if no client is attached).
+//! - Each client has one read task and one write task. Messages to send queue up to `QUEUE_CAP`, and the client is dropped if it overflows.
+//! - A client that sent `List` receives `Sessions` whenever the list changes after that. `List`, `New` and `Kill` are
+//!   answered directly to the requesting client with `Sessions` (or `Error`). This keeps a non-subscribed headless connection from
+//!   mistaking a notification about another event for the answer to its own request.
+//! - When a client reports the outer terminal's default colors with `Colors`, every session screen (including screens attached later)
+//!   answers the inner app's color queries with those colors.
+//! - When the daemon starts again, it scans `sessions/*/meta.json`, reattaches to the holder processes that are alive, and rebuilds
+//!   the 80x24 screen from the holder process's output buffer. The first `Attach` changes it to the client's size.
 //!
-//! `proto::recv`는 취소에 안전하지 않으므로 `select!`에 넣지 않는다. 연결마다 읽기 작업 하나가 차례로 읽는다.
+//! `proto::recv` is not cancellation-safe, so it isn't put in `select!`. One read task per connection reads in turn.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions, TryLockError};
@@ -43,92 +43,92 @@ use mine_core::session::{
     self, Kind, Meta, NewSession, Restore, SessionInfo, SessionState, session_id, validate_name,
 };
 
-/// 클라이언트 하나에 쌓아 둘 수 있는 보낼 메시지 수. 넘치면 그 클라이언트를 끊는다.
+/// The number of messages to send that can be queued for one client. If it overflows, that client is dropped.
 const QUEUE_CAP: usize = 1024;
-/// 보관 프로세스의 종료 코드 파일 이름(세션 폴더 안).
+/// File name of the holder process's exit code file (inside the session directory).
 const EXIT_FILE: &str = "exit";
-/// 사용자가 세션을 마지막으로 본 시각(유닉스 밀리초) 파일 이름(세션 폴더 안).
+/// File name of the time the user last saw the session (Unix milliseconds) (inside the session directory).
 const VIEWED_FILE: &str = "viewed";
-/// 새로 띄운 보관 프로세스의 PTY 크기이자, 데몬이 다시 떴을 때 화면을 다시 만드는 크기.
+/// The PTY size of a newly started holder process, and the size used to rebuild a screen when the daemon starts again.
 const INITIAL_SIZE: (u16, u16) = (80, 24);
-/// `Kill` 뒤 보관 프로세스 연결이 끝나기를 기다리는 최대 시간. 보관 프로세스는 SIGHUP을 보내고 `KILL_GRACE`가
-/// 지나면 SIGKILL을 보낸 뒤, 남은 출력을 `DRAIN_GRACE`까지 읽고 끝난다. 그 위에 여유를 둔다.
+/// Maximum time to wait for the holder connection to end after `Kill`. The holder sends SIGHUP, and after `KILL_GRACE`
+/// sends SIGKILL, then reads the remaining output up to `DRAIN_GRACE` and exits. This adds some headroom on top of that.
 const KILL_WAIT: Duration = hold::KILL_GRACE
     .saturating_add(hold::DRAIN_GRACE)
     .saturating_add(Duration::from_millis(1500));
-/// shell 세션이 출력 없이 이만큼 지나면 작업 중에서 대기로 돌아간다(설계 5.2).
+/// If a shell session produces no output for this long, it goes back from Working to Idle (design 5.2).
 const SHELL_QUIET: Duration = Duration::from_secs(2);
-/// 띄운 보관 프로세스가 연결을 받기까지 기다리는 최대 시간.
+/// Maximum time to wait for a started holder process to accept connections.
 const START_WAIT: Duration = Duration::from_secs(5);
-/// 보관 프로세스 연결에서 `Hello`와 출력 버퍼를 기다리는 최대 시간.
+/// Maximum time to wait for `Hello` and the output buffer on a holder process connection.
 const LINK_WAIT: Duration = Duration::from_secs(5);
-/// 이보다 짧게 이어졌던 보관 프로세스 연결이 끊기면 다시 붙지 않고 끝난 것으로 본다(붙었다 끊기기를 되풀이하지 않게).
+/// If a holder process connection that had been up for less than this drops, the process is considered to have ended rather than reattached (to avoid attaching and dropping over and over).
 const RELINK_MIN_AGE: Duration = Duration::from_secs(1);
-/// 다른 데몬이 막 끝나는 중이면 pid 파일 잠금이 풀리기를 이만큼 기다린다.
+/// If another daemon is just finishing, wait this long for the pid file lock to be released.
 const PID_LOCK_WAIT: Duration = Duration::from_secs(1);
-/// 보관 프로세스 연결의 읽기 버퍼 크기. 밀린 출력을 한 번에 모을 수 있는 양을 정한다.
+/// Read buffer size of a holder process connection. Sets how much backed-up output can be gathered at once.
 const HOLD_READ_BUF: usize = 64 * 1024;
-/// 한 번에 모아 화면에 먹이는 출력의 최대 바이트 수. 잠금 횟수를 줄이는 효과는 수십 바이트짜리 조각을
-/// 합치는 데서 나오므로 작게 둔다.
-// ponytail: 출력 메시지 하나는 BATCH_MAX 미만에 보관 프로세스 읽기 한 번(최대 16 KiB)을 더해 32 KiB 미만이고,
-// 클라이언트 큐는 1024개라 처진 클라이언트 하나가 데몬에 쌓는 출력은 32 MiB 이하다(스냅숏은 따로).
-// 더 줄이려면 큐를 바이트로 센다.
+/// Maximum bytes of output gathered and fed to the screen at once. The lock-count savings come from merging
+/// chunks of a few dozen bytes, so this is kept small.
+// ponytail: One output message is under BATCH_MAX plus one holder read (up to 16 KiB), so under 32 KiB, and
+// the client queue has 1024 entries, so the output one lagging client piles up in the daemon is at most 32 MiB (snapshots are separate).
+// To cut it further, count the queue in bytes.
 const BATCH_MAX: usize = 16 * 1024;
 
-// ponytail: 전역 잠금, 세션이 수백 개가 되면 세션별 잠금으로
+// ponytail: global lock; per-session locks once there are hundreds of sessions
 type Shared = Arc<Mutex<Daemon>>;
 
-/// 데몬 전체 상태.
+/// State of the whole daemon.
 struct Daemon {
     state: State,
     exe: PathBuf,
     sessions: BTreeMap<String, Sess>,
-    /// `New`가 보관 프로세스를 띄우는 중인 세션 id. 같은 이름을 동시에 두 번 만들지 않게 한다.
+    /// Session ids for which `New` is starting a holder process. Keeps the same name from being created twice at once.
     starting: HashSet<String>,
-    /// `Kill`로 닫았지만 보관 프로세스 연결이 아직 끝나지 않은 세션. 끝날 때까지 같은 id로 `New`를 받지 않는다.
+    /// Sessions closed with `Kill` whose holder process connection hasn't ended yet. Until it ends, `New` with the same id is not accepted.
     closing: HashMap<String, Closing>,
     clients: HashMap<u64, Client>,
     next_id: u64,
-    /// 구독한 클라이언트에 마지막으로 알린 목록. 바뀌었을 때만 다시 알린다.
+    /// The list last announced to subscribed clients. Announced again only when it changes.
     last: Vec<SessionInfo>,
-    /// 클라이언트가 알려 준 바깥 터미널의 기본 전경·배경색. 새로 만드는 화면에도 쓴다.
+    /// The outer terminal's default foreground and background colors reported by a client. Used for newly created screens too.
     colors: Option<(Rgb, Rgb)>,
 }
 
-/// 세션 하나.
+/// One session.
 struct Sess {
     meta: Meta,
     screen: Screen,
-    /// 화면과 PTY의 지금 크기.
+    /// The current size of the screen and PTY.
     size: (u16, u16),
-    /// 보관 프로세스 연결. 프로세스가 끝났거나 붙지 못한 세션이면 `None`이다.
+    /// The holder process connection. `None` if the process has ended or the session couldn't be attached.
     hold: Option<Hold>,
-    /// 보관 프로세스에 붙지 못했지만(시간 초과, 버전 불일치 등) 살아 있을 수 있다. 끝난 것으로 보지 않고
-    /// 다시 띄우지도 않는다. 다음 `Attach`가 다시 붙어 본다.
+    /// Couldn't attach to the holder process (timeout, version mismatch, etc.) but it may be alive. It isn't treated as ended
+    /// and isn't restarted either. The next `Attach` tries to reattach.
     unlinked: bool,
     state: SessionState,
     waiting: Option<String>,
     resume_id: Option<String>,
     viewed_ms: Option<u64>,
-    /// 동기화 갱신 시간 제한을 지켜보는 작업이 있다.
+    /// A task is watching the synchronized-update time limit.
     sync_timer: bool,
-    /// shell 세션이 마지막으로 출력한 시각. 출력 없이 `SHELL_QUIET`가 지나면 `None`으로 돌린다. 그동안 작업 중이다.
+    /// When a shell session last produced output. If `SHELL_QUIET` passes without output it goes back to `None`. Until then it's Working.
     active: Option<Instant>,
-    /// 보관 프로세스를 다시 띄우거나 다시 붙는 중이다.
+    /// The holder process is being restarted or reattached.
     busy: bool,
 }
 
-/// 보관 프로세스 연결. `link`는 연결마다 새로 매겨, 이전 연결 작업이 보낸 사건을 걸러 낸다.
+/// A holder process connection. `link` is numbered afresh for each connection, filtering out events sent by a previous connection's tasks.
 struct Hold {
     link: u64,
     tx: mpsc::UnboundedSender<HoldIn>,
     since: Instant,
 }
 
-/// 닫는 중인 세션의 보관 프로세스 연결.
+/// The holder process connection of a session being closed.
 ///
-/// 연결을 쥐고 있어야 보관 프로세스가 입력 EOF를 보고 연결을 먼저 끊지 않고, 자식이 끝난 뒤 `Exited`를 보낸다.
-/// 버리면 `_done`이 닫혀 `Kill`을 기다리는 쪽이 깨어난다.
+/// Holding the connection lets the holder see input EOF without cutting the connection first, and it sends `Exited` after the child ends.
+/// Dropping it closes `_done`, and whoever is waiting for `Kill` wakes up.
 struct Closing {
     hold: Hold,
     _done: oneshot::Sender<()>,
@@ -137,28 +137,28 @@ struct Closing {
 struct Client {
     tx: mpsc::Sender<FromDaemon>,
     writer: AbortHandle,
-    /// `List`를 보내 목록 변경을 받는다.
+    /// Sends `List` to receive list changes.
     subscribed: bool,
     attached: Option<String>,
-    /// 이 클라이언트가 마지막으로 알린 크기(설계 5.1: 세션 크기는 마지막으로 입력한 클라이언트를 따른다).
+    /// The size this client last reported (design 5.1: the session size follows the client that typed last).
     size: Option<(u16, u16)>,
 }
 
-/// 막 붙은 보관 프로세스 연결. `Hello`와 출력 버퍼까지 읽은 상태다.
+/// A just-attached holder process connection. It has read through `Hello` and the output buffer.
 struct Link {
     reader: BufReader<OwnedReadHalf>,
     writer: OwnedWriteHalf,
     ring: Vec<u8>,
 }
 
-/// 보관 프로세스를 띄운 결과.
+/// The result of starting a holder process.
 enum Started {
     Linked(Link),
-    /// 붙기 전에 자식이 이미 끝났다(exit 파일이 있다).
+    /// The child had already ended before attaching (there is an exit file).
     Ended,
 }
 
-/// 데몬을 실행한다. 시작할 때 `daemon.pid`를 잠그고 pid를 쓴다. 돌아오지 않는다(오류가 나면 돌아온다).
+/// Runs the daemon. At startup it locks `daemon.pid` and writes the pid. Doesn't return (returns if an error occurs).
 pub async fn run(state: State) -> Result<()> {
     for dir in [
         state.root.clone(),
@@ -172,7 +172,7 @@ pub async fn run(state: State) -> Result<()> {
     let _pid = lock_pid_file(&state)?;
     let sock = state.daemon_sock();
     check_sock_path(&sock)?;
-    // pid 잠금을 잡았으니 남은 소켓 파일은 죽은 데몬의 것이다.
+    // The pid lock is held, so a leftover socket file belongs to a dead daemon.
     match fs::remove_file(&sock) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -205,7 +205,7 @@ pub async fn run(state: State) -> Result<()> {
                 tokio::spawn(serve_client(Arc::clone(&shared), stream));
             }
             Err(e) => {
-                // EMFILE 같은 일시 오류에서 바쁜 반복을 피한다.
+                // Avoid a busy loop on transient errors such as EMFILE.
                 eprintln!("Couldn't accept a connection: {e}");
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
@@ -213,7 +213,7 @@ pub async fn run(state: State) -> Result<()> {
     }
 }
 
-/// `daemon.pid`를 잠그고 pid를 쓴다. 잠금은 돌려준 파일이 살아 있는 동안(데몬이 끝날 때까지) 유지된다.
+/// Locks `daemon.pid` and writes the pid. The lock is held as long as the returned file is alive (until the daemon ends).
 fn lock_pid_file(state: &State) -> Result<File> {
     let path = state.daemon_pid();
     let mut file = OpenOptions::new()
@@ -245,9 +245,9 @@ fn lock_pid_file(state: &State) -> Result<File> {
     Ok(file)
 }
 
-/// 닫지 않은 세션을 되살린다. 보관 프로세스에 붙으면 살아 있는 세션이고, 소켓이 없거나 연결을 거절하면
-/// 끝난 세션이다(끝난 셸 세션은 목록에서 빼고 `closed=true`로 저장한다). 그 밖의 실패는 보관 프로세스가 살아
-/// 있을 수 있으므로 세션을 그대로 남기고 오류를 기록한다.
+/// Revives sessions that haven't been closed. If it can attach to the holder process, the session is alive; if the socket is missing or refuses the connection,
+/// the session has ended (an ended shell session is removed from the list and saved with `closed=true`). Any other failure may mean the holder process is alive,
+/// so the session is left as it is and the error is logged.
 async fn restore(shared: &Shared) {
     let state = shared.lock().await.state.clone();
     let Ok(entries) = fs::read_dir(state.sessions_dir()) else {
@@ -300,7 +300,7 @@ fn read_viewed(dir: &Path) -> Option<u64> {
         .ok()
 }
 
-/// 클라이언트 연결 하나를 처리한다. 첫 메시지는 같은 버전의 `Hello`여야 한다.
+/// Handles one client connection. The first message must be a `Hello` of the same version.
 async fn serve_client(shared: Shared, stream: UnixStream) {
     let (read, mut write) = stream.into_split();
     let (tx, mut rx) = mpsc::channel::<FromDaemon>(QUEUE_CAP);
@@ -340,11 +340,11 @@ async fn serve_client(shared: Shared, stream: UnixStream) {
         }
         Some(_) => {}
     }
-    // 송신자를 버리면 쓰기 작업이 남은 메시지(오류 포함)를 마저 보내고 연결을 닫는다.
+    // Dropping the sender makes the write task send the remaining messages (errors included) and close the connection.
     shared.lock().await.clients.remove(&client);
 }
 
-/// 메시지 하나를 처리한다. 그 사이 클라이언트가 끊겼으면 `false`다.
+/// Handles one message. Returns `false` if the client dropped in the meantime.
 async fn handle(shared: &Shared, client: u64, msg: ToDaemon) -> bool {
     match msg {
         ToDaemon::Hello { .. } => {}
@@ -366,7 +366,7 @@ async fn handle(shared: &Shared, client: u64, msg: ToDaemon) -> bool {
     shared.lock().await.clients.contains_key(&client)
 }
 
-/// `New`: 세션을 만들고 보관 프로세스를 띄워 붙는다. 실패하면 목록에 아무것도 남기지 않는다.
+/// `New`: creates the session, starts a holder process and attaches. On failure it leaves nothing in the list.
 async fn new_session(shared: &Shared, client: u64, spec: NewSession) {
     let result = create(shared, spec).await;
     let mut d = shared.lock().await;
@@ -423,7 +423,7 @@ async fn create(shared: &Shared, spec: NewSession) -> Result<()> {
         closed: false,
     };
     let dir = state.session_dir(&id);
-    // 잠금 밖에서 띄운다. 보관 프로세스가 뜨는 동안에도 다른 세션 출력과 클라이언트가 멈추지 않는다.
+    // Start it outside the lock. Other sessions' output and clients don't stall while the holder process starts.
     let started = async {
         project::register(&state, &meta.project)?;
         ensure_dir(&dir)?;
@@ -444,7 +444,7 @@ async fn create(shared: &Shared, spec: NewSession) -> Result<()> {
             d.refresh(&id);
             Ok(())
         }
-        // 셸이 곧바로 끝났다. 셸 세션은 끝나면 목록에서 사라진다.
+        // The shell ended right away. A shell session disappears from the list when it ends.
         Ok(Started::Ended) => close_meta(meta, &dir),
         Err(e) => {
             let _ = close_meta(meta, &dir);
@@ -453,8 +453,8 @@ async fn create(shared: &Shared, spec: NewSession) -> Result<()> {
     }
 }
 
-/// `Kill`: 세션을 닫고, 보관 프로세스 연결이 끝난 뒤(최대 `KILL_WAIT`) 답한다. 답을 받고 곧바로 같은 이름으로
-/// 다시 만들어도 끝나 가는 보관 프로세스와 엉키지 않는다. 기다리는 동안에도 이 클라이언트의 다른 요청은 처리한다.
+/// `Kill`: closes the session and replies after the holder process connection ends (up to `KILL_WAIT`). Even if the reply is followed immediately by creating
+/// the same name again, it doesn't tangle with the holder process that is about to end. While waiting, this client's other requests are still handled.
 async fn kill(shared: &Shared, client: u64, id: &str) {
     let mut d = shared.lock().await;
     let ended = match d.kill(client, id) {
@@ -484,8 +484,8 @@ fn close_meta(mut meta: Meta, dir: &Path) -> Result<()> {
     meta.save(dir)
 }
 
-/// `Attach`: 붙지 못한 채 남긴 세션이면 먼저 다시 붙어 본다. 끝난 claude·codex 세션이고 resume id가 있으면
-/// 먼저 다시 띄운다. 그다음 붙는다.
+/// `Attach`: if the session was left unattached, first try reattaching. If it's an ended claude or codex session with a resume id,
+/// first start it again. Then attach.
 async fn attach(shared: &Shared, client: u64, id: &str, size: (u16, u16)) {
     let retry = shared.lock().await.begin_relink(id);
     if let Some(sock) = retry {
@@ -494,7 +494,7 @@ async fn attach(shared: &Shared, client: u64, id: &str, size: (u16, u16)) {
         let exists = d.sessions.get_mut(id).map(|s| s.busy = false).is_some();
         match link {
             Ok(Some(link)) if exists => install(&mut d, shared, id, link, false),
-            // 다시 붙는 사이 세션이 닫혔다. 보관 프로세스도 끝낸다.
+            // The session was closed while reattaching. End the holder process too.
             Ok(Some(link)) => kill_link(link),
             Ok(None) => d.gone(id),
             Err(e) => {
@@ -512,7 +512,7 @@ async fn attach(shared: &Shared, client: u64, id: &str, size: (u16, u16)) {
         let exists = d.sessions.get_mut(id).map(|s| s.busy = false).is_some();
         match started {
             Ok(Started::Linked(link)) if exists => install(&mut d, shared, id, link, true),
-            // 다시 띄우는 사이 세션이 닫혔다. 새 보관 프로세스도 끝낸다.
+            // The session was closed while restarting. End the new holder process too.
             Ok(Started::Linked(link)) => kill_link(link),
             Ok(Started::Ended) => d.refresh(id),
             Err(e) => d.send(
@@ -527,7 +527,7 @@ async fn attach(shared: &Shared, client: u64, id: &str, size: (u16, u16)) {
     shared.lock().await.attach(client, id, size);
 }
 
-/// 쓸 곳이 없는 보관 프로세스 연결로 `Kill`을 보내고 버린다.
+/// Sends `Kill` over a holder process connection that has nowhere to write, and drops it.
 fn kill_link(link: Link) {
     let mut writer = link.writer;
     tokio::spawn(async move {
@@ -535,10 +535,10 @@ fn kill_link(link: Link) {
     });
 }
 
-/// 보관 프로세스를 새 세션 리더로 띄우고 소켓에 붙는다.
+/// Starts a holder process as a new session leader and attaches to its socket.
 ///
-/// 붙기 전에 보관 프로세스가 끝났을 때, exit 파일이 있으면 자식이 곧바로 끝난 것이고(`Ended`),
-/// 없으면 시작하지 못한 것이다(오류, 로그 내용을 담는다).
+/// If the holder process ends before attaching, an exit file means the child ended right away (`Ended`),
+/// and no exit file means it couldn't start (an error that carries the log contents).
 async fn start_holder(state: &State, exe: &Path, meta: &Meta) -> Result<Started> {
     let dir = state.session_dir(&meta.id);
     let sock = state.hold_sock(&meta.id);
@@ -560,7 +560,7 @@ async fn start_holder(state: &State, exe: &Path, meta: &Meta) -> Result<Started>
         .with_context(|| format!("Couldn't open the log file: {}", log_path.display()))?;
     let launch = session::launch(meta, state, exe);
     let mut cmd = tokio::process::Command::new(exe);
-    // portable-pty는 보관 프로세스의 환경을 자식에 그대로 넘기므로, 데몬을 띄운 셸의 환경은 여기서 지운다.
+    // portable-pty passes the holder process's environment to the child as it is, so the environment of the shell that started the daemon is cleared here.
     for (key, _) in std::env::vars_os() {
         if key.to_str().is_some_and(session::is_leaked_env) {
             cmd.env_remove(&key);
@@ -588,7 +588,7 @@ async fn start_holder(state: &State, exe: &Path, meta: &Meta) -> Result<Started>
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(log);
-    // SAFETY: fork 뒤 exec 전에 비동기 시그널 안전 함수인 setsid만 부른다.
+    // SAFETY: Between fork and exec, only setsid, an async-signal-safe function, is called.
     unsafe {
         cmd.pre_exec(|| {
             if libc::setsid() == -1 {
@@ -624,17 +624,17 @@ async fn start_holder(state: &State, exe: &Path, meta: &Meta) -> Result<Started>
     }
 }
 
-/// 띄운 보관 프로세스가 끝나면 거둔다. 데몬이 먼저 끝나면 init이 거둔다.
+/// Reaps the started holder process when it ends. If the daemon ends first, init reaps it.
 fn reap(mut child: tokio::process::Child) {
     tokio::spawn(async move {
         let _ = child.wait().await;
     });
 }
 
-/// 보관 소켓에 붙어 `Hello`(버전 확인)와 출력 버퍼를 읽는다.
+/// Attaches to the holder socket and reads `Hello` (version check) and the output buffer.
 ///
-/// 소켓 파일이 없거나 연결을 거절하면 보관 프로세스가 없는 것이라 `Ok(None)`이다. 그 밖의 실패(시간 초과,
-/// 버전 불일치 등)는 오류다. 그때는 보관 프로세스가 살아 있을 수 있으므로 세션을 끝난 것으로 보면 안 된다.
+/// If the socket file is missing or refuses the connection, there is no holder process, so `Ok(None)`. Any other failure (timeout,
+/// version mismatch, etc.) is an error. In that case the holder process may be alive, so the session must not be treated as ended.
 async fn connect_holder(sock: &Path) -> Result<Option<Link>> {
     check_sock_path(sock)?;
     let stream = match UnixStream::connect(sock).await {
@@ -673,10 +673,10 @@ async fn connect_holder(sock: &Path) -> Result<Option<Link>> {
     }))
 }
 
-/// 세션에 보관 프로세스 연결을 붙이고 출력 버퍼로 화면을 다시 만든다.
+/// Attaches a holder process connection to the session and rebuilds the screen from the output buffer.
 ///
-/// `fresh`는 방금 띄운 보관 프로세스다. PTY가 80x24로 시작하고, 버퍼 속 질의는 아직 아무도 답하지 않았으므로
-/// 답을 보낸다. 다시 붙는 경우(데몬 재시작 등)에는 질의에 이미 답했으므로 답을 버리고, PTY 크기를 화면에 맞춘다.
+/// `fresh` is a holder process just started. The PTY starts at 80x24, and no one has yet answered the queries in the buffer, so
+/// answers are sent. When reattaching (daemon restart, etc.), the queries were already answered, so the answers are discarded and the PTY size is fitted to the screen.
 fn install(d: &mut Daemon, shared: &Shared, id: &str, link: Link, fresh: bool) {
     let link_id = d.next_id();
     let colors = d.colors;
@@ -717,7 +717,7 @@ fn install(d: &mut Daemon, shared: &Shared, id: &str, link: Link, fresh: bool) {
     let data = s.screen.snapshot();
     spawn_hold_reader(Arc::clone(shared), id.to_string(), link_id, reader);
     d.refresh(id);
-    // 화면을 새로 만들었으니 보던 클라이언트에는 스냅숏을 다시 보낸다.
+    // The screen was rebuilt, so send a snapshot again to the clients that were viewing.
     d.send_viewers(
         id,
         FromDaemon::Snapshot {
@@ -739,17 +739,17 @@ fn spawn_hold_writer(mut writer: OwnedWriteHalf) -> mpsc::UnboundedSender<HoldIn
     tx
 }
 
-/// 보관 프로세스 연결을 차례로 읽는 작업. 출력을 전역 잠금 안에서 화면에 먹인다.
+/// A task that reads a holder process connection in turn. Feeds output to the screen inside the global lock.
 ///
-/// macOS PTY는 읽는 쪽이 따라잡으면 수십 바이트씩 끊어 주므로, 이미 읽기 버퍼에 와 있는 출력 줄은
-/// 기다리지 않고 모아서(`BATCH_MAX`까지) 한 번에 처리한다. 잠금 횟수와 클라이언트 큐 항목 수가 줄어든다.
+/// When the reader catches up, a macOS PTY hands data over in chunks of a few dozen bytes, so output lines already in the read buffer
+/// are gathered (up to `BATCH_MAX`) and handled at once without waiting. This cuts lock counts and client queue entries.
 fn spawn_hold_reader(shared: Shared, id: String, link: u64, mut reader: BufReader<OwnedReadHalf>) {
     tokio::spawn(async move {
         'read: loop {
             let mut msg = recv::<_, HoldOut>(&mut reader).await;
             let mut after = None;
             if let Ok(Some(HoldOut::Output { data })) = &mut msg {
-                // 버퍼에 줄 끝이 있으면 다음 메시지는 소켓을 기다리지 않고 읽힌다.
+                // If the buffer has a line end, the next message is read without waiting on the socket.
                 while data.len() < BATCH_MAX && reader.buffer().contains(&b'\n') {
                     match recv::<_, HoldOut>(&mut reader).await {
                         Ok(Some(HoldOut::Output { data: more })) => data.extend(more),
@@ -787,8 +787,8 @@ fn spawn_hold_reader(shared: Shared, id: String, link: u64, mut reader: BufReade
     });
 }
 
-/// `Exited` 없이 연결이 끊겼다. 보관 프로세스가 살아 있으면(연결만 끊긴 경우) 다시 붙는다. 소켓이 없거나
-/// 연결을 거절하면 끝난 세션이고, 그 밖의 실패면 세션을 남겨 두고 다음 `Attach`에 맡긴다.
+/// The connection dropped without `Exited`. If the holder process is alive (only the connection dropped), reattach. If the socket is missing or
+/// refuses the connection, the session ended; for any other failure, leave the session and leave it to the next `Attach`.
 async fn lost_holder(shared: Shared, id: String, link: u64) {
     let (sock, exit, old_enough) = {
         let d = shared.lock().await;
@@ -801,7 +801,7 @@ async fn lost_holder(shared: Shared, id: String, link: u64) {
             _ => return,
         }
     };
-    // exit 파일이 있으면 자식이 끝났다. 없으면 보관 프로세스가 아직 있는지 소켓으로 확인한다.
+    // If there's an exit file, the child ended. If not, check by socket whether the holder process still exists.
     let relink = if exit.exists() {
         Ok(None)
     } else {
@@ -817,14 +817,14 @@ async fn lost_holder(shared: Shared, id: String, link: u64) {
             install(&mut d, &shared, &id, new, false);
             d.publish();
         }
-        // 붙자마자 또 끊겼다. 되풀이하지 않고 다음 Attach에 맡긴다.
+        // It dropped again right after attaching. Don't repeat; leave it to the next Attach.
         Ok(Some(_)) => d.unlink(&id, "the connection dropped again right away"),
         Ok(None) => d.gone(&id),
         Err(e) => d.unlink(&id, &format!("{e:#}")),
     }
 }
 
-/// 동기화 갱신이 시간 제한을 넘기면 끝낸다. 갱신이 다시 시작돼 제한이 늦춰졌으면 그때까지 더 기다린다.
+/// Ends a synchronized update when it exceeds its time limit. If the update restarted and the limit was pushed back, wait further until then.
 fn spawn_sync_timer(shared: Shared, id: String, mut deadline: Instant) {
     tokio::spawn(async move {
         loop {
@@ -850,7 +850,7 @@ fn spawn_sync_timer(shared: Shared, id: String, mut deadline: Instant) {
     });
 }
 
-/// shell 세션이 `SHELL_QUIET` 동안 출력이 없으면 대기로 돌리고 알린다. 그사이 출력이 있었으면 그만큼 더 기다린다.
+/// If a shell session has no output for `SHELL_QUIET`, sets it to Idle and announces it. If there was output in the meantime, wait that much longer.
 fn spawn_quiet_timer(shared: Shared, id: String) {
     tokio::spawn(async move {
         let mut deadline = Instant::now() + SHELL_QUIET;
@@ -907,7 +907,7 @@ impl Sess {
         }
     }
 
-    /// 화면이 모은 터미널 질의 답을 보관 프로세스에 입력으로 보낸다.
+    /// Sends the answers to terminal queries the screen gathered to the holder process as input.
     fn answer_queries(&mut self) {
         let data = self.screen.take_replies();
         if !data.is_empty() {
@@ -915,7 +915,7 @@ impl Sess {
         }
     }
 
-    /// 동기화 갱신 중이고 지켜보는 작업이 없으면 그 데드라인을 돌려주고 작업이 있다고 표시한다.
+    /// If a synchronized update is in progress and no task is watching, returns its deadline and marks that a task exists.
     fn start_sync_timer(&mut self) -> Option<Instant> {
         if self.sync_timer {
             return None;
@@ -925,7 +925,7 @@ impl Sess {
         Some(deadline)
     }
 
-    /// 화면과 PTY 크기를 바꾼다. 같은 크기면 아무것도 하지 않는다.
+    /// Changes the screen and PTY size. Does nothing if the size is the same.
     fn resize(&mut self, size: (u16, u16)) {
         if self.size == size {
             return;
@@ -961,7 +961,7 @@ impl Daemon {
         id
     }
 
-    /// 클라이언트 큐에 넣는다. 큐가 꽉 찼거나 닫혔으면 그 클라이언트를 끊는다.
+    /// Puts it in the client queue. If the queue is full or closed, drops that client.
     fn send(&mut self, client: u64, msg: FromDaemon) {
         let Some(c) = self.clients.get(&client) else {
             return;
@@ -971,14 +971,14 @@ impl Daemon {
         }
     }
 
-    /// 쓰기 작업을 멈춰 연결을 바로 끊는다. 다시 붙으면 `Attach`로 스냅숏을 받는다.
+    /// Stops the write task and drops the connection right away. After reattaching, it gets a snapshot via `Attach`.
     fn disconnect(&mut self, client: u64) {
         if let Some(c) = self.clients.remove(&client) {
             c.writer.abort();
         }
     }
 
-    /// 세션을 보고 있는 클라이언트 모두에 보낸다.
+    /// Sends to every client viewing the session.
     fn send_viewers(&mut self, id: &str, msg: FromDaemon) {
         let full: Vec<u64> = self
             .clients
@@ -998,14 +998,14 @@ impl Daemon {
             .any(|c| c.attached.as_deref() == Some(id))
     }
 
-    /// 프로젝트 경로, 이름 순 목록.
+    /// Project path, list sorted by name.
     fn infos(&self) -> Vec<SessionInfo> {
         let mut infos: Vec<SessionInfo> = self.sessions.values().map(Sess::info).collect();
         infos.sort_by(|a, b| (&a.meta.project, &a.meta.name).cmp(&(&b.meta.project, &b.meta.name)));
         infos
     }
 
-    /// 목록이 바뀌었으면 구독한 클라이언트 모두에 알린다.
+    /// If the list changed, announces it to every subscribed client.
     fn publish(&mut self) {
         let infos = self.infos();
         if infos == self.last {
@@ -1033,8 +1033,8 @@ impl Daemon {
         self.send(client, FromDaemon::Sessions { sessions });
     }
 
-    /// 이벤트 기록을 다시 읽어 상태를 계산한다. 누가 보고 있으면 지금 본 것으로 기록한다.
-    /// 같은 id로 다시 만든 세션이 지난 세션의 이벤트를 물려받지 않게 만든 시각 이후 이벤트만 본다.
+    /// Rereads the event log and computes the state. If someone is viewing it, records it as seen now.
+    /// Only events after the creation time are looked at, so a session recreated with the same id doesn't inherit the previous session's events.
     fn refresh(&mut self, id: &str) {
         let viewed = self.viewed_by_someone(id);
         let dir = self.state.session_dir(id);
@@ -1057,8 +1057,8 @@ impl Daemon {
             .filter(|ev| ev.ms >= s.meta.created_ms)
             .collect();
         let (mut state, waiting, resume_id) = hooks::fold(&events, s.viewed_ms);
-        // shell 세션은 훅 대신 출력으로 작업 중을 정한다(`active`는 shell 세션에만 생긴다). 훅 기록이 대기 말고 다른
-        // 상태를 정했으면 그쪽을 따른다.
+        // A shell session decides Working from output instead of hooks (`active` exists only for shell sessions). If the hook log decided a
+        // state other than Idle, follow that.
         if s.active.is_some() && state == SessionState::Idle {
             state = SessionState::Working;
         }
@@ -1070,7 +1070,7 @@ impl Daemon {
         };
     }
 
-    /// `List`: 모든 세션을 다시 계산해 답하고, 이 클라이언트를 목록 변경 구독자로 삼는다.
+    /// `List`: recomputes all sessions and replies, and makes this client a subscriber to list changes.
     fn list(&mut self, client: u64) {
         let ids: Vec<String> = self.sessions.keys().cloned().collect();
         for id in &ids {
@@ -1083,11 +1083,11 @@ impl Daemon {
         self.reply_sessions(client);
     }
 
-    /// 끝난 세션을 다시 띄울 준비를 한다. 다시 띄울 세션이면 띄우는 데 필요한 값을 돌려준다.
+    /// Prepares to start an ended session again. If it should be restarted, returns the values needed to start it.
     fn prepare_resume(&mut self, id: &str) -> Option<(State, PathBuf, Meta)> {
         let dir = self.state.session_dir(id);
         let s = self.sessions.get_mut(id)?;
-        // 붙지 못한 세션은 프로세스가 살아 있을 수 있으므로 같은 대화로 하나 더 띄우지 않는다.
+        // A session that couldn't be attached may have a live process, so don't start another one in the same conversation.
         if s.hold.is_some() || s.unlinked || s.busy || s.meta.kind == Kind::Shell {
             return None;
         }
@@ -1099,7 +1099,7 @@ impl Daemon {
         Some((self.state.clone(), self.exe.clone(), s.meta.clone()))
     }
 
-    /// 붙지 못한 채 남긴 세션이고 다른 시도가 없으면 다시 붙을 소켓 경로를 돌려준다.
+    /// If it's a session left unattached and no other attempt is underway, returns the socket path to reattach to.
     fn begin_relink(&mut self, id: &str) -> Option<PathBuf> {
         let s = self.sessions.get_mut(id)?;
         if !s.unlinked || s.busy {
@@ -1109,7 +1109,7 @@ impl Daemon {
         Some(self.state.hold_sock(id))
     }
 
-    /// 클라이언트를 세션 구독자로 정하고, 크기를 맞춘 뒤 스냅숏을 보낸다.
+    /// Makes the client a session subscriber, fits the size, and sends a snapshot.
     fn attach(&mut self, client: u64, id: &str, size: (u16, u16)) {
         if !self.clients.contains_key(&client) {
             return;
@@ -1135,7 +1135,7 @@ impl Daemon {
         self.publish();
     }
 
-    /// `Input`: 보관 프로세스에 보낸다. 승인 대기 중이었으면 `Input` 이벤트를 기록한다.
+    /// `Input`: sends it to the holder process. If it was waiting for approval, records an `Input` event.
     fn input(&mut self, client: u64, id: &str, data: Vec<u8>) {
         let Some(c) = self.clients.get(&client) else {
             return;
@@ -1167,8 +1167,8 @@ impl Daemon {
         }
     }
 
-    /// `Colors`: 바깥 터미널 색을 지금 있는 모든 화면과 앞으로 붙일 화면(`install`)의 기본색으로 삼는다.
-    /// 보관 프로세스가 붙지 않은 화면은 질의할 앱이 없고, 붙을 때 `install`이 화면을 새로 만든다.
+    /// `Colors`: makes the outer terminal's colors the default colors of every current screen and of screens to be attached later (`install`).
+    /// A screen with no holder process attached has no app to query, and `install` rebuilds the screen when it attaches.
     fn set_colors(&mut self, fg: &str, bg: &str) {
         let (Ok(fg), Ok(bg)) = (fg.parse::<Rgb>(), bg.parse::<Rgb>()) else {
             eprintln!("Invalid color format: {fg} {bg}");
@@ -1180,7 +1180,7 @@ impl Daemon {
         }
     }
 
-    /// `Resize`: 이 클라이언트의 크기를 기억하고 세션 크기를 맞춘다.
+    /// `Resize`: remembers this client's size and fits the session size.
     fn resize(&mut self, client: u64, id: &str, size: (u16, u16)) {
         let Some(c) = self.clients.get_mut(&client) else {
             return;
@@ -1191,10 +1191,10 @@ impl Daemon {
         }
     }
 
-    /// `Kill`: 보관 프로세스에 `Kill`을 보내고 `closed=true`로 저장한다. 폴더와 기록은 남긴다.
+    /// `Kill`: sends `Kill` to the holder process and saves `closed=true`. The directory and history are kept.
     ///
-    /// 보관 프로세스 연결이 있었으면 그 연결이 끝날 때까지 세션을 `closing`에 두고, 끝나면 닫히는 수신자를
-    /// 돌려준다. 세션이 없으면 클라이언트에 보낼 오류 문구를 돌려준다.
+    /// If there was a holder process connection, keeps the session in `closing` until that connection ends, then returns the receiver that closes.
+    /// If the session doesn't exist, returns the error text to send to the client.
     fn kill(&mut self, client: u64, id: &str) -> Result<Option<oneshot::Receiver<()>>, String> {
         let Some(s) = self.sessions.remove(id) else {
             return Err(format!("No such session: {id}"));
@@ -1220,7 +1220,7 @@ impl Daemon {
         Ok(Some(ended))
     }
 
-    /// 보관 프로세스 연결 `link`가 끝났다. `Kill`로 닫는 중이던 연결이면 `closing`에서 빼고 기다리는 쪽을 깨운다.
+    /// Holder process connection `link` has ended. If it was a connection being closed by `Kill`, removes it from `closing` and wakes whoever is waiting.
     fn end_closing(&mut self, id: &str, link: u64) {
         if self.closing.get(id).is_some_and(|c| c.hold.link == link) {
             self.closing.remove(id);
@@ -1235,8 +1235,8 @@ impl Daemon {
         }
     }
 
-    /// 보관 프로세스 출력. 화면에 먹이고, 질의에 답하고, 보는 클라이언트에 보낸다.
-    /// 동기화 갱신 시간 제한 작업을 새로 띄워야 하면 그 데드라인을 돌려준다.
+    /// Holder process output. Feeds it to the screen, answers queries, and sends it to viewing clients.
+    /// If a synchronized-update time limit task must be started anew, returns its deadline.
     fn on_output(&mut self, id: &str, link: u64, data: Vec<u8>) -> Option<Instant> {
         let s = self.sessions.get_mut(id)?;
         if s.hold.as_ref()?.link != link {
@@ -1255,11 +1255,11 @@ impl Daemon {
         deadline
     }
 
-    /// shell 세션의 보관 프로세스가 실시간 출력을 보냈다. 대기에서 작업 중으로 바뀌면 알린다. 조용해지기를
-    /// 지켜보는 작업을 새로 띄워야 하면 `true`다.
+    /// The holder process of a shell session sent live output. Announces if it changed from Idle to Working. `true` if a task that watches
+    /// for it to go quiet must be started anew.
     ///
-    /// 다시 붙을 때 받는 출력 버퍼는 `install`이 화면에 먹이고, 터미널 질의 답은 보관 프로세스로 가는 입력이라
-    /// 둘 다 여기에 오지 않는다. 출력 조각마다 목록을 다시 계산하지 않고, 바뀔 때만 계산해 알린다.
+    /// The output buffer received on reattaching is fed to the screen by `install`, and answers to terminal queries are input going to the holder process, so
+    /// neither comes here. The list isn't recomputed for every output chunk; it's computed and announced only when it changes.
     fn mark_active(&mut self, id: &str, link: u64) -> bool {
         let Some(s) = self.sessions.get_mut(id) else {
             return false;
@@ -1275,7 +1275,7 @@ impl Daemon {
         true
     }
 
-    /// 세션에 붙은 보관 프로세스 연결이 `link`인가.
+    /// Whether the holder process connection attached to the session is `link`.
     fn is_current(&self, id: &str, link: u64) -> bool {
         self.sessions
             .get(id)
@@ -1283,14 +1283,14 @@ impl Daemon {
             .is_some_and(|h| h.link == link)
     }
 
-    /// 연결 `link`의 보관 프로세스가 `Exited`를 알렸다.
+    /// The holder process of connection `link` reported `Exited`.
     fn on_exit(&mut self, id: &str, link: u64) {
         if self.is_current(id, link) {
             self.gone(id);
         }
     }
 
-    /// 보관 프로세스에 붙지 못했지만 살아 있을 수 있다. 세션을 닫거나 끝남으로 돌리지 않고 남긴다.
+    /// Couldn't attach to the holder process, but it may be alive. Leaves the session as it is, without closing it or marking it Done.
     fn unlink(&mut self, id: &str, why: &str) {
         eprintln!("Couldn't connect to the holder process; keeping the session: {id} ({why})");
         if let Some(s) = self.sessions.get_mut(id) {
@@ -1301,7 +1301,7 @@ impl Daemon {
         self.publish();
     }
 
-    /// 보관 프로세스가 끝났다. 셸 세션은 목록에서 빼고 닫고, claude·codex 세션은 끝남으로 남긴다.
+    /// The holder process ended. A shell session is removed from the list and closed; claude and codex sessions are left as Done.
     fn gone(&mut self, id: &str) {
         let Some(s) = self.sessions.get_mut(id) else {
             return;

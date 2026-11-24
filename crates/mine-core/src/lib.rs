@@ -1,5 +1,5 @@
-//! `mine` 공용 코드. CLI(`mine-cli`)와 데스크톱 앱이 같은 모듈을 쓴다.
-//! 데몬·보관 프로세스·터미널 화면(ratatui)은 여기 없고 각 실행 파일 쪽에 있다.
+//! Shared code for `mine`. The CLI (`mine-cli`) and the desktop app use the same modules.
+//! The daemon, holder process and terminal view (ratatui) are not here; they live in each executable.
 
 pub mod accounts;
 pub mod conn;
