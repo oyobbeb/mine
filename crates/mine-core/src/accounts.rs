@@ -20,6 +20,7 @@ use crate::profiles::{self, ProfileInfo, Profiles};
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Labels {
     names: HashMap<String, String>,
+    profiles: Vec<ProfileInfo>,
 }
 
 impl Labels {
@@ -57,7 +58,14 @@ impl Labels {
                 .iter()
                 .map(|info| (info.id.clone(), info.label.clone()))
                 .collect(),
+            profiles: infos.to_vec(),
         }
+    }
+
+    /// The profiles the names came from, for the typed new-session form ([`crate::view::parse_new`]).
+    // ponytail: a bridge until the clients take the profile list from the daemon (Task 6).
+    pub fn profiles(&self) -> &[ProfileInfo] {
+        &self.profiles
     }
 
     /// The on-screen name of `account`. An unknown id comes back as the id.

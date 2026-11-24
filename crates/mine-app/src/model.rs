@@ -471,7 +471,7 @@ impl Model {
             self.message = Some(NOT_CONNECTED.into());
             return Vec::new();
         }
-        match view::parse_new(text, self.project()) {
+        match view::parse_new(text, self.project(), self.labels.profiles()) {
             Ok(spec) => {
                 self.typing = false;
                 self.message = None;
@@ -1288,12 +1288,18 @@ pub(crate) mod tests {
     #[test]
     fn typed_choice_parses_kind_name_and_model() {
         let mut m = connected("/p");
+        m.labels = labels_from("[profiles.claude-b]\nkind = \"claude\"\n");
         assert!(m.launch(Choice::Typed).is_empty());
         assert!(m.typing && m.pending.is_none());
         // Wrong input shows the reason and leaves the box open.
         assert!(m.submit_typed("gpt x").is_empty());
         assert!(m.typing);
-        assert!(m.message.as_deref().unwrap().contains("Unknown kind"));
+        assert!(
+            m.message
+                .as_deref()
+                .unwrap()
+                .contains("Unknown profile: gpt")
+        );
         let Effect::Send(ToDaemon::New { spec }) = &m.submit_typed("claude-b mine opus")[0] else {
             panic!("not a New");
         };

@@ -10,13 +10,23 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::paths::State;
+use crate::profiles::{Profile, ProfileKind, Profiles};
 
 /// Kind of program a session runs.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
 pub enum Kind {
     Claude,
     Codex,
     Shell,
+}
+
+impl From<ProfileKind> for Kind {
+    fn from(kind: ProfileKind) -> Kind {
+        match kind {
+            ProfileKind::Claude => Kind::Claude,
+            ProfileKind::Codex => Kind::Codex,
+        }
+    }
 }
 
 /// Session state shown in the list.
@@ -135,12 +145,14 @@ pub struct Launch {
 }
 
 /// Whether an environment variable was inherited from the shell that started the daemon but must not be passed on to the session child. It is removed when the holder process is started,
-/// and [`launch`] puts back the values that are needed (`MINE_SESSION`, claude-b's `CLAUDE_CONFIG_DIR`).
+/// and [`launch`] puts back the values that are needed (`MINE_SESSION`, a profile's `CLAUDE_CONFIG_DIR` or `CODEX_HOME`).
 ///
 /// If the daemon was started inside tmux, `TMUX` sends tmux-aware tools to the outer tmux; if it was started inside a claude session,
-/// `CLAUDECODE` blocks nested runs or `CLAUDE_CONFIG_DIR` runs a claude-a session under the claude-b account.
+/// `CLAUDECODE` blocks nested runs or `CLAUDE_CONFIG_DIR` runs a claude-a session under the claude-b account. `CODEX_HOME` would do the same for codex:
+/// a profile's home comes only from [`launch`].
 /// Only the variables a running Claude Code sets for its children are removed. `CLAUDE_*` settings the user turned on on purpose
-/// (`CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS`, `CLAUDE_CODE_USE_BEDROCK`, etc.) are passed through to the session unchanged.
+/// (`CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS`, etc.) are passed through to the session unchanged, except the ones on the
+/// [`bypass_vars`] list.
 /// Of the prefixes removed, `CLAUDE_CODE_SESSION_` is the session id, `CLAUDE_CODE_CHILD_` is child session info,
 /// and `CLAUDE_CODE_MESSAGING_` is the messaging socket and token. A token must not leak into another session.
 /// `MINE_STATE_DIR` is kept because the hook (`mine _event`) uses it to find this daemon.
@@ -159,6 +171,7 @@ pub fn is_leaked_env(name: &str) -> bool {
             | "CLAUDE_PLUGIN_DATA"
             | "CLAUDE_EFFORT"
             | "CLAUDE_CONFIG_DIR"
+            | "CODEX_HOME"
             | "MINE_SESSION"
     ) || [
         "CLAUDE_CODE_SESSION_",
@@ -167,6 +180,27 @@ pub fn is_leaked_env(name: &str) -> bool {
     ]
     .iter()
     .any(|prefix| name.starts_with(prefix))
+}
+
+const CLAUDE_BYPASS: [&str; 6] = [
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "AWS_BEARER_TOKEN_BEDROCK",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+];
+const CODEX_BYPASS: [&str; 2] = ["OPENAI_API_KEY", "CODEX_API_KEY"];
+
+/// Variables that would route a CLI around its profile's login onto a key or another provider (design 10.2). The holder's env
+/// cleaning removes them for that kind of session. A shell keeps everything.
+// ponytail: no opt-out. A per-profile `env` table to opt back in comes when someone needs an API-key profile.
+pub fn bypass_vars(kind: Kind) -> &'static [&'static str] {
+    match kind {
+        Kind::Claude => &CLAUDE_BYPASS,
+        Kind::Codex => &CODEX_BYPASS,
+        Kind::Shell => &[],
+    }
 }
 
 /// Login shell path. `/bin/zsh` if `SHELL` is empty or unset.
@@ -200,9 +234,42 @@ fn hook_command(exe: &Path, session_dir: &Path) -> String {
     )
 }
 
-/// Builds the launch command for each session kind. State hooks are injected into claude and codex.
-pub fn launch(meta: &Meta, state: &State, exe: &Path) -> Launch {
+/// The profile a session runs on: `account` holds its id. `None` for a session without one, which runs at the CLI's own home.
+/// An id that isn't in `profiles`, or one of another kind, is an error: a session never falls back to another login.
+pub fn profile<'a>(
+    kind: Kind,
+    account: Option<&str>,
+    profiles: &'a Profiles,
+) -> Result<Option<&'a Profile>> {
+    let Some(id) = account else {
+        return Ok(None);
+    };
+    let Some(profile) = profiles.get(id) else {
+        bail!("Unknown profile: {id}");
+    };
+    if Kind::from(profile.kind) != kind {
+        bail!("Profile {id} is a {} profile", profile.kind.word());
+    }
+    Ok(Some(profile))
+}
+
+/// Builds the launch command for each session kind. State hooks are injected into claude and codex, and a profile with its own
+/// home gets `CLAUDE_CONFIG_DIR` or `CODEX_HOME`. Fails for an unknown or mismatched profile ([`profile`]).
+///
+/// Only builds the command: getting the profile's home ready (`share::prepare`) is up to the caller.
+pub fn launch(
+    meta: &Meta,
+    state: &State,
+    exe: &Path,
+    profiles: &Profiles,
+    user_home: &Path,
+) -> Result<Launch> {
     let mut env = vec![("MINE_SESSION".to_string(), meta.id.clone())];
+    if let Some((key, home)) = profile(meta.kind, meta.account.as_deref(), profiles)?
+        .and_then(|profile| profile.env(state, user_home))
+    {
+        env.push((key.to_string(), home.to_string_lossy().into_owned()));
+    }
     let command = hook_command(exe, &state.session_dir(&meta.id));
     let mut argv = Vec::new();
     match meta.kind {
@@ -226,13 +293,6 @@ pub fn launch(meta: &Meta, state: &State, exe: &Path) -> Launch {
             if let Some(id) = &meta.resume_id {
                 argv.extend(["--resume".to_string(), id.clone()]);
             }
-            if meta.account.as_deref() == Some("claude-b") {
-                let dir = state.profiles_dir().join("claude-b");
-                env.push((
-                    "CLAUDE_CONFIG_DIR".to_string(),
-                    dir.to_string_lossy().into_owned(),
-                ));
-            }
         }
         Kind::Codex => {
             // The `-c` value is TOML, not JSON. JSON string escaping also works for TOML basic strings.
@@ -252,11 +312,11 @@ pub fn launch(meta: &Meta, state: &State, exe: &Path) -> Launch {
             }
         }
     }
-    Launch {
+    Ok(Launch {
         argv,
         env,
         cwd: meta.project.clone(),
-    }
+    })
 }
 
 #[cfg(test)]
@@ -352,16 +412,36 @@ mod tests {
         argv.windows(2).any(|w| w[0] == a && w[1] == b)
     }
 
-    fn session_env(l: &Launch) -> Option<&str> {
+    fn env_of<'a>(l: &'a Launch, key: &str) -> Option<&'a str> {
         l.env
             .iter()
-            .find(|(k, _)| k == "MINE_SESSION")
+            .find(|(k, _)| k == key)
             .map(|(_, v)| v.as_str())
+    }
+
+    fn session_env(l: &Launch) -> Option<&str> {
+        env_of(l, "MINE_SESSION")
+    }
+
+    /// claude-a and codex at the CLIs' default homes, and a managed profile of each kind.
+    const CONFIG: &str = "[profiles.claude-a]\nkind = \"claude\"\nhome = \"default\"\n\
+        [profiles.team]\nkind = \"claude\"\n\
+        [profiles.codex]\nkind = \"codex\"\nhome = \"default\"\n\
+        [profiles.codex-team]\nkind = \"codex\"\n";
+
+    fn try_run(m: &Meta, state: &State, exe: &str) -> Result<Launch> {
+        let (profiles, warnings) = Profiles::parse(Some(CONFIG), state);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        launch(m, state, Path::new(exe), &profiles, Path::new("/h"))
+    }
+
+    fn run(m: &Meta) -> Launch {
+        try_run(m, &st(), "/x/mine").unwrap()
     }
 
     #[test]
     fn shell_launch_uses_login_shell() {
-        let l = launch(&meta(Kind::Shell, None), &st(), Path::new("/x/mine"));
+        let l = run(&meta(Kind::Shell, None));
         assert_eq!(l.argv, vec![login_shell(), "-l".to_string()]);
         assert_eq!(l.cwd, PathBuf::from("/work/mine"));
         assert_eq!(session_env(&l), Some("k1-rust"));
@@ -369,11 +449,7 @@ mod tests {
 
     #[test]
     fn claude_a_launch_keeps_default_config_dir() {
-        let l = launch(
-            &meta(Kind::Claude, Some("claude-a")),
-            &st(),
-            Path::new("/x/mine"),
-        );
+        let l = run(&meta(Kind::Claude, Some("claude-a")));
         assert_eq!(l.argv[0], "claude");
         assert_eq!(l.argv[1], "--settings");
         assert!(!l.env.iter().any(|(k, _)| k == "CLAUDE_CONFIG_DIR"));
@@ -397,23 +473,65 @@ mod tests {
     }
 
     #[test]
-    fn claude_without_account_keeps_default_config_dir() {
-        let l = launch(&meta(Kind::Claude, None), &st(), Path::new("/x/mine"));
-        assert!(!l.env.iter().any(|(k, _)| k == "CLAUDE_CONFIG_DIR"));
+    fn launch_sets_env_for_managed_profile() {
+        let l = run(&meta(Kind::Claude, Some("team")));
+        assert_eq!(env_of(&l, "CLAUDE_CONFIG_DIR"), Some("/s/profiles/team"));
+        assert_eq!(env_of(&l, "CODEX_HOME"), None);
+        assert_eq!(session_env(&l), Some("k1-rust"));
+        let l = run(&meta(Kind::Codex, Some("codex-team")));
+        assert_eq!(env_of(&l, "CODEX_HOME"), Some("/s/profiles/codex-team"));
+        assert_eq!(env_of(&l, "CLAUDE_CONFIG_DIR"), None);
     }
 
     #[test]
-    fn claude_b_launch_sets_profile_dir() {
-        let l = launch(
-            &meta(Kind::Claude, Some("claude-b")),
-            &st(),
-            Path::new("/x/mine"),
+    fn default_profile_sets_no_env() {
+        // A profile at the CLI's own home, or no profile at all (an older session), sets nothing but `MINE_SESSION`.
+        for (kind, account) in [
+            (Kind::Claude, Some("claude-a")),
+            (Kind::Claude, None),
+            (Kind::Codex, Some("codex")),
+            (Kind::Codex, None),
+        ] {
+            let l = run(&meta(kind, account));
+            let keys: Vec<&str> = l.env.iter().map(|(k, _)| k.as_str()).collect();
+            assert_eq!(keys, ["MINE_SESSION"], "{account:?}");
+        }
+    }
+
+    #[test]
+    fn legacy_claude_b_meta_resumes_same_dir() {
+        // No `[profiles]` table: the built-in claude-b stands in once its directory exists, at the same path as before.
+        let t = tmp();
+        let state = State {
+            root: t.path().to_path_buf(),
+        };
+        let dir = state.profiles_dir().join("claude-b");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (profiles, warnings) = Profiles::load(&state);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let mut m = meta(Kind::Claude, Some("claude-b"));
+        m.resume_id = Some("s1".into());
+        let l = launch(&m, &state, Path::new("/x/mine"), &profiles, Path::new("/h")).unwrap();
+        assert_eq!(env_of(&l, "CLAUDE_CONFIG_DIR"), dir.to_str());
+        assert!(has_pair(&l.argv, "--resume", "s1"));
+    }
+
+    #[test]
+    fn unknown_or_mismatched_profile_refuses_to_launch() {
+        // Never falls back to another login.
+        let err = |m: &Meta| try_run(m, &st(), "/x/mine").unwrap_err().to_string();
+        assert_eq!(
+            err(&meta(Kind::Claude, Some("gone"))),
+            "Unknown profile: gone"
         );
-        assert!(l.env.contains(&(
-            "CLAUDE_CONFIG_DIR".to_string(),
-            "/s/profiles/claude-b".to_string()
-        )));
-        assert_eq!(session_env(&l), Some("k1-rust"));
+        assert_eq!(
+            err(&meta(Kind::Codex, Some("team"))),
+            "Profile team is a claude profile"
+        );
+        assert_eq!(
+            err(&meta(Kind::Claude, Some("codex"))),
+            "Profile codex is a codex profile"
+        );
     }
 
     #[test]
@@ -421,32 +539,16 @@ mod tests {
         let mut m = meta(Kind::Claude, Some("claude-a"));
         m.model = Some("opus".into());
         m.resume_id = Some("s1".into());
-        let l = launch(&m, &st(), Path::new("/x/mine"));
+        let l = run(&m);
         assert!(has_pair(&l.argv, "--model", "opus"));
         assert!(has_pair(&l.argv, "--resume", "s1"));
-        let plain = launch(
-            &meta(Kind::Claude, Some("claude-a")),
-            &st(),
-            Path::new("/x/mine"),
-        );
+        let plain = run(&meta(Kind::Claude, Some("claude-a")));
         assert_eq!(plain.argv.len(), 3);
     }
 
     #[test]
-    fn claude_resume_adds_flag() {
-        let mut m = meta(Kind::Claude, Some("claude-a"));
-        m.resume_id = Some("s1".into());
-        let l = launch(&m, &st(), Path::new("/x/mine"));
-        assert!(has_pair(&l.argv, "--resume", "s1"));
-    }
-
-    #[test]
     fn codex_launch_injects_toml_hooks() {
-        let l = launch(
-            &meta(Kind::Codex, Some("codex")),
-            &st(),
-            Path::new("/x/mine"),
-        );
+        let l = run(&meta(Kind::Codex, Some("codex")));
         assert_eq!(l.argv[0], "codex");
         assert!(l.argv.iter().any(|a| {
             a.starts_with("hooks.UserPromptSubmit=[{hooks=[{type=\"command\",command=\"")
@@ -478,7 +580,7 @@ mod tests {
         let mut m = meta(Kind::Codex, Some("codex"));
         m.model = Some("gpt-5".into());
         m.resume_id = Some("t1".into());
-        let l = launch(&m, &st(), Path::new("/x/mine"));
+        let l = run(&m);
         assert!(has_pair(&l.argv, "--model", "gpt-5"));
         assert_eq!(l.argv[l.argv.len() - 2..], ["resume", "t1"]);
     }
@@ -496,6 +598,7 @@ mod tests {
             "CLAUDE_PLUGIN_DATA",
             "CLAUDE_EFFORT",
             "CLAUDE_CONFIG_DIR",
+            "CODEX_HOME",
             "MINE_SESSION",
             "CLAUDE_CODE_SESSION_ID",
             "CLAUDE_CODE_CHILD_SESSION",
@@ -512,11 +615,34 @@ mod tests {
             "SSH_AUTH_SOCK",
             "CLAUDE",
             "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS",
-            "CLAUDE_CODE_USE_BEDROCK",
             "CLAUDE_CODE_SESSION",
             "CLAUDE_API_KEY",
         ] {
             assert!(!is_leaked_env(kept), "{kept}");
+        }
+    }
+
+    #[test]
+    fn bypass_vars_by_kind() {
+        assert_eq!(
+            bypass_vars(Kind::Claude),
+            [
+                "ANTHROPIC_API_KEY",
+                "ANTHROPIC_AUTH_TOKEN",
+                "CLAUDE_CODE_OAUTH_TOKEN",
+                "AWS_BEARER_TOKEN_BEDROCK",
+                "CLAUDE_CODE_USE_BEDROCK",
+                "CLAUDE_CODE_USE_VERTEX",
+            ]
+        );
+        assert_eq!(
+            bypass_vars(Kind::Codex),
+            ["OPENAI_API_KEY", "CODEX_API_KEY"]
+        );
+        // A shell keeps everything, so these aren't leaked variables.
+        assert!(bypass_vars(Kind::Shell).is_empty());
+        for kind in [Kind::Claude, Kind::Codex] {
+            assert!(!bypass_vars(kind).iter().any(|v| is_leaked_env(v)));
         }
     }
 
@@ -530,7 +656,7 @@ mod tests {
         let st = State {
             root: PathBuf::from("/s s"),
         };
-        let l = launch(&meta(Kind::Claude, None), &st, Path::new("/my bin/mine"));
+        let l = try_run(&meta(Kind::Claude, None), &st, "/my bin/mine").unwrap();
         let v: serde_json::Value = serde_json::from_str(&l.argv[2]).unwrap();
         assert_eq!(
             v["hooks"]["Stop"][0]["hooks"][0]["command"],

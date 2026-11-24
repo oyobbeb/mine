@@ -64,7 +64,7 @@ impl ProfileKind {
     }
 
     /// The word used in `config.toml` and in messages.
-    fn word(self) -> &'static str {
+    pub fn word(self) -> &'static str {
         match self {
             ProfileKind::Claude => "claude",
             ProfileKind::Codex => "codex",
@@ -432,7 +432,7 @@ fn resolve_color(text: &str) -> Option<String> {
 }
 
 /// What a client shows for a profile. The daemon sends these, so clients never read `config.toml` or `.claude.json` themselves.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct ProfileInfo {
     pub id: String,
     pub kind: ProfileKind,

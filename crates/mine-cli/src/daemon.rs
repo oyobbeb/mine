@@ -38,12 +38,14 @@ use crate::hold;
 use mine_core::conn::restart_hint;
 use mine_core::hooks::{self, Event, EventKind, now_ms};
 use mine_core::paths::{State, check_sock_path, ensure_dir};
+use mine_core::profiles::Profiles;
 use mine_core::project::{self, project_key};
 use mine_core::proto::{FromDaemon, HOLD_VERSION, HoldIn, HoldOut, ToDaemon, VERSION, recv, send};
 use mine_core::screen::Screen;
 use mine_core::session::{
     self, Kind, Meta, NewSession, Restore, SessionInfo, SessionState, session_id, validate_name,
 };
+use mine_core::share;
 
 /// The number of messages to send that can be queued for one client. If it overflows, that client is dropped.
 const QUEUE_CAP: usize = 1024;
@@ -86,6 +88,11 @@ type Shared = Arc<Mutex<Daemon>>;
 struct Daemon {
     state: State,
     exe: PathBuf,
+    /// Read once at startup.
+    // ponytail: no reload yet; `ToDaemon::ReloadProfiles` comes with the profile commands.
+    profiles: Profiles,
+    /// The user's home (`HOME`), where the CLIs' default homes are.
+    user_home: PathBuf,
     sessions: BTreeMap<String, Sess>,
     /// Session ids for which `New` is starting a holder process. Keeps the same name from being created twice at once.
     starting: HashSet<String>,
@@ -160,6 +167,14 @@ struct Link {
     ring: Vec<u8>,
 }
 
+/// What starting a holder process needs, copied out of the daemon so the start runs outside the lock.
+struct Start {
+    state: State,
+    exe: PathBuf,
+    profiles: Profiles,
+    user_home: PathBuf,
+}
+
 /// The result of starting a holder process.
 enum Started {
     Linked(Link),
@@ -195,9 +210,16 @@ pub async fn run(state: State) -> Result<()> {
         .with_context(|| format!("Couldn't create the socket: {}", sock.display()))?;
     fs::set_permissions(&sock, fs::Permissions::from_mode(0o600))?;
     let exe = std::env::current_exe().context("Couldn't determine the executable path")?;
+    let user_home = std::env::home_dir().context("Couldn't determine the home directory")?;
+    let (profiles, warnings) = Profiles::load(&state);
+    for warning in warnings {
+        eprintln!("Warning: {warning}");
+    }
     let shared: Shared = Arc::new(Mutex::new(Daemon {
         state,
         exe,
+        profiles,
+        user_home,
         sessions: BTreeMap::new(),
         starting: HashSet::new(),
         closing: HashMap::new(),
@@ -421,7 +443,7 @@ async fn create(shared: &Shared, spec: NewSession) -> Result<()> {
         )
     })?;
     let id = session_id(&project_key(&project), &spec.name);
-    let (state, exe) = {
+    let start = {
         let mut d = shared.lock().await;
         if d.closing.contains_key(&id) {
             bail!(
@@ -429,10 +451,12 @@ async fn create(shared: &Shared, spec: NewSession) -> Result<()> {
                 spec.name
             );
         }
+        // Before anything is written, so a wrong profile leaves no session directory behind.
+        session::profile(spec.kind, spec.account.as_deref(), &d.profiles)?;
         if d.sessions.contains_key(&id) || !d.starting.insert(id.clone()) {
             bail!("A session with the same name already exists: {}", spec.name);
         }
-        (d.state.clone(), d.exe.clone())
+        d.start()
     };
     let restore = match spec.kind {
         Kind::Shell => Restore::None,
@@ -450,13 +474,13 @@ async fn create(shared: &Shared, spec: NewSession) -> Result<()> {
         resume_id: None,
         closed: false,
     };
-    let dir = state.session_dir(&id);
+    let dir = start.state.session_dir(&id);
     // Start it outside the lock. Other sessions' output and clients don't stall while the holder process starts.
     let started = async {
-        project::register(&state, &meta.project)?;
+        project::register(&start.state, &meta.project)?;
         ensure_dir(&dir)?;
         meta.save(&dir)?;
-        start_holder(&state, &exe, &meta).await
+        start_holder(&start, &meta).await
     }
     .await;
     let mut d = shared.lock().await;
@@ -534,8 +558,8 @@ async fn attach(shared: &Shared, client: u64, id: &str, size: (u16, u16)) {
         d.publish();
     }
     let resume = shared.lock().await.prepare_resume(id);
-    if let Some((state, exe, meta)) = resume {
-        let started = start_holder(&state, &exe, &meta).await;
+    if let Some((start, meta)) = resume {
+        let started = start_holder(&start, &meta).await;
         let mut d = shared.lock().await;
         let exists = d.sessions.get_mut(id).map(|s| s.busy = false).is_some();
         match started {
@@ -543,12 +567,11 @@ async fn attach(shared: &Shared, client: u64, id: &str, size: (u16, u16)) {
             // The session was closed while restarting. End the new holder process too.
             Ok(Started::Linked(link)) => kill_link(link),
             Ok(Started::Ended) => d.refresh(id),
-            Err(e) => d.send(
-                client,
-                FromDaemon::Error {
-                    message: format!("Couldn't restart the session: {e:#}"),
-                },
-            ),
+            Err(e) => {
+                let message = format!("Couldn't restart the session: {e:#}");
+                eprintln!("{id}: {message}");
+                d.send(client, FromDaemon::Error { message });
+            }
         }
         d.publish();
     }
@@ -567,7 +590,25 @@ fn kill_link(link: Link) {
 ///
 /// If the holder process ends before attaching, an exit file means the child ended right away (`Ended`),
 /// and no exit file means it couldn't start (an error that carries the log contents).
-async fn start_holder(state: &State, exe: &Path, meta: &Meta) -> Result<Started> {
+///
+/// First the session's profile is resolved (an unknown one refuses to start) and its home made ready with `share::prepare`.
+/// Only a home that can't be created stops the start; any other sharing problem is logged and the session starts anyway.
+async fn start_holder(start: &Start, meta: &Meta) -> Result<Started> {
+    let Start {
+        state,
+        exe,
+        profiles,
+        user_home,
+    } = start;
+    let launch = session::launch(meta, state, exe, profiles, user_home)?;
+    if let Some(profile) = session::profile(meta.kind, meta.account.as_deref(), profiles)? {
+        let why = |what: &str| format!("{}: profile {}: {what}", meta.id, profile.id);
+        match share::prepare(profile, profiles, state, user_home) {
+            Ok(report) => report.warnings.iter().for_each(|w| eprintln!("{}", why(w))),
+            Err(e) if !profile.home_dir(state, user_home).is_dir() => return Err(e),
+            Err(e) => eprintln!("{}", why(&format!("{e:#}"))),
+        }
+    }
     let dir = state.session_dir(&meta.id);
     let sock = state.hold_sock(&meta.id);
     check_sock_path(&sock)?;
@@ -586,11 +627,15 @@ async fn start_holder(state: &State, exe: &Path, meta: &Meta) -> Result<Started>
     let log_path = state.log_dir().join(format!("hold-{}.log", meta.id));
     let log = File::create(&log_path)
         .with_context(|| format!("Couldn't open the log file: {}", log_path.display()))?;
-    let launch = session::launch(meta, state, exe);
     let mut cmd = tokio::process::Command::new(exe);
-    // portable-pty passes the holder process's environment to the child as it is, so the environment of the shell that started the daemon is cleared here.
+    // portable-pty passes the holder process's environment to the child as it is, so the environment of the shell that started the daemon is cleared here,
+    // along with the variables that would route claude or codex around the profile's login.
+    let bypass = session::bypass_vars(meta.kind);
     for (key, _) in std::env::vars_os() {
-        if key.to_str().is_some_and(session::is_leaked_env) {
+        if key
+            .to_str()
+            .is_some_and(|key| session::is_leaked_env(key) || bypass.contains(&key))
+        {
             cmd.env_remove(&key);
         }
     }
@@ -1166,7 +1211,7 @@ impl Daemon {
     }
 
     /// Prepares to start an ended session again. If it should be restarted, returns the values needed to start it.
-    fn prepare_resume(&mut self, id: &str) -> Option<(State, PathBuf, Meta)> {
+    fn prepare_resume(&mut self, id: &str) -> Option<(Start, Meta)> {
         let dir = self.state.session_dir(id);
         let s = self.sessions.get_mut(id)?;
         // A session that couldn't be attached may have a live process, so don't start another one in the same conversation.
@@ -1178,7 +1223,17 @@ impl Daemon {
         if let Err(e) = s.meta.save(&dir) {
             eprintln!("{e:#}");
         }
-        Some((self.state.clone(), self.exe.clone(), s.meta.clone()))
+        let meta = s.meta.clone();
+        Some((self.start(), meta))
+    }
+
+    fn start(&self) -> Start {
+        Start {
+            state: self.state.clone(),
+            exe: self.exe.clone(),
+            profiles: self.profiles.clone(),
+            user_home: self.user_home.clone(),
+        }
     }
 
     /// If it's a session left unattached and no other attempt is underway, returns the socket path to reattach to.

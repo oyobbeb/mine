@@ -4,11 +4,10 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use crate::accounts::Labels;
-use crate::session::{NewSession, SessionInfo};
-use crate::view;
+use crate::session::{Kind, NewSession, SessionInfo};
 
 /// What can be picked on the start screen. Only `Typed` does not create a session right away; it takes the kind, name and model as typed input
-/// ([`view::parse_new`] format).
+/// ([`view::parse_new`](crate::view::parse_new) format).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Choice {
     ClaudeA,
@@ -19,7 +18,7 @@ pub enum Choice {
 }
 
 impl Choice {
-    /// Kind word: the first word of [`view::parse_new`]. Except for shell, it is the same as the session's account name (chip). Custom input (`Typed`)
+    /// Kind word: the first word of [`view::parse_new`](crate::view::parse_new). Except for shell, it is the same as the session's account name (chip). Custom input (`Typed`)
     /// is `None`.
     pub const fn word(self) -> Option<&'static str> {
         match self {
@@ -62,9 +61,21 @@ pub fn next_name(sessions: &[SessionInfo], project: &Path) -> String {
 }
 
 /// The spec of the new session a picked row creates. `Typed` opens input rather than being a spec, so it is `None`.
+/// The daemon checks the profile id when it starts the session.
 pub fn new_session(choice: Choice, name: &str, project: &Path) -> Option<NewSession> {
-    let word = choice.word()?;
-    view::parse_new(&format!("{word} {name}"), project).ok()
+    let kind = match choice {
+        Choice::ClaudeA | Choice::ClaudeB => Kind::Claude,
+        Choice::Codex => Kind::Codex,
+        Choice::Shell => Kind::Shell,
+        Choice::Typed => return None,
+    };
+    Some(NewSession {
+        project: project.to_path_buf(),
+        name: name.to_string(),
+        kind,
+        account: (kind != Kind::Shell).then(|| choice.word().unwrap_or_default().to_string()),
+        model: None,
+    })
 }
 
 /// Shortens the home part of a path under home to `~`. If home is `/` or empty, nothing is shortened.
@@ -153,12 +164,6 @@ mod tests {
                 None
             ]
         );
-        // All four are words `parse_new` accepts, and only shell has no account.
-        for c in [ClaudeA, ClaudeB, Codex, Shell] {
-            let word = c.word().unwrap();
-            let spec = view::parse_new(&format!("{word} x"), Path::new("/p")).unwrap();
-            assert_eq!(spec.account.as_deref(), (c != Shell).then_some(word));
-        }
     }
 
     #[test]

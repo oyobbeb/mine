@@ -105,7 +105,7 @@ mine app
 ```sh
 mine                                  # 터미널 UI를 연다
 mine ls                               # 세션 목록 (탭으로 나눈 스크립트용 출력)
-mine new review --kind claude --account claude-b --model opus
+mine new review --profile claude-b --model opus   # --account도 돼요
 mine new dev                          # 종류를 생략하면 shell
 mine kill review                      # 세션을 닫는다 (세션 폴더와 기록은 남는다)
 mine projects                         # 등록된 프로젝트
@@ -193,7 +193,7 @@ mine --project ~/dev/app new dev      # 프로젝트를 직접 지정한다
 2. 없으면 그 Claude 프로필의 로그인 이메일에서 `@` 앞부분. Codex는 `Codex`예요.
 3. 그것도 없으면 계정 id예요.
 
-mine은 자격 증명을 읽거나 저장하지 않아요. 자동 이름을 위해 `.claude.json`의 로그인 이메일 한 필드만 읽고, 로그에 남기지 않아요. 별칭은 화면에만 쓰여서 `mine ls`, `mine new --account`, 시작 화면의 `n` 입력은 계정 id를 그대로 써요.
+mine은 자격 증명을 읽거나 저장하지 않아요. 자동 이름을 위해 `.claude.json`의 로그인 이메일 한 필드만 읽고, 로그에 남기지 않아요. 별칭은 화면에만 쓰여서 `mine ls`, `mine new --profile`, 시작 화면의 `n` 입력은 계정 id를 그대로 써요.
 
 ### 상태 폴더
 

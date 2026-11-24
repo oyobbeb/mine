@@ -1,7 +1,8 @@
 //! Integration test for the daemon and headless commands. Starts the daemon and holder processes with the real binary.
 //!
 //! Every `mine` command runs in a temporary project directory with a `.git` folder, with a separate short `/tmp` state directory
-//! (`MINE_STATE_DIR`), `SHELL=/bin/sh` and a no-op `MINE_NOTIFY`. The test process's own environment is left untouched.
+//! (`MINE_STATE_DIR`), a temporary `HOME` (so the real `~/.claude` is never linked or read), `SHELL=/bin/sh` and a no-op `MINE_NOTIFY`.
+//! The test process's own environment is left untouched.
 
 use std::ffi::OsString;
 use std::fs::{self, File, TryLockError};
@@ -24,6 +25,8 @@ const WAIT: Duration = Duration::from_secs(10);
 struct St {
     root: PathBuf,
     project: PathBuf,
+    /// The `HOME` every command gets: an empty directory unless a test fills it.
+    home: PathBuf,
     /// If set, it's prepended to `PATH` (a fake `claude`, etc.).
     path_front: Option<PathBuf>,
     /// Environment variables to add to the `mine` command (and the daemon it starts). Overrides the earlier defaults (`SHELL`, etc.).
@@ -43,9 +46,12 @@ fn state() -> St {
     let state = tmp();
     let project = tmp();
     fs::create_dir(project.path().join(".git")).unwrap();
+    let home = state.path().join("h");
+    fs::create_dir(&home).unwrap();
     St {
         root: state.path().join("s"),
         project: project.path().canonicalize().unwrap(),
+        home,
         path_front: None,
         env: Vec::new(),
         _state: state,
@@ -73,6 +79,7 @@ impl St {
         cmd.args(args)
             .current_dir(&self.project)
             .env("MINE_STATE_DIR", &self.root)
+            .env("HOME", &self.home)
             .env("SHELL", "/bin/sh")
             // Never pop real notifications on the user's screen. A test that checks them sets its own fake.
             .env("MINE_NOTIFY", "/usr/bin/true");
@@ -934,28 +941,49 @@ fn new_is_refused_while_the_same_name_is_closing() {
     assert!(listed_alive(&st, "dev"));
 }
 
-#[test]
-fn sessions_do_not_inherit_the_daemon_spawners_environment() {
-    // Even if the daemon was started inside tmux or a claude-b session, that environment must not leak into the session child.
-    // The fake login shell and the fake `claude` write their environment to `<dump>/<MINE_SESSION>`.
-    let bin = tmp();
-    let dump = bin.path().join("env");
+/// Puts in `bin` a fake login shell `sh` (which stays up) and fake `claude` and `codex` (which exit). Each writes its environment to
+/// `<bin>/env/<MINE_SESSION>`. Returns that directory.
+fn env_dumpers(bin: &Path) -> PathBuf {
+    let dump = bin.join("env");
     fs::create_dir(&dump).unwrap();
-    let write = |name: &str, tail: &str| {
-        let path = bin.path().join(name);
+    for (name, tail) in [("sh", "exec sleep 60\n"), ("claude", ""), ("codex", "")] {
+        let path = bin.join(name);
         let script = format!(
             "#!/bin/sh\nenv > '{}'/\"$MINE_SESSION\"\n{tail}",
             dump.display()
         );
         fs::write(&path, script).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
-        path
-    };
-    let shell = write("sh", "exec sleep 60\n");
-    write("claude", "");
+    }
+    dump
+}
+
+/// The environment session `name`'s child started with (see [`env_dumpers`]), one `K=V` per entry. Waits for it.
+fn env_dump(st: &St, dump: &Path, name: &str) -> Vec<String> {
+    let path = dump.join(st.id(name));
+    wait_until(|| fs::metadata(&path).is_ok_and(|m| m.len() > 0));
+    fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Variable names only. Values may hold tokens, so failure messages show only the names.
+fn env_names(env: &[String]) -> Vec<&str> {
+    env.iter()
+        .map(|kv| kv.split_once('=').map_or(kv.as_str(), |(k, _)| k))
+        .collect()
+}
+
+#[test]
+fn sessions_do_not_inherit_the_daemon_spawners_environment() {
+    // Even if the daemon was started inside tmux or a claude-b session, that environment must not leak into the session child.
+    let bin = tmp();
+    let dump = env_dumpers(bin.path());
     let mut st = state_with_path(bin.path());
     st.env.extend([
-        ("SHELL", shell.into_os_string()),
+        ("SHELL", bin.path().join("sh").into_os_string()),
         ("TMUX", "/tmp/tmux-501/default,1,0".into()),
         ("TMUX_PANE", "%1".into()),
         ("CLAUDECODE", "1".into()),
@@ -967,8 +995,9 @@ fn sessions_do_not_inherit_the_daemon_spawners_environment() {
         ("MINE_SESSION", "stale".into()),
         // Settings the user turned on deliberately must pass through to the session child.
         ("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", "1".into()),
-        ("CLAUDE_CODE_USE_BEDROCK", "1".into()),
     ]);
+    // The built-in claude-b profile exists once its directory does.
+    fs::create_dir_all(st.root.join("profiles").join("claude-b")).unwrap();
     mine(&st, &["new", "s"]);
     mine(
         &st,
@@ -978,32 +1007,13 @@ fn sessions_do_not_inherit_the_daemon_spawners_environment() {
         &st,
         &["new", "b", "--kind", "claude", "--account", "claude-b"],
     );
-    let env_of = |name: &str| -> Vec<String> {
-        let path = dump.join(st.id(name));
-        wait_until(|| fs::metadata(&path).is_ok_and(|m| m.len() > 0));
-        fs::read_to_string(&path)
-            .unwrap()
-            .lines()
-            .map(str::to_owned)
-            .collect()
-    };
     let profile = format!(
         "CLAUDE_CONFIG_DIR={}",
         st.root.join("profiles").join("claude-b").display()
     );
-    // Values may contain tokens, so the failure message gives only the variable name.
-    let names = |env: &[String]| -> Vec<String> {
-        env.iter()
-            .map(|kv| {
-                kv.split_once('=')
-                    .map_or(kv.as_str(), |(k, _)| k)
-                    .to_owned()
-            })
-            .collect()
-    };
     for name in ["s", "a", "b"] {
-        let env = env_of(name);
-        let leaked: Vec<String> = names(&env)
+        let env = env_dump(&st, &dump, name);
+        let leaked: Vec<&str> = env_names(&env)
             .into_iter()
             .filter(|k| {
                 [
@@ -1016,9 +1026,9 @@ fn sessions_do_not_inherit_the_daemon_spawners_environment() {
                     "CLAUDE_PID",
                     "CLAUDE_CONFIG_DIR",
                 ]
-                .contains(&k.as_str())
+                .contains(k)
             })
-            .filter(|k| !(name == "b" && k == "CLAUDE_CONFIG_DIR" && env.contains(&profile)))
+            .filter(|k| !(name == "b" && *k == "CLAUDE_CONFIG_DIR" && env.contains(&profile)))
             .collect();
         assert!(leaked.is_empty(), "{name}: leaked variables {leaked:?}");
         for want in [
@@ -1026,17 +1036,135 @@ fn sessions_do_not_inherit_the_daemon_spawners_environment() {
             "COLORTERM=truecolor".to_string(),
             format!("MINE_SESSION={}", st.id(name)),
             "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1".to_string(),
-            "CLAUDE_CODE_USE_BEDROCK=1".to_string(),
         ] {
             assert!(
                 env.contains(&want),
                 "{name}: {} is missing, variables present {:?}",
                 want.split_once('=').map_or(want.as_str(), |(k, _)| k),
-                names(&env)
+                env_names(&env)
             );
         }
     }
-    assert!(env_of("b").contains(&profile));
+    assert!(env_dump(&st, &dump, "b").contains(&profile));
+}
+
+#[test]
+fn bypass_vars_stripped_for_agents_only() {
+    // A key in the daemon's environment would route claude or codex around the profile's login. A shell keeps everything.
+    let bin = tmp();
+    let dump = env_dumpers(bin.path());
+    let mut st = state_with_path(bin.path());
+    st.env.extend([
+        ("SHELL", bin.path().join("sh").into_os_string()),
+        ("ANTHROPIC_API_KEY", "sk-a".into()),
+        ("CLAUDE_CODE_USE_BEDROCK", "1".into()),
+        ("OPENAI_API_KEY", "sk-o".into()),
+        ("FOO", "1".into()),
+    ]);
+    mine(&st, &["new", "s"]);
+    mine(&st, &["new", "a", "--profile", "claude-a"]);
+    mine(&st, &["new", "x", "--profile", "codex"]);
+    let (shell, claude, codex) = (
+        env_dump(&st, &dump, "s"),
+        env_dump(&st, &dump, "a"),
+        env_dump(&st, &dump, "x"),
+    );
+    let has = |env: &[String], kv: &str| env.iter().any(|e| e == kv);
+    for kv in [
+        "ANTHROPIC_API_KEY=sk-a",
+        "CLAUDE_CODE_USE_BEDROCK=1",
+        "OPENAI_API_KEY=sk-o",
+        "FOO=1",
+    ] {
+        assert!(has(&shell, kv), "shell: {:?}", env_names(&shell));
+    }
+    let names = env_names(&claude);
+    assert!(!names.contains(&"ANTHROPIC_API_KEY"), "claude: {names:?}");
+    assert!(
+        !names.contains(&"CLAUDE_CODE_USE_BEDROCK"),
+        "claude: {names:?}"
+    );
+    assert!(has(&claude, "FOO=1"), "claude: {names:?}");
+    let names = env_names(&codex);
+    assert!(!names.contains(&"OPENAI_API_KEY"), "codex: {names:?}");
+    assert!(has(&codex, "FOO=1"), "codex: {names:?}");
+}
+
+#[test]
+fn creating_a_managed_profile_session_links_shared_items() {
+    let bin = tmp();
+    fake_claude(bin.path());
+    let st = state_with_path(bin.path());
+    fs::create_dir_all(&st.root).unwrap();
+    fs::write(
+        st.root.join("config.toml"),
+        "[profiles.claude-a]\nkind = \"claude\"\nhome = \"default\"\n[profiles.team]\nkind = \"claude\"\n",
+    )
+    .unwrap();
+    let skills = st.home.join(".claude").join("skills");
+    fs::create_dir_all(&skills).unwrap();
+    mine(&st, &["new", "t", "--profile", "team"]);
+    let link = st.root.join("profiles").join("team").join("skills");
+    assert_eq!(fs::read_link(&link).unwrap(), skills);
+    assert_eq!(ls(&st)[0][3], "team");
+}
+
+#[test]
+fn unknown_profile_refuses_to_start() {
+    // A session whose profile was removed from the config must not start on any other login.
+    let bin = tmp();
+    let trace = fake_claude(bin.path());
+    let st = state_with_path(bin.path());
+    let paths = State {
+        root: st.root.clone(),
+    };
+    let id = st.id("c");
+    let dir = paths.session_dir(&id);
+    fs::create_dir_all(&dir).unwrap();
+    Meta {
+        id: id.clone(),
+        project: st.project.clone(),
+        name: "c".into(),
+        kind: Kind::Claude,
+        account: Some("gone".into()),
+        model: None,
+        restore: Restore::Resume,
+        created_ms: 1,
+        resume_id: Some("s1".into()),
+        closed: false,
+    }
+    .save(&dir)
+    .unwrap();
+    // Starting the daemon finds it not running. Attaching is what would start it again.
+    assert_eq!(ls(&st)[0][3], "gone");
+    let mut c = client(&st);
+    c.send(&ToDaemon::Attach {
+        id: id.clone(),
+        cols: 80,
+        rows: 24,
+    });
+    let mut error = None;
+    loop {
+        match c.recv().expect("the connection dropped") {
+            FromDaemon::Snapshot { .. } => break,
+            FromDaemon::Error { message } => error = Some(message),
+            _ => {}
+        }
+    }
+    let error = error.expect("no error for the refused start");
+    assert!(error.contains("Unknown profile: gone"), "{error}");
+    let log = fs::read_to_string(paths.log_dir().join("daemon.log")).unwrap();
+    assert!(log.contains("Unknown profile: gone"), "{log}");
+    assert!(!trace.exists());
+    assert!(!paths.hold_sock(&id).exists());
+    c.send(&ToDaemon::List);
+    let alive = loop {
+        if let Some(FromDaemon::Sessions { sessions }) = c.recv() {
+            break sessions.iter().find(|s| s.meta.id == id).map(|s| s.alive);
+        }
+    };
+    assert_eq!(alive, Some(false));
+    assert_eq!(ls(&st)[0][4], "ended");
 }
 
 #[tokio::test]

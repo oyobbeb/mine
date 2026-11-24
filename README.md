@@ -105,7 +105,7 @@ When the terminal pane has focus, every key without ⌘ goes to the session.
 ```sh
 mine                                  # open the terminal UI
 mine ls                               # list sessions (tab-separated, script-friendly)
-mine new review --kind claude --account claude-b --model opus
+mine new review --profile claude-b --model opus   # --account still works
 mine new dev                          # kind defaults to shell
 mine kill review                      # close a session (its directory and history stay)
 mine projects                         # list registered projects
@@ -193,7 +193,7 @@ The UI shows a short name for each account instead of `claude-a` / `claude-b`:
 2. Otherwise, the part before `@` in that Claude profile's login email. Codex shows as `Codex`.
 3. Otherwise, the account id.
 
-mine never reads or stores credentials. For automatic names it reads a single field, the login email in `.claude.json`, and never logs it. Labels are display-only: `mine ls`, `mine new --account`, and the launcher's `n` prompt use the account ids.
+mine never reads or stores credentials. For automatic names it reads a single field, the login email in `.claude.json`, and never logs it. Labels are display-only: `mine ls`, `mine new --profile`, and the launcher's `n` prompt use the account ids.
 
 ### State directory
 

@@ -21,20 +21,10 @@ use serde_json::{Map, Value};
 
 use crate::paths::{State, ensure_dir};
 use crate::profiles::{Home, Profile, ProfileKind, Profiles, Share};
+use crate::session::{self, Kind};
 
 /// The shareable item that is copied into `.claude.json` instead of linked.
 const MCP: &str = "mcpServers";
-
-/// Variables that point Claude at a key instead of the profile's login (design 10.2). A `settings.json` `env` entry for one of
-/// these would put every profile that reads the file on that key.
-const CLAUDE_BYPASS_ENV: [&str; 6] = [
-    "ANTHROPIC_API_KEY",
-    "ANTHROPIC_AUTH_TOKEN",
-    "CLAUDE_CODE_OAUTH_TOKEN",
-    "AWS_BEARER_TOKEN_BEDROCK",
-    "CLAUDE_CODE_USE_BEDROCK",
-    "CLAUDE_CODE_USE_VERTEX",
-];
 
 /// What one shareable item looks like in a profile's home.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,39 +104,47 @@ pub fn prepare(
     };
     ensure_dir(&plan.home).with_context(|| format!("Couldn't create {}", plan.home.display()))?;
     let mut links = Links::load(state, &profile.id);
-    for &name in profile.kind.shareable() {
-        let item = if !wants(profile, name) {
-            LinkState::Off
-        } else if name == MCP {
-            let from = plan.source.claude_json(state, user_home);
-            if copy_mcp(&from, &profile.claude_json(state, user_home))? {
-                LinkState::Linked
+    // Links, then their record, then the MCP copy: a failure part way never loses the record of a link mine made.
+    let linked = (|| -> Result<()> {
+        for &name in profile.kind.shareable() {
+            let item = if !wants(profile, name) {
+                LinkState::Off
+            } else if name == MCP {
+                // Copied below. It is last on the kind's list, so the report keeps the list's order.
+                continue;
             } else {
-                LinkState::NoSource
-            }
-        } else {
-            let (dest, from) = (plan.home.join(name), plan.source_home.join(name));
-            let item = match probe(&dest, &from, links.has(name))? {
-                Some(item) => item,
-                None if !from.exists() => LinkState::NoSource,
-                None => {
-                    symlink(&from, &dest).with_context(|| {
-                        format!("Couldn't link {} to {}", dest.display(), from.display())
-                    })?;
-                    LinkState::Linked
+                let (dest, from) = (plan.home.join(name), plan.source_home.join(name));
+                let item = match probe(&dest, &from, links.has(name))? {
+                    Some(item) => item,
+                    None if !from.exists() => LinkState::NoSource,
+                    None => {
+                        link(&from, &dest)?;
+                        LinkState::Linked
+                    }
+                };
+                match item {
+                    LinkState::Linked => links.add(name),
+                    // A split item stays recorded, so it keeps showing as split. Anything else isn't ours.
+                    LinkState::Split => {}
+                    _ => links.remove(name),
                 }
+                item
             };
-            match item {
-                LinkState::Linked => links.add(name),
-                // A split item stays recorded, so it keeps showing as split. Anything else isn't ours.
-                LinkState::Split => {}
-                _ => links.remove(name),
-            }
-            item
-        };
-        report.items.push((name.to_string(), item));
-    }
+            report.items.push((name.to_string(), item));
+        }
+        Ok(())
+    })();
     links.save(state, profile.kind)?;
+    linked?;
+    if profile.kind.shareable().contains(&MCP) && wants(profile, MCP) {
+        let from = plan.source.claude_json(state, user_home);
+        let item = if copy_mcp(&from, &profile.claude_json(state, user_home))? {
+            LinkState::Linked
+        } else {
+            LinkState::NoSource
+        };
+        report.items.push((MCP.to_string(), item));
+    }
     if profile.kind == ProfileKind::Claude {
         report.warnings = auth_warnings(&plan.home.join("settings.json"));
     }
@@ -206,13 +204,28 @@ pub fn relink(
             Some(_) => move_aside(&dest)?,
             None => {}
         }
-        symlink(&from, &dest)
-            .with_context(|| format!("Couldn't link {} to {}", dest.display(), from.display()))?;
+        link(&from, &dest)?;
         links.add(name);
         done.push(name.to_string());
     }
     links.save(state, profile.kind)?;
     Ok(done)
+}
+
+/// Links `dest` to `from`. Another `prepare` of the same profile (two sessions starting at once) may have made that link a
+/// moment ago: finding it counts as done. Anything else already at `dest` is an error.
+fn link(from: &Path, dest: &Path) -> Result<()> {
+    match symlink(from, dest) {
+        Err(e)
+            if e.kind() == io::ErrorKind::AlreadyExists
+                && matches!(probe(dest, from, true), Ok(Some(LinkState::Linked))) =>
+        {
+            Ok(())
+        }
+        made => {
+            made.with_context(|| format!("Couldn't link {} to {}", dest.display(), from.display()))
+        }
+    }
 }
 
 /// What is at `dest`, without changing anything. `None`: nothing there. `from` is the default profile's item, `recorded`
@@ -413,7 +426,7 @@ pub fn auth_warnings(settings_json: &Path) -> Vec<String> {
             .to_string()
     });
     let env = match settings.get("env") {
-        Some(Value::Object(env)) => CLAUDE_BYPASS_ENV
+        Some(Value::Object(env)) => session::bypass_vars(Kind::Claude)
             .iter()
             .filter(|key| env.contains_key(**key))
             .map(|key| {
@@ -1048,5 +1061,39 @@ mod tests {
         fs::remove_file(env.team().join("settings.json")).unwrap();
         write(env.team().join("settings.json"), "{}");
         assert!(env.prepare("team").warnings.is_empty());
+    }
+
+    #[test]
+    fn link_made_by_a_concurrent_prepare_counts_as_linked() {
+        // Two launches of one profile can prepare at the same time: the one that links second finds the other's link.
+        let env = Env::seeded("");
+        let (from, dest) = (env.src().join("skills"), env.team().join("skills"));
+        fs::create_dir_all(env.team()).unwrap();
+        symlink(&from, &dest).unwrap();
+        link(&from, &dest).unwrap();
+        assert!(is_link_to(&dest, &from));
+        // Something else already there is still an error.
+        let other = env.team().join("commands");
+        symlink(env.src().join("agents"), &other).unwrap();
+        assert!(link(&env.src().join("commands"), &other).is_err());
+        assert!(is_link_to(&other, &env.src().join("agents")));
+    }
+
+    #[test]
+    fn link_records_survive_an_mcp_error() {
+        // The MCP copy fails on a profile `.claude.json` that isn't JSON. The links made before it stay recorded.
+        let env = Env::seeded("");
+        write(
+            env.home.join(".claude.json"),
+            r#"{"mcpServers":{"a":{"command":"x"}}}"#,
+        );
+        write(env.team().join(".claude.json"), "{not json");
+        let team = env.profile("team");
+        assert!(prepare(team, &env.profiles, &env.state, &env.home).is_err());
+        assert!(is_link_to(
+            &env.team().join("skills"),
+            &env.src().join("skills")
+        ));
+        assert_eq!(env.links("team"), FILES_AND_DIRS);
     }
 }

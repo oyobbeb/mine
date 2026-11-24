@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
 
+use crate::profiles::ProfileInfo;
 use crate::project::project_key;
 use crate::session::{Kind, NewSession, SessionInfo, SessionState, validate_name};
 
@@ -149,20 +150,22 @@ pub fn order(groups: &[Group]) -> Vec<usize> {
         .collect()
 }
 
-/// Format of the `⌃a c` input.
-pub const NEW_USAGE: &str = "<claude-a|claude-b|codex|shell> <name> [model]";
+/// Format of the typed new-session input (the launcher's `n`).
+pub const NEW_USAGE: &str = "<profile|shell> <name> [model]";
 
-/// Turns `"<claude-a|claude-b|codex|shell> <name> [model]"` into a new session spec.
-pub fn parse_new(input: &str, project: &Path) -> Result<NewSession> {
+/// Turns `"<profile|shell> <name> [model]"` into a new session spec. The kind comes from the profile; `profiles` is the list to
+/// pick from, and the daemon checks the id again when it starts the session.
+pub fn parse_new(input: &str, project: &Path, profiles: &[ProfileInfo]) -> Result<NewSession> {
     let tokens: Vec<&str> = input.split_whitespace().collect();
     let Some(&first) = tokens.first() else {
         bail!("Usage: {NEW_USAGE}");
     };
     let (kind, account) = match first {
-        "claude-a" | "claude-b" => (Kind::Claude, Some(first.to_string())),
-        "codex" => (Kind::Codex, Some(first.to_string())),
         "shell" => (Kind::Shell, None),
-        _ => bail!("Unknown kind: {first} (usage: {NEW_USAGE})"),
+        id => match profiles.iter().find(|p| p.id == id) {
+            Some(p) => (p.kind.into(), Some(id.to_string())),
+            None => bail!("Unknown profile: {id} (usage: {NEW_USAGE})"),
+        },
     };
     if tokens.len() > 3 {
         bail!("Too many arguments (usage: {NEW_USAGE})");
@@ -187,6 +190,7 @@ pub fn parse_new(input: &str, project: &Path) -> Result<NewSession> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::profiles::ProfileKind;
     use crate::session::{Kind, Meta, Restore, SessionState::*};
 
     fn s(project: &str, name: &str, state: SessionState) -> SessionInfo {
@@ -339,9 +343,55 @@ mod tests {
         assert_eq!(order(&expand(g, &[Idle, Working], Some(2))), vec![0, 2]);
     }
 
+    fn info(id: &str, kind: ProfileKind) -> ProfileInfo {
+        ProfileInfo {
+            id: id.into(),
+            kind,
+            label: id.into(),
+            color: "#e5c07b".into(),
+            chip: "X".into(),
+            default: false,
+            logged_in: true,
+        }
+    }
+
+    fn profiles() -> Vec<ProfileInfo> {
+        vec![
+            info("claude-a", ProfileKind::Claude),
+            info("claude-b", ProfileKind::Claude),
+            info("team", ProfileKind::Claude),
+            info("codex", ProfileKind::Codex),
+        ]
+    }
+
+    fn parse(text: &str) -> Result<NewSession> {
+        parse_new(text, Path::new("/p"), &profiles())
+    }
+
+    #[test]
+    fn parse_new_uses_profiles() {
+        let n = parse("team t1 opus").unwrap();
+        assert_eq!(
+            (
+                n.kind,
+                n.account.as_deref(),
+                n.name.as_str(),
+                n.model.as_deref()
+            ),
+            (Kind::Claude, Some("team"), "t1", Some("opus"))
+        );
+        let s = parse("shell dev").unwrap();
+        assert_eq!((s.kind, s.account), (Kind::Shell, None));
+        let e = parse("nope x").unwrap_err();
+        assert!(e.to_string().contains("Unknown profile: nope"), "{e}");
+        // Only the given profiles exist: without a list, only shell can be started.
+        assert!(parse_new("claude-a x", Path::new("/p"), &[]).is_err());
+        assert!(parse_new("shell x", Path::new("/p"), &[]).is_ok());
+    }
+
     #[test]
     fn parse_new_variants() {
-        let n = parse_new("claude-b rust-core opus", Path::new("/p")).unwrap();
+        let n = parse("claude-b rust-core opus").unwrap();
         assert_eq!(
             (
                 n.kind,
@@ -352,31 +402,28 @@ mod tests {
             (Kind::Claude, Some("claude-b"), "rust-core", Some("opus"))
         );
         assert_eq!(n.project, PathBuf::from("/p"));
-        assert_eq!(
-            parse_new("shell dev", Path::new("/p")).unwrap().account,
-            None
-        );
-        let a = parse_new("  claude-a   x  ", Path::new("/p")).unwrap();
+        assert_eq!(parse("shell dev").unwrap().account, None);
+        let a = parse("  claude-a   x  ").unwrap();
         assert_eq!(
             (a.kind, a.account.as_deref(), a.model),
             (Kind::Claude, Some("claude-a"), None)
         );
-        let c = parse_new("codex x gpt-5", Path::new("/p")).unwrap();
+        let c = parse("codex x gpt-5").unwrap();
         assert_eq!(
             (c.kind, c.account.as_deref(), c.model.as_deref()),
             (Kind::Codex, Some("codex"), Some("gpt-5"))
         );
-        assert!(parse_new("gpt x", Path::new("/p")).is_err());
-        assert!(parse_new("codex", Path::new("/p")).is_err());
-        assert!(parse_new("", Path::new("/p")).is_err());
-        assert!(parse_new("shell dev opus", Path::new("/p")).is_err());
-        assert!(parse_new("claude-a x opus extra", Path::new("/p")).is_err());
+        assert!(parse("gpt x").is_err());
+        assert!(parse("codex").is_err());
+        assert!(parse("").is_err());
+        assert!(parse("shell dev opus").is_err());
+        assert!(parse("claude-a x opus extra").is_err());
     }
 
     #[test]
     fn parse_new_rejects_invalid_name() {
         for bad in ["shell -x", "claude-a a/b", "codex 한글"] {
-            let e = parse_new(bad, Path::new("/p")).unwrap_err();
+            let e = parse(bad).unwrap_err();
             assert!(e.to_string().contains("session name"), "{bad}: {e}");
         }
     }

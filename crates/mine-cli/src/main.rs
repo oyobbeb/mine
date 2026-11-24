@@ -5,8 +5,9 @@ use std::process::{Command, Stdio};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use mine_core::conn::Conn;
+use mine_core::profiles::Profiles;
 use mine_core::proto::{FromDaemon, ToDaemon};
-use mine_core::session::{Kind, NewSession, SessionInfo, SessionState, session_id};
+use mine_core::session::{self, Kind, NewSession, SessionInfo, SessionState, session_id};
 use mine_core::{hooks, paths, project};
 
 mod client;
@@ -32,19 +33,7 @@ enum Cmd {
     /// Print the session list. Each line is tab-separated: `symbol project-folder name account state waiting-text`.
     Ls,
     /// Create a new session.
-    New {
-        /// Session name, unique within the project.
-        name: String,
-        /// Session kind.
-        #[arg(long, default_value = "shell", value_parser = parse_kind)]
-        kind: Kind,
-        /// Account.
-        #[arg(long, value_parser = ["claude-a", "claude-b", "codex"])]
-        account: Option<String>,
-        /// Model.
-        #[arg(long)]
-        model: Option<String>,
-    },
+    New(NewArgs),
     /// Close a session. The session directory and its history are kept.
     Kill {
         /// Session name.
@@ -77,6 +66,39 @@ enum Cmd {
         /// Session directory (`<state directory>/sessions/<id>`).
         dir: PathBuf,
     },
+}
+
+#[derive(clap::Args)]
+struct NewArgs {
+    /// Session name, unique within the project.
+    name: String,
+    /// Session kind. Defaults to the profile's kind, or shell without a profile.
+    #[arg(long, value_parser = parse_kind)]
+    kind: Option<Kind>,
+    /// Profile id (`claude-a`, `codex`, or one from `[profiles]` in config.toml). `--account` is the old name.
+    #[arg(long, alias = "account")]
+    profile: Option<String>,
+    /// Model.
+    #[arg(long)]
+    model: Option<String>,
+}
+
+impl NewArgs {
+    /// The spec to send. The profile is checked here so a typo fails before anything starts; the daemon checks it again.
+    fn spec(self, project: PathBuf, profiles: &Profiles) -> Result<NewSession> {
+        let profile_kind = self.profile.as_deref().and_then(|id| profiles.get(id));
+        let kind = (self.kind)
+            .or(profile_kind.map(|p| p.kind.into()))
+            .unwrap_or(Kind::Shell);
+        session::profile(kind, self.profile.as_deref(), profiles)?;
+        Ok(NewSession {
+            project,
+            name: self.name,
+            kind,
+            account: self.profile,
+            model: self.model,
+        })
+    }
 }
 
 fn parse_kind(s: &str) -> Result<Kind, String> {
@@ -181,21 +203,14 @@ fn main() -> Result<()> {
                 println!("{}", ls_line(&info));
             }
         }
-        Some(Cmd::New {
-            name,
-            kind,
-            account,
-            model,
-        }) => {
+        Some(Cmd::New(new)) => {
             let state = paths::State::from_env()?;
             let project = project_root(cli.project, &state)?;
-            let spec = NewSession {
-                project,
-                name,
-                kind,
-                account,
-                model,
-            };
+            let (profiles, warnings) = Profiles::load(&state);
+            for warning in warnings {
+                eprintln!("Warning: {warning}");
+            }
+            let spec = new.spec(project, &profiles)?;
             request_sessions(&state, &ToDaemon::New { spec })?;
         }
         Some(Cmd::Kill { name }) => {
@@ -340,5 +355,43 @@ mod tests {
         );
         fs::create_dir_all(&bundles[0]).unwrap();
         assert_eq!(launch(Some(on_path)), AppLaunch::Open(bundles[0].clone()));
+    }
+
+    #[test]
+    fn new_profile_and_account_give_the_same_spec() {
+        let state = paths::State {
+            root: PathBuf::from("/s"),
+        };
+        let (profiles, _) = Profiles::parse(Some("[profiles.team]\nkind = \"claude\"\n"), &state);
+        let spec = |args: &[&str]| -> Result<NewSession> {
+            let Some(Cmd::New(new)) = Cli::try_parse_from(args).unwrap().cmd else {
+                panic!("not new: {args:?}");
+            };
+            new.spec(PathBuf::from("/p"), &profiles)
+        };
+        let team = spec(&["mine", "new", "x", "--profile", "team"]).unwrap();
+        assert_eq!(
+            spec(&["mine", "new", "x", "--account", "team"]).unwrap(),
+            team
+        );
+        assert_eq!(
+            (team.kind, team.account.as_deref(), team.name.as_str()),
+            (Kind::Claude, Some("team"), "x")
+        );
+        // `--kind` still works, and has to agree with the profile.
+        let old = spec(&["mine", "new", "x", "--kind", "claude", "--account", "team"]);
+        assert_eq!(old.unwrap(), team);
+        let err = |args: &[&str]| spec(args).unwrap_err().to_string();
+        assert_eq!(
+            err(&["mine", "new", "x", "--kind", "codex", "--profile", "team"]),
+            "Profile team is a claude profile"
+        );
+        assert_eq!(
+            err(&["mine", "new", "x", "--profile", "nope"]),
+            "Unknown profile: nope"
+        );
+        // No profile: a shell, as before.
+        let shell = spec(&["mine", "new", "x"]).unwrap();
+        assert_eq!((shell.kind, shell.account), (Kind::Shell, None));
     }
 }

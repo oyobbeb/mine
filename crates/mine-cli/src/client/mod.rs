@@ -814,7 +814,7 @@ impl App {
 
     /// Interprets the input of `n` in the launcher and sends `New`. When the new session appears in the list, it attaches (`on_sessions`).
     fn submit_new(&mut self, text: &str) {
-        match view::parse_new(text, self.m.project()) {
+        match view::parse_new(text, self.m.project(), self.m.labels.profiles()) {
             Ok(spec) => self.create(spec),
             Err(e) => self.say(&format!("{e:#}")),
         }
@@ -2086,7 +2086,8 @@ mod tests {
         assert!(sent(&mut rx).is_empty());
         app.on_input(b"\x1b");
         assert!(app.m.prompt.is_none() && app.m.launcher);
-        // Creates one by typing the name and model.
+        // Creates one by typing the profile, name and model.
+        app.m.labels = ui::labels_from("[profiles.claude-b]\nkind = \"claude\"\n");
         app.on_input(b"n");
         app.on_input(b"claude-b mine opus\r");
         let mut spec = new_session(Kind::Claude, Some("claude-b"), "mine");
