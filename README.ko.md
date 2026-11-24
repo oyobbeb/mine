@@ -27,8 +27,9 @@ mine은 세션을 주변의 모든 것보다 오래 사는 것으로 다뤄요. 
 
 - **창보다 오래 사는 세션.** 세션마다 따로 뜨는 보관 프로세스가 PTY를 쥐어요. 앱을 닫거나 SSH가 끊기거나 데몬을 다시 띄워도 `claude`, `codex`, 개발 서버는 계속 돌아요. 다시 붙으면 화면이 돌아와요.
 - **끝난 대화 이어 가기.** 프로세스가 끝난 Claude·Codex 세션은 목록에 *Exited*로 남아요. 고르면 같은 대화가 다시 시작돼요.
-- **Claude 계정 두 개, 목록 하나.** 따로 로그인한 Claude 계정 두 개의 세션을 나란히 돌려요. 계정은 로그인 이름이나 직접 정한 별칭으로 보여요.
+- **로그인은 원하는 만큼, 목록은 하나.** 프로필로 따로 로그인한 Claude·Codex 계정의 세션을 몇 개든 나란히 돌려요. 스킬, 명령, 설정, MCP 서버는 함께 쓰고, 계정은 로그인 이름이나 직접 정한 별칭으로 보여요.
 - **나를 기다리는 일부터.** 모든 프로젝트의 세션을 *Needs approval → Working → Done → Idle* 순서로 묶어요. 상태는 순정 CLI 훅으로 정해요.
+- **목록에서 바로 승인.** Claude의 권한 요청을 세션을 열지 않고 앱의 작업 목록이나 터미널 UI의 승인 패널에서 허용하거나 거절해요.
 - **키 하나로 시작.** 시작 화면에 모든 프로필과 셸이 보이고, 키 하나로 어느 것이든 세션을 만들어요.
 - **순정 CLI 그대로.** 세션은 순정 Claude Code와 Codex를 띄워요. 키보드 모드(kitty 키보드, modifyOtherKeys)도 넘겨서 Shift+Enter가 그대로 동작해요.
 - **데스크톱 앱과 터미널 UI.** 평소에는 GPUI 데스크톱 앱, SSH에서는 터미널 UI를 써요. 둘 다 같은 데몬에 붙어요.
@@ -324,6 +325,7 @@ flowchart LR
 |---|---|---|
 | 1 | 데몬, 보관 프로세스, 터미널 UI, 상태별 목록, 복사 모드 | ✅ 완료 |
 | D1 | 데스크톱 앱 뼈대: 작업 목록, 세션 탭, 시작 화면, 입력·IME·마우스·찾기를 갖춘 터미널 칸, 알림, `.app` 묶음 | ✅ 완료 |
+| D1.5 | 프로필: Claude·Codex 로그인을 원하는 만큼, 설정은 함께; 붙들어 둔 권한 요청을 앱과 터미널 UI에서 허용·거절 | ✅ 완료 |
 | D2 | Claude·Codex 채팅 화면, 승인 버튼, 서브에이전트 카드 | 계획 |
 | D3 | Changes 칸: 미커밋 변경 트리와 커밋 목록 | 계획 |
 | 2 | 계정 한도와, 작업을 맥락과 함께 다른 계정으로 넘기는 키 하나 | 계획 |
@@ -334,7 +336,7 @@ flowchart LR
 | 7 | 헤드리스 브라우저 칸 | 계획 |
 | 8 | Homebrew 설치 | 계획 |
 
-설계 문서: [멀티플렉서 설계](docs/superpowers/specs/2026-11-20-mine-multiplexer-design.md) · [데스크톱 앱 설계](docs/superpowers/specs/2026-11-23-mine-desktop-design.md) (영문).
+설계 문서: [멀티플렉서 설계](docs/superpowers/specs/2026-11-20-mine-multiplexer-design.md) · [데스크톱 앱 설계](docs/superpowers/specs/2026-11-23-mine-desktop-design.md) · [프로필 설계](docs/superpowers/specs/2026-11-24-mine-profiles-design.md) (영문).
 
 ## 개발
 

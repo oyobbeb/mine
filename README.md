@@ -27,8 +27,9 @@ mine treats a session as something that outlives everything around it. A small d
 
 - **Sessions outlive their window.** Each session's PTY is held by its own holder process. Close the app, lose SSH, or restart the daemon, and `claude`, `codex`, and your dev server keep running. Reattach and the screen comes back.
 - **Exited conversations resume.** A Claude or Codex session whose process ended stays in the list as *Exited*. Select it and the same conversation starts again.
-- **Two Claude accounts, one list.** Run sessions on two separately logged-in Claude accounts side by side. Each shows as your login name or a label you choose.
+- **Any number of logins, one list.** Profiles run Claude and Codex sessions on as many separately logged-in accounts as you like, side by side. They share your skills, commands, settings and MCP servers, and each shows as your login name or a label you choose.
 - **See what needs you.** Sessions from every project are grouped as *Needs approval → Working → Done → Idle*, driven by the stock CLI hooks.
+- **Answer approvals from the list.** Allow or deny a Claude permission request from the app's task list or the terminal UI's approvals panel, without opening the session.
 - **One key to start.** The launcher lists every profile and a shell, and starts any of them with a single key.
 - **The real CLIs.** Sessions run stock Claude Code and Codex. Keyboard modes (kitty keyboard, modifyOtherKeys) pass through, so Shift+Enter just works.
 - **Desktop app and terminal UI.** A GPUI desktop app for daily use and a terminal UI for SSH, both attached to the same daemon.
@@ -324,6 +325,7 @@ flowchart LR
 |---|---|---|
 | 1 | Daemon, holders, terminal UI, status-grouped list, copy mode | ✅ Done |
 | D1 | Desktop app shell: task list, session tabs, launcher, terminal pane with input, IME, mouse and find, notifications, `.app` bundle | ✅ Done |
+| D1.5 | Profiles: any number of Claude and Codex logins with shared settings; Allow and Deny for held permission requests in the app and terminal UI | ✅ Done |
 | D2 | Chat view for Claude and Codex with approval buttons and subagent cards | Planned |
 | D3 | Changes panel: uncommitted tree and commit list | Planned |
 | 2 | Usage limits and one-key handoff of a task to another account, with context | Planned |
@@ -334,7 +336,7 @@ flowchart LR
 | 7 | Headless browser pane | Planned |
 | 8 | Homebrew install | Planned |
 
-Design docs: [multiplexer design](docs/superpowers/specs/2026-11-20-mine-multiplexer-design.md) · [desktop app design](docs/superpowers/specs/2026-11-23-mine-desktop-design.md).
+Design docs: [multiplexer design](docs/superpowers/specs/2026-11-20-mine-multiplexer-design.md) · [desktop app design](docs/superpowers/specs/2026-11-23-mine-desktop-design.md) · [profiles design](docs/superpowers/specs/2026-11-24-mine-profiles-design.md).
 
 ## Development
 
