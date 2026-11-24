@@ -261,16 +261,14 @@ pub fn link_at(screen: &Screen, col: u16, row: u16) -> Option<String> {
     grid[point].hyperlink().map(|link| link.uri().to_string())
 }
 
-/// May the pressed link be opened? Only web, mail and file addresses are opened. The address isn't shown beforehand, so
-/// this keeps session output from launching anything through an address of another app (`x-…://`) that it planted.
+/// May the pressed link be opened? Only web and mail addresses are opened (Ruling D-R10). The address isn't shown
+/// beforehand, so this keeps session output from launching anything it planted: an address of another app (`x-…://`),
+/// or a `file:` address, which macOS opens with that file's app (an `.app`, a `.command` script).
 pub fn openable(url: &str) -> bool {
     let scheme = url
         .split_once(':')
         .map(|(scheme, _)| scheme.to_ascii_lowercase());
-    matches!(
-        scheme.as_deref(),
-        Some("http" | "https" | "mailto" | "file")
-    )
+    matches!(scheme.as_deref(), Some("http" | "https" | "mailto"))
 }
 
 #[cfg(test)]
@@ -458,11 +456,13 @@ mod tests {
     }
 
     #[test]
-    fn only_web_mail_and_file_links_open() {
+    fn only_web_and_mail_links_open() {
         assert!(openable("https://example.com"));
         assert!(openable("HTTP://example.com"));
         assert!(openable("mailto:a@b.c"));
-        assert!(openable("file:///tmp/a.txt"));
+        // A file address from session output could launch an app or a .command script (Ruling D-R10).
+        assert!(!openable("file:///tmp/a.txt"));
+        assert!(!openable("FILE:///Applications/Calculator.app"));
         assert!(!openable("x-apple.systempreferences:com.apple"));
         assert!(!openable("javascript:alert(1)"));
         assert!(!openable(""));

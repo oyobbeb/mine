@@ -36,6 +36,8 @@ pub const CHIP_FG: u32 = 0x1e2128;
 pub const TERM_FG: u32 = 0xd0d3da;
 pub const TERM_BG: u32 = 0x1e2128;
 pub const TERM_CURSOR: u32 = 0xd0d3da;
+/// The background of selected terminal text and of the find box's matches. The text keeps its own color.
+pub const TERM_SELECTION: u32 = 0x2f323a;
 
 /// ANSI 0–15.
 pub const ANSI: [u32; 16] = [

@@ -14,6 +14,7 @@ use mine_core::screen::Screen;
 use mine_core::session::{NewSession, SessionInfo, SessionState};
 use mine_core::view::{self, Group, STATES};
 
+use crate::terminal::mouse::Mouse;
 use crate::theme;
 
 /// What the model asks the outside to do.
@@ -100,6 +101,9 @@ pub struct Model {
     /// The attached session's screen. On `Snapshot` it is rebuilt at the pane size and fed; `Output` is fed on top. When the
     /// attached session changes, it is dropped and a new `Snapshot` is awaited.
     pub screen: Option<Screen>,
+    /// The terminal pane's selection and mouse press. It is screen cells, so it is dropped when the cells under it
+    /// change: the view scrolls, the pane is resized, a snapshot replaces the screen, or another session is attached.
+    pub mouse: Mouse,
     /// Whether `Attach` for the attached session was sent on this connection. `false` while deferred because the pane size is unknown or there is no connection.
     attach_sent: bool,
     /// The session to attach to was chosen from the first list received.
@@ -128,6 +132,7 @@ impl Model {
             message: None,
             grid: None,
             screen: None,
+            mouse: Mouse::default(),
             attach_sent: false,
             started: false,
             labels: Labels::default(),
@@ -193,6 +198,7 @@ impl Model {
                     screen.feed(&data);
                     screen.take_replies();
                     self.screen = Some(screen);
+                    self.mouse.clear();
                 }
                 Vec::new()
             }
@@ -306,6 +312,8 @@ impl Model {
     fn detach(&mut self) {
         self.attached = None;
         self.screen = None;
+        // A press the old session holds is dropped too: its release must not go to the next session.
+        self.mouse = Mouse::default();
         self.attach_sent = false;
     }
 
@@ -537,6 +545,7 @@ impl Model {
             return Vec::new();
         }
         self.grid = Some((cols, rows));
+        self.mouse.clear();
         if let Some(screen) = &mut self.screen {
             screen.resize(cols, rows);
         }
@@ -552,14 +561,18 @@ impl Model {
     }
 
     /// Scrolls only the screen copy by `lines` lines (positive is toward the past). Nothing is sent to the session. Returns
-    /// `true` if the visible position changed (a redraw is needed).
+    /// `true` if the visible position changed (a redraw is needed); that also drops the selection.
     pub fn scroll(&mut self, lines: i32) -> bool {
         let Some(screen) = &mut self.screen else {
             return false;
         };
         let before = screen.term().grid().display_offset();
         screen.scroll(lines);
-        screen.term().grid().display_offset() != before
+        let moved = screen.term().grid().display_offset() != before;
+        if moved {
+            self.mouse.clear();
+        }
+        moved
     }
 
     /// Sends key input and paste to the attached session. A scrolled-back screen is returned to the bottom. With no
@@ -568,10 +581,11 @@ impl Model {
         let Some(id) = self.attached.clone().filter(|_| self.connected) else {
             return Vec::new();
         };
-        if let Some(screen) = &mut self.screen {
-            let scrolled = screen.term().grid().display_offset();
-            screen.scroll(-(scrolled as i32));
-        }
+        let scrolled = self
+            .screen
+            .as_ref()
+            .map_or(0, |s| s.term().grid().display_offset());
+        self.scroll(-(scrolled as i32));
         vec![Effect::Send(ToDaemon::Input { id, data })]
     }
 
@@ -688,7 +702,7 @@ pub fn status_text(s: &SessionInfo) -> (&str, bool) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use alacritty_terminal::grid::Dimensions;
     use mine_core::session::{Kind, Meta, Restore};
@@ -783,21 +797,21 @@ mod tests {
     }
 
     /// A model that knows the pane size is attached to session `t1` of `/p`.
-    fn attached_t1() -> Model {
+    pub(crate) fn attached_t1() -> Model {
         let mut m = connected("/p");
         listed(&mut m, vec![s("/p", "t1", SessionState::Idle)]);
         assert_eq!(m.attach("k-t1"), [attach_msg("k-t1")]);
         m
     }
 
-    fn output(id: &str, data: &[u8]) -> LinkEvent {
+    pub(crate) fn output(id: &str, data: &[u8]) -> LinkEvent {
         LinkEvent::Msg(FromDaemon::Output {
             id: id.into(),
             data: data.to_vec(),
         })
     }
 
-    fn snapshot(id: &str, data: Vec<u8>) -> LinkEvent {
+    pub(crate) fn snapshot(id: &str, data: Vec<u8>) -> LinkEvent {
         LinkEvent::Msg(FromDaemon::Snapshot {
             id: id.into(),
             data,

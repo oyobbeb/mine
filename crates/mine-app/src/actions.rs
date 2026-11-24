@@ -14,7 +14,11 @@ actions!(
         PrevProject,
         NextProject,
         ToggleSidebar,
-        Paste
+        Paste,
+        Copy,
+        Find,
+        FindPrev,
+        CloseFind
     ]
 );
 
@@ -30,6 +34,7 @@ pub const CONTEXT: &str = "Workspace";
 pub fn bindings() -> Vec<KeyBinding> {
     let ws = Some(CONTEXT);
     let term = Some(crate::terminal::CONTEXT);
+    let find = Some(crate::terminal::FIND_CONTEXT);
     let mut keys = vec![
         KeyBinding::new("cmd-q", Quit, None),
         KeyBinding::new("cmd-n", NewTask, ws),
@@ -41,6 +46,12 @@ pub fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-}", NextProject, ws),
         KeyBinding::new("cmd-b", ToggleSidebar, ws),
         KeyBinding::new("cmd-v", Paste, term),
+        KeyBinding::new("cmd-c", Copy, term),
+        KeyBinding::new("cmd-f", Find, term),
+        // In the find box: Shift+Enter steps back (Enter is the input's own `PressEnter`), Esc closes it. The input
+        // binds Esc too, deeper, and a single-line input passes it on, so this one runs next.
+        KeyBinding::new("shift-enter", FindPrev, find),
+        KeyBinding::new("escape", CloseFind, find),
         // gpui-component's Root binds Tab and Shift+Tab to move focus, and bindings run before the pane's key-down
         // listener. NoAction in the deeper Terminal context masks them, so the session gets both keys.
         KeyBinding::new("tab", NoAction, term),
@@ -110,6 +121,8 @@ mod tests {
             ("cmd-}", "mine::NextProject"),
             ("cmd-b", "mine::ToggleSidebar"),
             ("cmd-v", "mine::Paste"),
+            ("cmd-c", "mine::Copy"),
+            ("cmd-f", "mine::Find"),
         ] {
             assert!(
                 got.contains(&(keys.to_string(), action.to_string())),
@@ -126,8 +139,41 @@ mod tests {
                 .unwrap_or_else(|| panic!("{keys}"));
             assert!(b.action().partial_eq(&SelectTab(n - 1)), "{keys}");
         }
-        // 9 shortcuts, ⌘1–⌘9, and the two Tab masks.
-        assert_eq!(all.len(), 9 + 9 + 2);
+        // 11 shortcuts, ⌘1–⌘9, the two Tab masks, and the find box's Shift+Enter and Esc.
+        assert_eq!(all.len(), 11 + 9 + 2 + 2);
+    }
+
+    // Stands in for gpui-component's Input `Escape` (private), bound the same way: `escape` in "Input".
+    actions!(test_input, [InputEscape]);
+
+    #[test]
+    fn find_box_keys_reach_the_find_actions() {
+        let mut keymap = Keymap::default();
+        keymap.add_bindings([KeyBinding::new("escape", InputEscape, Some("Input"))]);
+        keymap.add_bindings(bindings());
+        let stack = |names: &[&str]| -> Vec<KeyContext> {
+            names
+                .iter()
+                .map(|n| KeyContext::parse(n).unwrap())
+                .collect()
+        };
+        let input = stack(&["Root", "Workspace", crate::terminal::FIND_CONTEXT, "Input"]);
+        let hits = |key: &str, at: &[KeyContext]| {
+            let (hits, _) = keymap.bindings_for_input(&[Keystroke::parse(key).unwrap()], at);
+            hits.iter()
+                .map(|b| b.action().name().to_string())
+                .collect::<Vec<_>>()
+        };
+        // The input's own Escape comes first; a single-line input passes it on, and CloseFind is next in line.
+        assert_eq!(
+            hits("escape", &input),
+            ["test_input::InputEscape", "mine::CloseFind"]
+        );
+        assert_eq!(hits("shift-enter", &input), ["mine::FindPrev"]);
+        // In the pane itself, Esc and Shift+Enter go to the session.
+        let pane = stack(&["Root", "Workspace", crate::terminal::CONTEXT]);
+        assert!(hits("escape", &pane).is_empty());
+        assert!(hits("shift-enter", &pane).is_empty());
     }
 
     #[test]
