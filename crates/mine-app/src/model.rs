@@ -55,6 +55,9 @@ const CREATING: &str = "Creating…";
 /// The text shown when you pick in the launcher with no connection. The link thread drops messages sent before connecting.
 const NOT_CONNECTED: &str =
     "Can't create a session while disconnected from the daemon. Pick again once it reconnects.";
+/// The text shown when the close confirmation is answered with no connection. The session is kept.
+const CLOSE_OFFLINE: &str =
+    "Can't close the session while disconnected from the daemon. Try again once it reconnects.";
 
 /// Names built from a label config (`config.toml` contents). Used by screen-string tests. There is no home, so codex is the only automatic name.
 #[cfg(test)]
@@ -106,6 +109,9 @@ pub struct Model {
     pub mouse: Mouse,
     /// Whether `Attach` for the attached session was sent on this connection. `false` while deferred because the pane size is unknown or there is no connection.
     attach_sent: bool,
+    /// The first list on this connection arrived. `Attach` waits for it: the attached session may have ended while
+    /// disconnected, and an `Attach` for it would only bring back a "No such session" error.
+    listed: bool,
     /// The session to attach to was chosen from the first list received.
     started: bool,
     /// Names used when showing account ids as text. Read when the app starts, and again when the window is reactivated ([`Model::reload_labels`]).
@@ -136,6 +142,7 @@ impl Model {
             screen: None,
             mouse: Mouse::default(),
             attach_sent: false,
+            listed: false,
             started: false,
             labels: Labels::default(),
             focused: false,
@@ -167,15 +174,16 @@ impl Model {
 
     /// Takes the daemon link's events.
     ///
-    /// On every connect (including reconnects) it subscribes to the list (R18), reports the terminal colors, and
-    /// reattaches to the session that was attached. The link already exchanged `Hello`. If the connection drops, the
-    /// session list and screen stay as they are; when it reconnects, they are replaced once a new list and `Snapshot`
-    /// arrive.
+    /// On every connect (including reconnects) it subscribes to the list (R18), reports the terminal colors, and once
+    /// the first list shows the attached session still exists, reattaches to it. The link already exchanged `Hello`.
+    /// If the connection drops, the session list and screen stay as they are; when it reconnects, they are replaced
+    /// once a new list and `Snapshot` arrive.
     pub fn on_link(&mut self, ev: LinkEvent) -> Vec<Effect> {
         match ev {
             LinkEvent::Connected => {
                 self.connected = true;
                 self.offline = None;
+                self.listed = false;
                 let mut effects = vec![
                     Effect::Send(ToDaemon::List),
                     Effect::Send(ToDaemon::Colors {
@@ -187,7 +195,6 @@ impl Model {
                 if self.focused {
                     effects.push(Effect::Send(ToDaemon::Focus { focused: true }));
                 }
-                effects.extend(self.send_attach());
                 effects
             }
             LinkEvent::Disconnected(reason) => {
@@ -204,6 +211,7 @@ impl Model {
                 // The daemon announces only when the list changed (publish). A list that didn't change is the answer to a request this app made.
                 let unchanged = sessions == self.sessions;
                 self.sessions = sessions;
+                self.listed = true;
                 self.on_sessions(unchanged)
             }
             LinkEvent::Msg(FromDaemon::Error { message }) => {
@@ -243,6 +251,7 @@ impl Model {
 
     /// Takes a new list. If a session that was being waited for appears, attaches to it. If it is the first list received or
     /// the attached session vanished, attaches to the first visible session, and if there is none, the launcher shows.
+    /// Otherwise it sends the `Attach` that waited for the first list after a reconnect.
     ///
     /// A list that didn't change, arriving with no session being waited for, is the answer to `New`. If the shell ends right
     /// away, the daemon leaves no session and answers success. Drop that wait and report it. A list that did change may have
@@ -273,7 +282,7 @@ impl Model {
             self.started = true;
             return self.attach_first();
         }
-        Vec::new()
+        self.send_attach()
     }
 
     /// Attaches to the first visible session. If there are no visible rows (the Idle group starts collapsed), it also looks into collapsed groups.
@@ -312,16 +321,18 @@ impl Model {
             .unwrap_or(&self.current_project)
     }
 
-    /// Attaches to a session. Closes the launcher and the input box. If it is already the attached session, it doesn't tell the daemon again.
+    /// Attaches to a session. Closes the launcher and the input box. If it is already the attached session, it doesn't
+    /// tell the daemon again, unless its `Attach` is still deferred.
     ///
     /// `Attach` changes the attached session's PTY to the size it carries. So it is sent only when the pane size is known.
-    /// If the pane hasn't been drawn yet, it is sent when first drawn ([`Model::set_grid`]); if there is no connection, when reattaching.
+    /// If the pane hasn't been drawn yet, it is sent when first drawn ([`Model::set_grid`]); if there is no connection,
+    /// when reattaching, after the first list.
     pub fn attach(&mut self, id: &str) -> Vec<Effect> {
         self.launcher = false;
         self.typing = false;
         self.message = None;
         if self.is_attached(id) {
-            return Vec::new();
+            return self.send_attach();
         }
         self.detach();
         self.attached = Some(id.to_string());
@@ -337,10 +348,13 @@ impl Model {
         self.attach_sent = false;
     }
 
-    /// Sends the not-yet-sent `Attach` of the attached session at the current pane size. Deferred if the pane size is unknown or there is no connection.
+    /// Sends the not-yet-sent `Attach` of the attached session at the current pane size. Deferred if the pane size is
+    /// unknown, there is no connection, or the connection's first list hasn't arrived yet.
     fn send_attach(&mut self) -> Vec<Effect> {
         match (&self.attached, self.grid) {
-            (Some(id), Some((cols, rows))) if self.connected && !self.attach_sent => {
+            (Some(id), Some((cols, rows)))
+                if self.connected && self.listed && !self.attach_sent =>
+            {
                 self.attach_sent = true;
                 vec![Effect::Send(ToDaemon::Attach {
                     id: id.clone(),
@@ -535,8 +549,13 @@ impl Model {
     }
 
     /// The answer of the close confirmation dialog. If `yes`, sends `Kill` for the session the confirmation was asked about. When it leaves the list, it attaches to another session (`on_sessions`).
+    /// With no connection the link would drop the `Kill`, so it keeps the session and says so.
     pub fn confirm_close(&mut self, yes: bool) -> Vec<Effect> {
         match self.closing.take() {
+            Some(_) if yes && !self.connected => {
+                self.message = Some(CLOSE_OFFLINE.into());
+                Vec::new()
+            }
             Some(id) if yes => vec![Effect::Send(ToDaemon::Kill { id })],
             _ => Vec::new(),
         }
@@ -880,12 +899,16 @@ pub(crate) mod tests {
         );
         // If the pane size changes while disconnected, it isn't sent but remembered.
         assert!(m.set_grid(100, 30).is_empty());
-        // On reconnect, it subscribes and reports colors, then reattaches to the same session at the current size.
+        // On reconnect, it subscribes and reports colors. Once the list shows the session is still there, it reattaches
+        // to it at the current size.
         let effects = m.on_link(LinkEvent::Connected);
-        assert_eq!(effects.len(), 3);
+        assert_eq!(effects.len(), 2);
         assert_eq!(effects[0], Effect::Send(ToDaemon::List));
         assert!(matches!(effects[1], Effect::Send(ToDaemon::Colors { .. })));
-        assert_eq!(effects[2], attach_at("k-t1", 100, 30));
+        assert_eq!(
+            listed(&mut m, vec![s("/p", "t1", SessionState::Idle)]),
+            [attach_at("k-t1", 100, 30)]
+        );
         // After that, only a changed size goes out as `Resize`.
         assert_eq!(m.set_grid(100, 32), [resize_at("k-t1", 100, 32)]);
         // With no attached session there is nothing to reattach.
@@ -908,11 +931,15 @@ pub(crate) mod tests {
         m.on_link(LinkEvent::Disconnected("disconnected".into()));
         assert!(m.input(b"x".to_vec()).is_empty());
         assert!(m.set_grid(50, 20).is_empty());
-        // `Attach` isn't sent for a session picked before connecting either; it is sent after connecting.
+        // `Attach` isn't sent for a session picked before connecting either; it is sent once connected and listed.
         let mut m = Model::new(PathBuf::from("/p"));
         assert!(m.set_grid(GRID.0, GRID.1).is_empty());
         assert!(m.attach("k-t1").is_empty());
-        assert_eq!(m.on_link(LinkEvent::Connected)[2], attach_msg("k-t1"));
+        assert_eq!(m.on_link(LinkEvent::Connected).len(), 2);
+        assert_eq!(
+            listed(&mut m, vec![s("/p", "t1", SessionState::Idle)]),
+            [attach_msg("k-t1")]
+        );
         // With no attached session there is nowhere to send input.
         let mut m = connected("/p");
         assert!(m.input(b"x".to_vec()).is_empty());
@@ -1414,6 +1441,49 @@ pub(crate) mod tests {
         assert_eq!(m.close(), Close::Launcher);
         assert!(!m.launcher_open() && m.closing.is_none());
         // When the closed session leaves the list, no sessions remain, so the launcher shows.
+        assert!(listed(&mut m, Vec::new()).is_empty());
+        assert!(m.attached.is_none() && m.launcher_open());
+    }
+
+    #[test]
+    fn close_while_disconnected_says_so_and_keeps_the_session() {
+        let mut m = attached_t1();
+        assert_eq!(m.close(), Close::Confirm("t1".into()));
+        m.on_link(LinkEvent::Disconnected("disconnected".into()));
+        // The link would drop a `Kill` sent now. Nothing is sent, the session stays, and the user is told.
+        assert!(m.confirm_close(true).is_empty());
+        assert_eq!(m.attached.as_deref(), Some("k-t1"));
+        assert_eq!(m.message.as_deref(), Some(CLOSE_OFFLINE));
+        assert!(m.closing.is_none());
+        // Once it reconnects, closing works again.
+        m.on_link(LinkEvent::Connected);
+        assert_eq!(m.close(), Close::Confirm("t1".into()));
+        assert_eq!(
+            m.confirm_close(true),
+            [Effect::Send(ToDaemon::Kill { id: "k-t1".into() })]
+        );
+    }
+
+    #[test]
+    fn reconnect_drops_the_attach_to_a_session_that_vanished() {
+        let mut m = attached_t1();
+        m.on_link(LinkEvent::Disconnected("disconnected".into()));
+        // `Attach` waits for the first list: the session may have ended while the daemon was down.
+        let effects = m.on_link(LinkEvent::Connected);
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::Send(ToDaemon::Attach { .. })))
+        );
+        // It did end. No `Attach` goes out for it (whose "No such session" error would stay on screen), and the
+        // first visible session is attached instead, with no message.
+        let effects = listed(&mut m, vec![s("/p", "t2", SessionState::Idle)]);
+        assert_eq!(effects, [attach_msg("k-t2")]);
+        assert_eq!(m.attached.as_deref(), Some("k-t2"));
+        assert_eq!(m.message, None);
+        // With nothing left, the launcher shows and nothing is sent.
+        m.on_link(LinkEvent::Disconnected("disconnected".into()));
+        m.on_link(LinkEvent::Connected);
         assert!(listed(&mut m, Vec::new()).is_empty());
         assert!(m.attached.is_none() && m.launcher_open());
     }
