@@ -28,7 +28,7 @@ pub fn render(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
                 .pt_3()
                 .text_size(px(12.))
                 .text_color(rgb(FAINT))
-                .child("세션이 없어요")
+                .child("No sessions")
                 .into_any_element(),
         );
     }
@@ -79,7 +79,7 @@ fn offline_banner(reason: &str) -> impl IntoElement {
             div()
                 .text_size(px(12.))
                 .text_color(rgb(WAITING))
-                .child("데몬 연결이 끊겼어요 · 다시 연결하는 중이에요"),
+                .child("Disconnected from the daemon · reconnecting…"),
         )
         .child(
             div()
@@ -101,7 +101,7 @@ fn new_task(cx: &mut Context<Workspace>) -> impl IntoElement {
         .text_size(px(13.))
         .cursor_pointer()
         .hover(|s| s.bg(rgb(SELECTED_BG)))
-        .child(div().flex_1().text_color(rgb(TITLE)).child("＋ 새 작업"))
+        .child(div().flex_1().text_color(rgb(TITLE)).child("＋ New task"))
         .child(div().text_size(px(12.)).text_color(rgb(FAINT)).child("⌘N"))
         .on_click(cx.listener(|ws, _, window, cx| ws.new_task(window, cx)))
 }
@@ -174,7 +174,7 @@ fn project_picker(m: &Model, open: bool, cx: &mut Context<Workspace>) -> impl In
 fn project_name(item: &ProjectItem) -> String {
     item.root
         .as_deref()
-        .map_or_else(|| "전체".to_string(), folder_name)
+        .map_or_else(|| "All projects".to_string(), folder_name)
 }
 
 fn approval_mark() -> impl IntoElement {
@@ -308,6 +308,6 @@ fn add_project(cx: &mut Context<Workspace>) -> impl IntoElement {
         .text_color(rgb(FAINT))
         .cursor_pointer()
         .hover(|s| s.text_color(rgb(TEXT)))
-        .child("＋ 프로젝트 추가")
+        .child("＋ Add project")
         .on_click(cx.listener(|ws, _, _, cx| ws.add_project(cx)))
 }

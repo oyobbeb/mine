@@ -47,13 +47,13 @@ pub struct Pending {
 /// `New`의 답을 이만큼 기다린다. 넘으면 버리고 [`START_FAILED`]를 띄운다.
 pub const PENDING_TIMEOUT: Duration = Duration::from_secs(5);
 /// 만든 세션이 목록에 나타나지 않았다(셸이 곧바로 끝났거나 답이 오지 않았다).
-const START_FAILED: &str = "세션을 시작하지 못했어요";
+const START_FAILED: &str = "Couldn't start the session";
 /// 앞서 보낸 `New`의 답을 기다리는 동안 다시 고르면 띄운다.
-const CREATING: &str = "만드는 중이에요";
+const CREATING: &str = "Creating…";
 
 /// 연결이 없을 때 실행 화면에서 고르면 띄우는 글. 연결 스레드는 연결 전에 보낸 메시지를 버린다.
 const NOT_CONNECTED: &str =
-    "데몬에 연결되지 않아 세션을 만들 수 없어요. 다시 연결되면 골라 주세요.";
+    "Can't create a session while disconnected from the daemon. Pick again once it reconnects.";
 
 /// 별칭 설정(`config.toml` 내용)으로 만든 이름들. 화면 문자열 테스트가 쓴다. 홈이 없으니 자동 이름은 codex뿐이다.
 #[cfg(test)]
@@ -523,7 +523,7 @@ impl Model {
             self.set_filter(Some(root));
         } else {
             self.message = Some(format!(
-                "홈 폴더와 /는 프로젝트로 추가하지 않아요: {}",
+                "The home directory and / can't be added as projects: {}",
                 root.display()
             ));
         }
@@ -668,10 +668,10 @@ pub fn glyph(state: &SessionState) -> &'static str {
 /// 묶음 이름.
 pub fn group_label(state: &SessionState) -> &'static str {
     match state {
-        SessionState::Approval => "승인 대기",
-        SessionState::Working => "작업 중",
-        SessionState::Done | SessionState::Ended => "끝남",
-        SessionState::Idle => "대기",
+        SessionState::Approval => "Needs approval",
+        SessionState::Working => "Working",
+        SessionState::Done | SessionState::Ended => "Done",
+        SessionState::Idle => "Idle",
     }
 }
 
@@ -681,7 +681,7 @@ pub fn group_label(state: &SessionState) -> &'static str {
 pub fn status_text(s: &SessionInfo) -> (&str, bool) {
     match (&s.waiting, &s.state) {
         (Some(waiting), _) => (waiting, true),
-        (None, SessionState::Ended) => ("종료됨", false),
+        (None, SessionState::Ended) => ("Exited", false),
         (None, state) => (group_label(state), false),
     }
 }
@@ -1148,7 +1148,7 @@ mod tests {
         assert!(m.launch(Choice::Shell).is_empty());
         assert!(m.submit_typed("shell dev").is_empty());
         assert!(m.pending.is_none());
-        assert!(m.message.as_deref().unwrap().contains("데몬"));
+        assert!(m.message.as_deref().unwrap().contains("daemon"));
         // `New`를 보낸 뒤 끊기면 답이 오지 않을 수 있다. 기다림을 풀어 다시 고를 수 있게 한다.
         m.on_link(LinkEvent::Connected);
         assert_eq!(m.launch(Choice::Shell).len(), 1);
@@ -1170,11 +1170,11 @@ mod tests {
         );
         // 답을 기다리는 동안 고르면 만드는 중이라고 알린다.
         assert!(m.launch(Choice::Codex).is_empty());
-        assert_eq!(m.message.as_deref(), Some("만드는 중이에요"));
+        assert_eq!(m.message.as_deref(), Some("Creating…"));
         // 셸이 곧바로 끝나면 데몬은 세션 없이 답한다. 목록이 바뀌지 않아 데몬은 알리지 않고 답만 온다.
         assert!(listed(&mut m, Vec::new()).is_empty());
         assert!(m.pending.is_none());
-        assert_eq!(m.message.as_deref(), Some("세션을 시작하지 못했어요"));
+        assert_eq!(m.message.as_deref(), Some("Couldn't start the session"));
         // 실행 화면이 다시 동작한다.
         assert!(m.launcher_open());
         assert_eq!(
@@ -1197,7 +1197,7 @@ mod tests {
         // 5초가 넘으면 버리고 알린다.
         assert!(m.expire_pending(since + PENDING_TIMEOUT));
         assert!(m.pending.is_none());
-        assert_eq!(m.message.as_deref(), Some("세션을 시작하지 못했어요"));
+        assert_eq!(m.message.as_deref(), Some("Couldn't start the session"));
         assert!(!m.expire_pending(since + PENDING_TIMEOUT));
         assert_eq!(m.launch(Choice::Shell).len(), 1);
     }
@@ -1210,7 +1210,7 @@ mod tests {
         // 틀린 입력은 상자를 열어 둔 채 사유를 띄운다.
         assert!(m.submit_typed("gpt x").is_empty());
         assert!(m.typing);
-        assert!(m.message.as_deref().unwrap().contains("알 수 없는 종류"));
+        assert!(m.message.as_deref().unwrap().contains("Unknown kind"));
         let Effect::Send(ToDaemon::New { spec }) = &m.submit_typed("claude-b mine opus")[0] else {
             panic!("New가 아니다");
         };
@@ -1401,7 +1401,7 @@ mod tests {
         // 등록 목록에 없으면(홈 폴더) 고르지 않고 알린다.
         m.project_added(PathBuf::from("/Users/me"), vec![kyoto.clone()]);
         assert_eq!(m.filter, Some(kyoto));
-        assert!(m.message.as_deref().unwrap().contains("홈 폴더"));
+        assert!(m.message.as_deref().unwrap().contains("home directory"));
     }
 
     #[test]
@@ -1411,12 +1411,12 @@ mod tests {
         assert_eq!(status_text(&ask), ("Bash(npm run deploy)", true));
         assert_eq!(
             status_text(&s("/p", "e", SessionState::Ended)),
-            ("종료됨", false)
+            ("Exited", false)
         );
         assert_eq!(
             status_text(&s("/p", "w", SessionState::Working)),
-            ("작업 중", false)
+            ("Working", false)
         );
-        assert_eq!(group_label(&SessionState::Ended), "끝남");
+        assert_eq!(group_label(&SessionState::Ended), "Done");
     }
 }

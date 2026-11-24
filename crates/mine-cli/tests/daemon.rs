@@ -789,7 +789,7 @@ fn new_is_refused_while_the_same_name_is_closing() {
     let out = mine_raw(&st, &["new", "dev"]);
     assert!(!out.status.success());
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("닫는 중"),
+        String::from_utf8_lossy(&out.stderr).contains("still closing"),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );

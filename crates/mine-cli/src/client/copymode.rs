@@ -153,7 +153,7 @@ impl CopyMode {
 
     /// 커서를 `delta`줄(아래가 양수) 옮긴다. 처음과 끝에서 멈추고 `col`은 새 줄 안으로 줄인다.
     /// 화면은 `reveal`이 옮긴 줄 수만큼 따라 움직여서 커서가 화면의 같은 줄에 머문다.
-    /// 키를 거치지 않는 휠에서도 "검색 결과 없음"이 걷히게 여기서 알림을 지운다.
+    /// 키를 거치지 않는 휠에서도 "No matches"이 걷히게 여기서 알림을 지운다.
     pub fn move_lines(&mut self, lines: &[String], delta: isize) {
         self.miss = false;
         self.hangul = false;
@@ -275,11 +275,11 @@ impl CopyMode {
         let hint = if self.hangul {
             HANGUL_HINT
         } else if self.miss {
-            "검색 결과 없음"
+            "No matches"
         } else {
-            "v 선택 · y 복사 · / ? 검색 · q 끝"
+            "v select · y copy · / ? search · q quit"
         };
-        format!("복사 모드 │ {}/{total} │ {hint}", self.line + 1)
+        format!("Copy mode │ {}/{total} │ {hint}", self.line + 1)
     }
 
     /// 클라이언트 화면을 커서 줄이 보이게 스크롤한다. 쪽 넘김·휠로 커서가 옮긴 줄 수는 화면도 그만큼 따라 옮기고,
@@ -556,13 +556,13 @@ mod tests {
         search(&mut c, &ls, "zzz");
         assert_eq!(at(&c), (0, 0));
         assert!(c.miss && !c.typing);
-        assert!(c.status(2).contains("검색 결과 없음"));
+        assert!(c.status(2).contains("No matches"));
         // n도 못 찾으면 마찬가지고, 다른 키를 누르면 알림이 걷힌다.
         c.key(&ls, b'n');
         assert!(c.miss);
         c.key(&ls, b'j');
         assert!(!c.miss);
-        assert!(!c.status(2).contains("검색 결과 없음"));
+        assert!(!c.status(2).contains("No matches"));
     }
 
     #[test]
@@ -656,7 +656,7 @@ mod tests {
         assert_eq!((at(&c), c.query.as_str()), ((1, 3), "세계"));
         assert_eq!(
             c.status(3),
-            "복사 모드 │ 2/3 │ v 선택 · y 복사 · / ? 검색 · q 끝"
+            "Copy mode │ 2/3 │ v select · y copy · / ? search · q quit"
         );
     }
 
@@ -992,7 +992,7 @@ mod tests {
         let mut c = CopyMode::new(&ls);
         assert_eq!(
             c.status(3),
-            "복사 모드 │ 3/3 │ v 선택 · y 복사 · / ? 검색 · q 끝"
+            "Copy mode │ 3/3 │ v select · y copy · / ? search · q quit"
         );
         c.key(&ls, b'/');
         typed(&mut c, &ls, "ab");
@@ -1258,10 +1258,14 @@ mod tests {
         c.hangul = true;
         assert_eq!(
             c.status(2),
-            "복사 모드 │ 2/2 │ 한/영을 영문으로 바꾸고 다시 눌러 주세요"
+            "Copy mode │ 2/2 │ Switch your keyboard to English and press again"
         );
         c.move_lines(&ls, -1);
-        assert!(!c.hangul && c.status(2).ends_with("v 선택 · y 복사 · / ? 검색 · q 끝"));
+        assert!(
+            !c.hangul
+                && c.status(2)
+                    .ends_with("v select · y copy · / ? search · q quit")
+        );
         c.hangul = true;
         c.key(&ls, b'j');
         assert!(!c.hangul);

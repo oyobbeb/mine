@@ -87,7 +87,7 @@ pub fn validate_name(name: &str) -> Result<()> {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '~' | '-'));
     if !ok {
         bail!(
-            "세션 이름이 올바르지 않아요: {name:?} (영문·숫자로 시작하고 영문·숫자·_~-만 써서 64자 이하로 지어 주세요)"
+            "Invalid session name: {name:?} (start with a letter or digit, then use only letters, digits, _, ~ and -, up to 64 characters)"
         );
     }
     Ok(())
@@ -97,10 +97,9 @@ impl Meta {
     /// `dir/meta.json`을 읽는다.
     pub fn load(dir: &Path) -> Result<Meta> {
         let path = dir.join(META_FILE);
-        let bytes =
-            fs::read(&path).with_context(|| format!("읽을 수 없어요: {}", path.display()))?;
+        let bytes = fs::read(&path).with_context(|| format!("Couldn't read {}", path.display()))?;
         serde_json::from_slice(&bytes)
-            .with_context(|| format!("meta.json 형식이 올바르지 않아요: {}", path.display()))
+            .with_context(|| format!("Invalid meta.json format: {}", path.display()))
     }
 
     /// `dir/meta.json`에 원자적으로 쓴다. 같은 폴더의 임시 파일에 쓴 뒤 이름을 바꾼다.
@@ -120,7 +119,7 @@ impl Meta {
             Ok(())
         };
         write()
-            .with_context(|| format!("저장할 수 없어요: {}", path.display()))
+            .with_context(|| format!("Couldn't save {}", path.display()))
             .inspect_err(|_| {
                 let _ = fs::remove_file(&tmp);
             })

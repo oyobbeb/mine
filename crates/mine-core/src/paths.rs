@@ -31,7 +31,7 @@ impl State {
         let root = match (state_dir, home) {
             (Some(dir), _) if !dir.is_empty() => PathBuf::from(dir),
             (_, Some(home)) if !home.is_empty() => PathBuf::from(home).join(".mine"),
-            _ => bail!("상태 폴더를 정할 수 없어요. HOME 또는 {STATE_DIR_ENV}를 설정해 주세요"),
+            _ => bail!("Couldn't determine the state directory. Set HOME or {STATE_DIR_ENV}"),
         };
         Ok(State {
             root: std::path::absolute(root)?,
@@ -83,7 +83,7 @@ pub fn check_sock_path(p: &Path) -> Result<()> {
     let len = p.as_os_str().len();
     if len >= SOCK_PATH_MAX {
         bail!(
-            "소켓 경로가 너무 길어요({len}바이트, {SOCK_PATH_MAX}바이트 미만이어야 해요): {}. {STATE_DIR_ENV}로 짧은 상태 폴더를 써 주세요",
+            "The socket path is too long ({len} bytes; it must be under {SOCK_PATH_MAX} bytes): {}. Use a shorter state directory via {STATE_DIR_ENV}",
             p.display()
         );
     }

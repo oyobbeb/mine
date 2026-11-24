@@ -115,7 +115,7 @@ pub async fn run(state: State, project: PathBuf) -> Result<()> {
             },
             msg = rx.recv() => match msg {
                 Some(msg) => app.on_msg(msg),
-                None => bail!("데몬 연결이 끊겼어요. mine을 다시 실행하면 세션에 다시 붙어요"),
+                None => bail!("Disconnected from the daemon. Run mine again to reattach to your sessions"),
             },
             _ = winch.recv() => app.on_resize(terminal.size()?),
             _ = term.recv() => app.quit = true,
@@ -297,7 +297,7 @@ impl App {
                     copy.held.extend_from_slice(&data);
                     if copy.held.len() > MAX_HELD {
                         self.exit_copy();
-                        self.say("출력이 너무 많아서 복사 모드를 끝냈어요");
+                        self.say("Too much output, so copy mode was ended");
                     }
                 } else if let Some(screen) = &mut self.screen {
                     screen.feed(&data);
@@ -511,7 +511,7 @@ impl App {
                     self.m.prompt = Some(Prompt::ConfirmKill(id));
                     self.dirty = true;
                 }
-                None => self.say("닫을 세션이 없어요"),
+                None => self.say("No session to close"),
             },
             Cmd::ToggleList => {
                 self.m.list_open = !self.m.list_open;
@@ -666,7 +666,7 @@ impl App {
         }
         // 시작 화면이 세션 칸을 덮고 있으면 복사할 화면이 보이지 않는다.
         let Some(screen) = self.screen.as_ref().filter(|_| !self.m.launcher) else {
-            return self.say("복사할 세션 화면이 없어요");
+            return self.say("No session screen to copy");
         };
         // 쪽 넘김의 한 쪽(터미널 칸의 줄 수)은 `freeze`가 화면에서 읽는다. 크기가 바뀌면 복사 모드가 끝난다.
         let (lines, mode) = copymode::freeze(screen);
@@ -1316,11 +1316,11 @@ mod tests {
         assert!(app.clipboard.is_empty());
         app.mouse(ev(MouseKind::Up, 38, 0));
         assert_eq!(app.clipboard, select::osc52("hello"));
-        assert_eq!(app.m.message, "복사됨 5자");
+        assert_eq!(app.m.message, "Copied 5 chars");
         assert!(app.select.selection().is_some());
         // 복사 알림은 마우스로는 지워지지 않고, 키를 누르면 알림과 반전이 함께 사라진다.
         app.mouse(ev(MouseKind::WheelDown, 40, 5));
-        assert_eq!(app.m.message, "복사됨 5자");
+        assert_eq!(app.m.message, "Copied 5 chars");
         app.on_action(Action::Pass(b"x".to_vec()));
         assert!(app.select.selection().is_none());
         assert!(app.m.message.is_empty());
@@ -1449,11 +1449,11 @@ mod tests {
         app.mouse(ev(MouseKind::WheelUp, 10, 5));
         assert_eq!(copy_line(&app), 96);
         assert!(app.copy.is_some() && sent(&mut rx).is_empty());
-        // 휠로 움직이면 "검색 결과 없음"이 걷힌다.
+        // 휠로 움직이면 "No matches"이 걷힌다.
         app.on_input(b"/nothing\r");
-        assert!(app.m.status.as_deref().unwrap().contains("검색 결과 없음"));
+        assert!(app.m.status.as_deref().unwrap().contains("No matches"));
         app.mouse(ev(MouseKind::WheelDown, 40, 5));
-        assert!(!app.m.status.as_deref().unwrap().contains("검색 결과 없음"));
+        assert!(!app.m.status.as_deref().unwrap().contains("No matches"));
     }
 
     #[test]
@@ -1677,7 +1677,7 @@ mod tests {
         assert!(app.clipboard.is_empty());
         app.on_input(b"y");
         assert_eq!(app.clipboard, select::osc52("alpha\nbe"));
-        assert_eq!(app.m.message, "복사됨 8자");
+        assert_eq!(app.m.message, "Copied 8 chars");
         assert!(app.copy.is_none() && app.m.status.is_none());
         assert!(sent(&mut rx).is_empty());
         // 선택 없이 y는 복사하지 않고 끝낸다.
@@ -1695,7 +1695,7 @@ mod tests {
         enter_copy(&mut app);
         assert_eq!(
             app.m.status.as_deref(),
-            Some("복사 모드 │ 100/101 │ v 선택 · y 복사 · / ? 검색 · q 끝")
+            Some("Copy mode │ 100/101 │ v select · y copy · / ? search · q quit")
         );
         assert_eq!(offset(&app), 0);
         app.on_input(b"g");
@@ -1712,7 +1712,7 @@ mod tests {
         assert_eq!(offset(&app), 0);
         // 못 찾으면 그 자리에서 알린다.
         app.on_input(b"/nothing\r");
-        assert!(app.m.status.as_deref().unwrap().contains("검색 결과 없음"));
+        assert!(app.m.status.as_deref().unwrap().contains("No matches"));
     }
 
     #[test]
@@ -1775,7 +1775,7 @@ mod tests {
             data: b"\r\nend".to_vec().into_iter().chain([b'!'; 10]).collect(),
         });
         assert!(app.copy.is_none() && app.m.status.is_none());
-        assert_eq!(app.m.message, "출력이 너무 많아서 복사 모드를 끝냈어요");
+        assert_eq!(app.m.message, "Too much output, so copy mode was ended");
         // 넘친 덩이까지 화면에 먹였고 맨 아래로 돌아와 있다.
         assert_eq!(offset(&app), 0);
         assert!(
@@ -2158,7 +2158,7 @@ mod tests {
         app.on_input(b"\x01c");
         app.on_input(b"\x01[");
         assert!(app.copy.is_none() && app.m.launcher);
-        assert_eq!(app.m.message, "복사할 세션 화면이 없어요");
+        assert_eq!(app.m.message, "No session screen to copy");
     }
 
     #[test]
@@ -2238,11 +2238,17 @@ mod tests {
         assert_eq!(copy_line(&app), at);
         let status = app.m.status.clone().unwrap();
         assert!(status.contains(input::HANGUL_HINT), "{status}");
-        assert!(status.starts_with("복사 모드 │"));
+        assert!(status.starts_with("Copy mode │"));
         // 영문 키를 누르면 안내가 걷히고 평소처럼 움직인다.
         app.on_input(b"k");
         assert_eq!(copy_line(&app), at - 1);
-        assert!(!app.m.status.as_deref().unwrap().contains("한/영"));
+        assert!(
+            !app.m
+                .status
+                .as_deref()
+                .unwrap()
+                .contains("Switch your keyboard")
+        );
         // 한글 음절도 같고, 휠로도 걷힌다.
         app.on_input("한".as_bytes());
         assert!(
@@ -2253,7 +2259,13 @@ mod tests {
                 .contains(input::HANGUL_HINT)
         );
         app.mouse(ev(MouseKind::WheelUp, 40, 5));
-        assert!(!app.m.status.as_deref().unwrap().contains("한/영"));
+        assert!(
+            !app.m
+                .status
+                .as_deref()
+                .unwrap()
+                .contains("Switch your keyboard")
+        );
         // 접두 뒤의 한글도 복사 모드 상태줄에 알린다. 복사 모드는 끝나지 않는다.
         app.on_input("\x01ㅊ".as_bytes());
         assert!(

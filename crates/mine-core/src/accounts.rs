@@ -125,7 +125,10 @@ fn read_aliases(state: &State) -> HashMap<String, String> {
         return HashMap::new();
     };
     parse_aliases(&text).unwrap_or_else(|why| {
-        eprintln!("경고: {}을 읽지 못해 별칭 없이 써요: {why}", path.display());
+        eprintln!(
+            "Warning: couldn't read {}, so no labels are used: {why}",
+            path.display()
+        );
         HashMap::new()
     })
 }
@@ -141,7 +144,7 @@ fn parse_aliases(text: &str) -> Result<HashMap<String, String>, String> {
                 .filter(|&&b| b == b'\n')
                 .count()
         });
-        format!("{line}줄: {}", e.message())
+        format!("line {line}: {}", e.message())
     })?;
     let accounts = table.get("accounts").and_then(toml::Value::as_table);
     Ok(accounts
@@ -319,7 +322,7 @@ mod tests {
         // 경고는 로그에 남는다. 깨진 줄에 이메일이 있어도 파일 내용은 담지 않는다.
         let text = "[accounts.claude-a]\nlabel = \"yb@gmail.com\n";
         let warning = parse_aliases(text).unwrap_err();
-        assert!(warning.contains("2줄"), "{warning}");
+        assert!(warning.contains("line 2"), "{warning}");
         assert!(
             !warning.contains("yb") && !warning.contains("gmail"),
             "{warning}"

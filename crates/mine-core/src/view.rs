@@ -150,30 +150,30 @@ pub fn order(groups: &[Group]) -> Vec<usize> {
 }
 
 /// `⌃a c` 입력 형식.
-pub const NEW_USAGE: &str = "<claude-a|claude-b|codex|shell> <이름> [모델]";
+pub const NEW_USAGE: &str = "<claude-a|claude-b|codex|shell> <name> [model]";
 
 /// `"<claude-a|claude-b|codex|shell> <이름> [모델]"`을 새 세션 명세로 바꾼다.
 pub fn parse_new(input: &str, project: &Path) -> Result<NewSession> {
     let tokens: Vec<&str> = input.split_whitespace().collect();
     let Some(&first) = tokens.first() else {
-        bail!("형식: {NEW_USAGE}");
+        bail!("Usage: {NEW_USAGE}");
     };
     let (kind, account) = match first {
         "claude-a" | "claude-b" => (Kind::Claude, Some(first.to_string())),
         "codex" => (Kind::Codex, Some(first.to_string())),
         "shell" => (Kind::Shell, None),
-        _ => bail!("알 수 없는 종류예요: {first} (형식: {NEW_USAGE})"),
+        _ => bail!("Unknown kind: {first} (usage: {NEW_USAGE})"),
     };
     if tokens.len() > 3 {
-        bail!("인자가 너무 많아요 (형식: {NEW_USAGE})");
+        bail!("Too many arguments (usage: {NEW_USAGE})");
     }
     let Some(&name) = tokens.get(1) else {
-        bail!("세션 이름이 필요해요 (형식: {NEW_USAGE})");
+        bail!("A session name is required (usage: {NEW_USAGE})");
     };
     validate_name(name)?;
     let model = tokens.get(2).map(|m| m.to_string());
     if kind == Kind::Shell && model.is_some() {
-        bail!("shell 세션에는 모델을 지정할 수 없어요");
+        bail!("Can't set a model for a shell session");
     }
     Ok(NewSession {
         project: project.to_path_buf(),
@@ -377,7 +377,7 @@ mod tests {
     fn parse_new_rejects_invalid_name() {
         for bad in ["shell -x", "claude-a a/b", "codex 한글"] {
             let e = parse_new(bad, Path::new("/p")).unwrap_err();
-            assert!(e.to_string().contains("세션 이름"), "{bad}: {e}");
+            assert!(e.to_string().contains("session name"), "{bad}: {e}");
         }
     }
 }

@@ -110,7 +110,7 @@ pub fn render(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
                 div()
                     .text_size(px(11.))
                     .text_color(rgb(FAINT))
-                    .child("Enter 만들기 · Esc 돌아가기"),
+                    .child("Enter create · Esc back"),
             )
     });
     div()
@@ -132,7 +132,7 @@ pub fn render(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
                         .text_size(px(13.))
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(rgb(TITLE))
-                        .child("새 세션"),
+                        .child("New session"),
                 )
                 .children(rows)
                 .children(typed)
@@ -141,7 +141,7 @@ pub fn render(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
                         .mt_5()
                         .text_size(px(12.))
                         .text_color(rgb(FAINT))
-                        .child("⌘W 닫기"),
+                        .child("⌘W close"),
                 ),
         )
 }
@@ -231,7 +231,7 @@ mod tests {
                 "claude-b",
                 "codex",
                 "shell",
-                "이름·모델 직접 입력"
+                "Custom name and model"
             ]
         );
         // 칩은 claude-a·claude-b·codex 줄에만 붙는다.
@@ -258,7 +258,7 @@ mod tests {
                 ("b", "claude-b"),
                 ("x", "Codex"),
                 ("s", "shell"),
-                ("n", "이름·모델 직접 입력"),
+                ("n", "Custom name and model"),
             ]
         );
         // 줄을 고르는 값은 이름과 무관하게 종류 말 그대로다(세션의 계정 id가 된다).

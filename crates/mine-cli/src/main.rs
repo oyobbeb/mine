@@ -12,9 +12,9 @@ mod daemon;
 mod hold;
 
 #[derive(Parser)]
-#[command(name = "mine", version, about = "AI 코딩 에이전트 세션 멀티플렉서")]
+#[command(name = "mine", version, about = "AI coding agent session multiplexer")]
 struct Cli {
-    /// 프로젝트 폴더. 없으면 현재 위치에서 찾아요.
+    /// Project directory. If omitted, it is looked up from the current directory.
     #[arg(long)]
     project: Option<PathBuf>,
     #[command(subcommand)]
@@ -23,54 +23,54 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// 등록된 프로젝트 경로를 한 줄씩 출력해요.
+    /// Print the registered project paths, one per line.
     Projects,
-    /// 데몬을 실행해요. 다른 명령은 데몬이 없으면 알아서 띄워요.
+    /// Run the daemon. Other commands start it automatically if it isn't running.
     Daemon,
-    /// 세션 목록을 출력해요. 한 줄에 `기호 프로젝트폴더 이름 계정 상태 대기문구`를 탭으로 나눠 써요.
+    /// Print the session list. Each line is tab-separated: `symbol project-folder name account state waiting-text`.
     Ls,
-    /// 새 세션을 만들어요.
+    /// Create a new session.
     New {
-        /// 프로젝트 안에서 고유한 세션 이름.
+        /// Session name, unique within the project.
         name: String,
-        /// 세션 종류.
+        /// Session kind.
         #[arg(long, default_value = "shell", value_parser = parse_kind)]
         kind: Kind,
-        /// 계정.
+        /// Account.
         #[arg(long, value_parser = ["claude-a", "claude-b", "codex"])]
         account: Option<String>,
-        /// 모델.
+        /// Model.
         #[arg(long)]
         model: Option<String>,
     },
-    /// 세션을 닫아요. 세션 폴더와 기록은 남아요.
+    /// Close a session. The session directory and its history are kept.
     Kill {
-        /// 세션 이름.
+        /// Session name.
         name: String,
     },
-    /// 세션 PTY를 쥐는 보관 프로세스예요. 데몬이 띄워요.
+    /// Holder process that owns a session's PTY. The daemon starts it.
     #[command(hide = true)]
     Hold {
-        /// 데몬이 붙는 유닉스 소켓 경로.
+        /// Unix socket path the daemon connects to.
         #[arg(long)]
         sock: PathBuf,
-        /// 자식 종료 코드를 쓸 파일 경로.
+        /// File path to write the child's exit code to.
         #[arg(long)]
         exit: PathBuf,
-        /// 자식이 시작할 작업 폴더.
+        /// Working directory the child starts in.
         #[arg(long)]
         cwd: PathBuf,
-        /// 자식에게 더할 환경 변수(`K=V`). 여러 번 줄 수 있어요.
+        /// Environment variable to add for the child (`K=V`). Can be given multiple times.
         #[arg(long = "env", value_name = "K=V", value_parser = parse_env)]
         env: Vec<(String, String)>,
-        /// 자식 명령과 인자.
+        /// Child command and its arguments.
         #[arg(last = true, required = true)]
         argv: Vec<String>,
     },
-    /// CLI 훅이 불러요. 표준 입력의 훅 페이로드를 세션 폴더에 기록하고 데몬에 알려요.
+    /// Called by CLI hooks. Records the hook payload from standard input in the session directory and notifies the daemon.
     #[command(name = "_event", hide = true)]
     Event {
-        /// 세션 폴더(`<상태 폴더>/sessions/<id>`).
+        /// Session directory (`<state directory>/sessions/<id>`).
         dir: PathBuf,
     },
 }
@@ -80,7 +80,7 @@ fn parse_kind(s: &str) -> Result<Kind, String> {
         "claude" => Ok(Kind::Claude),
         "codex" => Ok(Kind::Codex),
         "shell" => Ok(Kind::Shell),
-        _ => Err(format!("claude, codex, shell 중 하나여야 해요: {s}")),
+        _ => Err(format!("must be one of claude, codex, shell: {s}")),
     }
 }
 
@@ -88,7 +88,7 @@ fn parse_kind(s: &str) -> Result<Kind, String> {
 fn project_root(cli_project: Option<PathBuf>, state: &paths::State) -> Result<PathBuf> {
     let start = match cli_project {
         Some(dir) => dir,
-        None => std::env::current_dir().context("현재 폴더를 알 수 없어요")?,
+        None => std::env::current_dir().context("Couldn't determine the current directory")?,
     };
     project::project_root(&start, state)
 }
@@ -97,7 +97,7 @@ fn project_root(cli_project: Option<PathBuf>, state: &paths::State) -> Result<Pa
 fn request_sessions(state: &paths::State, msg: &ToDaemon) -> Result<Vec<SessionInfo>> {
     match Conn::connect_or_spawn(state)?.request(msg)? {
         FromDaemon::Sessions { sessions } => Ok(sessions),
-        other => bail!("데몬이 예상하지 못한 답을 보냈어요: {other:?}"),
+        other => bail!("The daemon sent an unexpected reply: {other:?}"),
     }
 }
 
@@ -140,7 +140,7 @@ fn ls_line(info: &SessionInfo) -> String {
 fn parse_env(s: &str) -> Result<(String, String), String> {
     match s.split_once('=') {
         Some((key, value)) if !key.is_empty() => Ok((key.to_string(), value.to_string())),
-        _ => Err(format!("`K=V` 형식이어야 해요: {s}")),
+        _ => Err(format!("must be in `K=V` form: {s}")),
     }
 }
 
@@ -198,7 +198,7 @@ fn main() -> Result<()> {
             let project = project_root(cli.project, &state)?;
             let id = session_id(&project::project_key(&project), &name);
             request_sessions(&state, &ToDaemon::Kill { id })
-                .with_context(|| format!("세션을 닫지 못했어요: {name}"))?;
+                .with_context(|| format!("Couldn't close the session: {name}"))?;
         }
         // 명령이 없으면 클라이언트 화면이다. 프로젝트는 `mine new`와 같은 방법으로 찾는다.
         None => {

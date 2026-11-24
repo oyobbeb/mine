@@ -39,8 +39,8 @@ pub fn copy(text: &str) -> Option<(Vec<u8>, String)> {
         end -= 1;
     }
     let cut = &text[..end];
-    let note = if end < text.len() { " (잘림)" } else { "" };
-    let message = format!("복사됨 {}자{note}", cut.chars().count());
+    let note = if end < text.len() { " (truncated)" } else { "" };
+    let message = format!("Copied {} chars{note}", cut.chars().count());
     Some((osc52(cut), message))
 }
 
@@ -175,7 +175,7 @@ mod tests {
         assert_eq!(copy(""), None);
         let (bytes, msg) = copy("한글hi").unwrap();
         assert_eq!(bytes, osc52("한글hi"));
-        assert_eq!(msg, "복사됨 4자");
+        assert_eq!(msg, "Copied 4 chars");
     }
 
     #[test]
@@ -183,10 +183,10 @@ mod tests {
         // 가는 3바이트라 100_000바이트 경계(100_000 = 3 * 33333 + 1)가 글자 한가운데다.
         let text = "가".repeat(40_000);
         let (bytes, msg) = copy(&text).unwrap();
-        assert_eq!(msg, "복사됨 33333자 (잘림)");
+        assert_eq!(msg, "Copied 33333 chars (truncated)");
         assert_eq!(bytes, osc52(&"가".repeat(33_333)));
         let (_, msg) = copy(&"a".repeat(100_000)).unwrap();
-        assert_eq!(msg, "복사됨 100000자");
+        assert_eq!(msg, "Copied 100000 chars");
     }
 
     #[test]

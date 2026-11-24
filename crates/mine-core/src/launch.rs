@@ -39,7 +39,7 @@ impl Choice {
                 labels.get(self.word().unwrap_or_default())
             }
             Choice::Shell => "shell",
-            Choice::Typed => "이름·모델 직접 입력",
+            Choice::Typed => "Custom name and model",
         }
     }
 }
@@ -177,7 +177,7 @@ mod tests {
         assert_eq!(row(Choice::Codex), "Codex");
         // shell은 계정이 없어 별칭이 있어도 그대로다.
         assert_eq!(row(Choice::Shell), "shell");
-        assert_eq!(row(Choice::Typed), "이름·모델 직접 입력");
+        assert_eq!(row(Choice::Typed), "Custom name and model");
         // 이름을 읽지 않은 기본값은 종류 말이다. 세션을 만드는 말은 이름과 무관하다.
         let ids = Labels::default();
         assert_eq!(Choice::ClaudeA.label(&ids), "claude-a");

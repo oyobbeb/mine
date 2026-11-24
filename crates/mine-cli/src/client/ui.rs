@@ -133,7 +133,7 @@ const RAIL_W: u16 = 4;
 const LIST_W: u16 = 30;
 /// 목록 줄 오른쪽 끝의 빈 칸. 칩이 터미널 칸에 붙지 않게 띄운다.
 const GUTTER: usize = 1;
-const KEYS: &str = "⌃a n/p 세션 · ( ) 프로젝트 · c 새로 · x 닫기 · b 목록 · d 나가기";
+const KEYS: &str = "⌃a n/p sessions · ( ) projects · c new · x close · b list · d detach";
 
 const fn rgb(hex: u32) -> Color {
     Color::Rgb((hex >> 16) as u8, (hex >> 8) as u8, hex as u8)
@@ -371,16 +371,16 @@ fn item_line(m: &Model, rail: &[RailItem], item: &Item, width: usize) -> Line<'s
         Item::Title => {
             let title = match &m.filter {
                 Some(p) => view::folder_name(p),
-                None => "전체".to_string(),
+                None => "All projects".to_string(),
             };
             Line::styled(title, Style::new().fg(MARK).add_modifier(Modifier::BOLD))
         }
         Item::Head(_, g) => {
             let (glyph, color, label) = match g.state {
-                SessionState::Approval => ("◆", YELLOW, "승인 대기"),
-                SessionState::Working => ("◐", CYAN, "작업 중"),
-                SessionState::Done | SessionState::Ended => ("✓", GREEN, "끝남"),
-                SessionState::Idle => ("○", MUTED, "대기"),
+                SessionState::Approval => ("◆", YELLOW, "Needs approval"),
+                SessionState::Working => ("◐", CYAN, "Working"),
+                SessionState::Done | SessionState::Ended => ("✓", GREEN, "Done"),
+                SessionState::Idle => ("○", MUTED, "Idle"),
             };
             let arrow = if g.collapsed { "▸" } else { "▾" };
             let left = vec![
@@ -399,8 +399,8 @@ fn item_line(m: &Model, rail: &[RailItem], item: &Item, width: usize) -> Line<'s
             let waiting = m.sessions[*i].waiting.as_deref().unwrap_or_default();
             Line::styled(format!("    {waiting}"), WAITING)
         }
-        Item::Empty => Line::styled("  (세션 없음)", MUTED),
-        Item::NewHint => Line::styled("＋ 새 세션  ⌃a c", MUTED),
+        Item::Empty => Line::styled("  (no sessions)", MUTED),
+        Item::NewHint => Line::styled("＋ New session  ⌃a c", MUTED),
     }
 }
 
@@ -415,7 +415,7 @@ fn session_line(m: &Model, rail: &[RailItem], i: usize, width: usize) -> Line<'s
             .map_or(Color::Reset, |r| project_color(r.color));
         left.push(Span::styled("■ ", color));
     }
-    let ended = (s.state == SessionState::Ended).then(|| Span::styled(" 종료됨", MUTED));
+    let ended = (s.state == SessionState::Ended).then(|| Span::styled(" Exited", MUTED));
     let chip = chip(s.meta.account.as_deref());
     let fixed = spans_width(&left)
         + ended.as_ref().map_or(0, Span::width)
@@ -601,9 +601,9 @@ fn draw_status(f: &mut Frame, area: Rect, m: &Model) {
     let mut cursor = None;
     let right = match &m.prompt {
         Some(Prompt::New(input)) => {
-            left.push(Span::raw(format!("새 세션: {input}")));
+            left.push(Span::raw(format!("New session: {input}")));
             cursor = Some(spans_width(&left));
-            Span::styled(format!("{NEW_USAGE} · Enter 만들기 · Esc 취소"), MUTED)
+            Span::styled(format!("{NEW_USAGE} · Enter create · Esc cancel"), MUTED)
         }
         Some(Prompt::ConfirmKill(id)) => {
             let name = m
@@ -611,8 +611,8 @@ fn draw_status(f: &mut Frame, area: Rect, m: &Model) {
                 .iter()
                 .find(|s| s.meta.id == *id)
                 .map_or(id.as_str(), |s| s.meta.name.as_str());
-            left.push(Span::styled(format!("{name} 세션을 닫을까요?"), YELLOW));
-            Span::styled("y 닫기 · 다른 키 취소", MUTED)
+            left.push(Span::styled(format!("Close session {name}?"), YELLOW));
+            Span::styled("y close · any other key cancels", MUTED)
         }
         None => {
             match m
@@ -632,7 +632,7 @@ fn draw_status(f: &mut Frame, area: Rect, m: &Model) {
                 None => left.push(Span::raw(
                     m.filter
                         .as_ref()
-                        .map_or_else(|| "전체".to_string(), |p| p.display().to_string()),
+                        .map_or_else(|| "All projects".to_string(), |p| p.display().to_string()),
                 )),
             }
             if m.message.is_empty() {
@@ -784,7 +784,7 @@ mod tests {
     fn draws_rail_groups_and_chips() {
         let m = kyoto();
         let buf = render(&m, 100, 20);
-        assert!(text(&buf).contains("◆ 승인 대기"));
+        assert!(text(&buf).contains("◆ Needs approval"));
         assert!(text(&buf).contains("npm run deploy 승인?"));
         assert_eq!(cell(&buf, 1, 1).symbol(), "∗");
         assert!(row_of(&buf, "billing").ends_with("B"));
@@ -815,13 +815,13 @@ mod tests {
         ]);
         let buf = render(&m, 100, 20);
         assert_eq!(row_text(&buf, 0).trim(), "kyoto");
-        assert!(row_of(&buf, "gone").contains("gone 종료됨"));
+        assert!(row_of(&buf, "gone").contains("gone Exited"));
         assert!(row_of(&buf, "gone").ends_with('A'));
-        assert!(text(&buf).contains("▸ ○ 대기"));
+        assert!(text(&buf).contains("▸ ○ Idle"));
         assert!(!text(&buf).contains("core"));
         m.filter = None;
         let buf = render(&m, 100, 20);
-        assert_eq!(row_text(&buf, 0).trim(), "전체");
+        assert_eq!(row_text(&buf, 0).trim(), "All projects");
         assert!(row_of(&buf, "core").contains("■ core"));
         assert!(row_of(&buf, "core").ends_with('C'));
     }
@@ -854,8 +854,8 @@ mod tests {
         assert_eq!(hit(&a, &m, list_x, y("billing")), Hit::Row(0));
         assert_eq!(hit(&a, &m, list_x, y("deploy")), Hit::Row(0));
         assert_eq!(hit(&a, &m, list_x, y("ui")), Hit::Row(1));
-        assert_eq!(hit(&a, &m, list_x, y("승인 대기")), Hit::Group(0));
-        assert_eq!(hit(&a, &m, list_x, y("작업 중")), Hit::Group(1));
+        assert_eq!(hit(&a, &m, list_x, y("Needs approval")), Hit::Group(0));
+        assert_eq!(hit(&a, &m, list_x, y("Working")), Hit::Group(1));
         assert_eq!(hit(&a, &m, list_x, 0), Hit::None);
         assert_eq!(hit(&a, &m, a.term.x + 3, a.term.y + 2), Hit::Term(3, 2));
         assert_eq!(hit(&a, &m, 50, a.status.y), Hit::None);
@@ -877,13 +877,13 @@ mod tests {
         let list_x = a.list.unwrap().x + 3;
         let buf = render(&m, 100, 20);
         assert!(!text(&buf).contains("shellx"));
-        let head = y_of(&buf, "○ 대기");
+        let head = y_of(&buf, "○ Idle");
         let Hit::Group(g) = hit(&a, &m, list_x, head) else {
             panic!("대기 묶음 머리가 아니다");
         };
         m.toggle_group(g);
         let buf = render(&m, 100, 20);
-        assert!(row_text(&buf, head).contains("▾ ○ 대기"));
+        assert!(row_text(&buf, head).contains("▾ ○ Idle"));
         assert_eq!(hit(&a, &m, list_x, y_of(&buf, "shellx")), Hit::Row(1));
         // 한 번 더 누르면 다시 접힌다.
         m.toggle_group(g);
@@ -897,11 +897,11 @@ mod tests {
         let a = layout(Rect::new(0, 0, 100, 20), true);
         let list_x = a.list.unwrap().x + 3;
         let buf = render(&m, 100, 20);
-        assert!(text(&buf).contains("▾ ○ 대기"));
+        assert!(text(&buf).contains("▾ ○ Idle"));
         assert_eq!(hit(&a, &m, list_x, y_of(&buf, "shellx")), Hit::Row(0));
         // 사용자가 접어도 붙은 세션의 묶음은 펼친 채다.
         m.toggle_group(0);
-        assert!(text(&render(&m, 100, 20)).contains("▾ ○ 대기"));
+        assert!(text(&render(&m, 100, 20)).contains("▾ ○ Idle"));
     }
 
     #[test]
@@ -970,7 +970,7 @@ mod tests {
             status.starts_with("mine │ /p/kyoto/billing │ claude-b"),
             "{status}"
         );
-        assert!(status.ends_with("d 나가기"), "{status}");
+        assert!(status.ends_with("d detach"), "{status}");
         m.prompt = Some(Prompt::New("shell de".into()));
         assert!(row_text(&render(&m, 140, 20), 19).contains("shell de"));
         m.prompt = Some(Prompt::ConfirmKill("k-billing".into()));
@@ -995,9 +995,9 @@ mod tests {
         assert!(status.starts_with("mine │ /p/kyoto/billing"), "{status}");
         assert_eq!(pos, Position::new(term_x + 2, 0));
         // 상태줄 전체가 그 글로 바뀌고, 세션 커서는 옮기지 않는다.
-        m.status = Some("복사 모드 │ 1/3 │ v 선택".into());
+        m.status = Some("Copy mode │ 1/3 │ v select".into());
         let (status, pos) = drawn(&m);
-        assert_eq!(status, "복사 모드 │ 1/3 │ v 선택");
+        assert_eq!(status, "Copy mode │ 1/3 │ v select");
         assert_eq!(pos, Position::ORIGIN);
     }
 
@@ -1087,14 +1087,14 @@ mod tests {
         let buf = render(&model(vec![]), 100, 20);
         assert_eq!(row_text(&buf, 0).trim(), "kyoto");
         // 줄 앞쪽은 아이콘 줄이다. 목록은 4열부터고 세션 줄처럼 두 칸 들여 쓴다.
-        assert!(row_text(&buf, 1).ends_with("  (세션 없음)"));
+        assert!(row_text(&buf, 1).ends_with("  (no sessions)"));
         assert_eq!(cell(&buf, 6, 1).symbol(), "(");
         assert_eq!(cell(&buf, 6, 1).fg, Color::Rgb(0x6b, 0x70, 0x7a));
-        assert!(text(&buf).contains("＋ 새 세션  ⌃a c"));
+        assert!(text(&buf).contains("＋ New session  ⌃a c"));
         // 세션이 있으면 보이지 않는다. 다른 프로젝트 세션만 있으면 이 프로젝트는 빈 것이다.
-        assert!(!text(&render(&kyoto(), 100, 20)).contains("(세션 없음)"));
+        assert!(!text(&render(&kyoto(), 100, 20)).contains("(no sessions)"));
         let other = model(vec![s("/p/mine", "core", Working, "codex", None)]);
-        assert!(text(&render(&other, 100, 20)).contains("(세션 없음)"));
+        assert!(text(&render(&other, 100, 20)).contains("(no sessions)"));
     }
 
     #[test]
@@ -1121,7 +1121,7 @@ mod tests {
         m.attached = Some("k-x".into());
         let buf = render_with_screen(&m, &sc, 100, 20);
         assert!(text(&buf).contains("hello") && !text(&buf).contains("claude-a"));
-        assert!(row_text(&buf, 19).ends_with("d 나가기"));
+        assert!(row_text(&buf, 19).ends_with("d detach"));
         assert_eq!(hit(&a, &m, a.term.x, a.term.y), Hit::Term(0, 0));
     }
 }

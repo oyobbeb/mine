@@ -247,7 +247,7 @@ impl Workspace {
             files: false,
             directories: true,
             multiple: false,
-            prompt: Some("프로젝트로 추가".into()),
+            prompt: Some("Add as project".into()),
         });
         cx.spawn(async move |this, cx| {
             // 취소했거나 고르기 창을 열지 못했다.
@@ -277,7 +277,7 @@ impl Workspace {
             });
         match added {
             Ok((root, registered)) => self.model.project_added(root, registered),
-            Err(e) => self.model.message = Some(format!("프로젝트를 추가하지 못했어요: {e:#}")),
+            Err(e) => self.model.message = Some(format!("Couldn't add the project: {e:#}")),
         }
     }
 
@@ -313,8 +313,8 @@ impl Workspace {
             Close::Confirm(name) => {
                 let answer = window.prompt(
                     PromptLevel::Warning,
-                    &format!("{name} 세션을 닫을까요?"),
-                    Some("세션의 프로세스를 끝내고 목록에서 빼요."),
+                    &format!("Close session {name}?"),
+                    Some("This ends the session's process and removes it from the list."),
                     &close_buttons(),
                     cx,
                 );
@@ -423,7 +423,7 @@ impl Render for Workspace {
 /// 취소를 `PromptButton::cancel`로 만들면 GPUI가 그 단추의 키를 Esc로 바꿔 Return이 어느 단추에도 걸리지 않는다.
 /// 그래서 보통 단추로 둔다. 대신 Esc는 이 창을 닫지 않는다.
 fn close_buttons() -> [PromptButton; 2] {
-    [PromptButton::new("취소"), PromptButton::new("닫기")]
+    [PromptButton::new("Cancel"), PromptButton::new("Close")]
 }
 
 /// 확인 창의 답(단추 자리)이 닫기(둘째 단추)인가. 창이 닫혀 답이 없으면 취소로 본다.
@@ -507,7 +507,7 @@ mod tests {
         // macOS는 첫 단추에 Return을 건다. ⌘W 뒤 Return이 세션을 끝내지 않도록 첫 단추는 취소다(Ruling D-R9).
         let buttons = close_buttons();
         let labels: Vec<_> = buttons.iter().map(|b| b.label().to_string()).collect();
-        assert_eq!(labels, ["취소", "닫기"]);
+        assert_eq!(labels, ["Cancel", "Close"]);
         // 취소를 Cancel 단추로 만들면 GPUI가 그 키를 Esc로 바꿔 Return이 아무 단추에도 걸리지 않는다.
         assert!(matches!(buttons[0], PromptButton::Other(_)));
         assert!(!close_confirmed(Some(0)));

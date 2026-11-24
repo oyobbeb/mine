@@ -65,7 +65,7 @@ fn label_w(labels: &Labels) -> usize {
 fn body(labels: &Labels) -> Vec<Line<'static>> {
     let key = Style::new().add_modifier(Modifier::BOLD);
     let label_w = label_w(labels);
-    let mut out = vec![Line::styled("새 세션", HEAD), Line::default()];
+    let mut out = vec![Line::styled("New session", HEAD), Line::default()];
     out.extend(ROWS.iter().map(|&(choice, k)| {
         let label = choice.label(labels);
         let pad = label_w.saturating_sub(Span::raw(label).width());
@@ -81,7 +81,7 @@ fn body(labels: &Labels) -> Vec<Line<'static>> {
         Line::from(spans)
     }));
     out.push(Line::default());
-    out.push(Line::styled("⌃a d 나가기", MUTED));
+    out.push(Line::styled("⌃a d detach", MUTED));
     out
 }
 
@@ -207,13 +207,13 @@ mod tests {
             texts,
             [
                 "kyoto  /p/kyoto",
-                "새 세션",
+                "New session",
                 "↵  claude-a    A",
                 "b  claude-b    B",
                 "x  codex       C",
                 "s  shell",
-                "n  이름·모델 직접 입력",
-                "⌃a d 나가기",
+                "n  Custom name and model",
+                "⌃a d detach",
             ]
         );
         // 열한 줄(빈 줄 포함) 덩이가 위아래 가운데이고, 메뉴 폭 덩이가 좌우 가운데다.
@@ -224,7 +224,7 @@ mod tests {
             (HEIGHT, (TERM.height - HEIGHT) / 2)
         );
         let width = menu_width(&Labels::default());
-        assert_eq!(width, 22);
+        assert_eq!(width, 24);
         let left = TERM.x + (TERM.width - width) / 2;
         for (_, x, _) in &rows {
             assert_eq!(*x, left);
@@ -285,7 +285,7 @@ mod tests {
                 "b  company-work  B",
                 "x  Codex         C",
                 "s  shell",
-                "n  이름·모델 직접 입력",
+                "n  Custom name and model",
             ]
         );
         for line in ["claude-a", "claude-b", "codex"] {
@@ -320,7 +320,7 @@ mod tests {
         // 줄 옆(메뉴 폭 밖)과 제목·머리·안내 줄은 아니다.
         assert_eq!(pick(y_of("↵"), left - 1), None);
         assert_eq!(pick(y_of("↵"), left + menu_width(&ids)), None);
-        for text in ["kyoto", "새 세션", "⌃a d"] {
+        for text in ["kyoto", "New session", "⌃a d"] {
             assert_eq!(pick(y_of(text), left + 1), None, "{text}");
         }
         assert_eq!(pick(y_of("↵") - 1, left), None);

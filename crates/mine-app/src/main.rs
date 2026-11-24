@@ -51,7 +51,7 @@ fn main() {
         cx.bind_keys(actions::bindings());
         cx.set_menus(vec![Menu {
             name: "mine".into(),
-            items: vec![MenuItem::action("mine 끝내기", Quit)],
+            items: vec![MenuItem::action("Quit mine", Quit)],
         }]);
         let view = root_view(cx);
         cx.set_global(MainView(view));
@@ -76,8 +76,7 @@ fn root_view(cx: &mut App) -> AnyView {
         exe_dir.as_deref(),
         std::env::var_os("PATH"),
     ) else {
-        let message =
-            "mine 실행 파일을 찾지 못했어요 · cargo install --path crates/mine-cli로 설치해 주세요";
+        let message = "Couldn't find the mine executable · install it with cargo install --path crates/mine-cli";
         return cx.new(|_| Problem(message.into())).into();
     };
     let (current, home_fallback) = current_project(&state);
@@ -119,6 +118,6 @@ fn open_window(cx: &mut App) {
         cx.new(|cx| Root::new(view, window, cx))
     });
     if let Err(e) = opened {
-        eprintln!("창을 열지 못했어요: {e:#}");
+        eprintln!("Couldn't open the window: {e:#}");
     }
 }
