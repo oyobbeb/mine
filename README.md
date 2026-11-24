@@ -108,6 +108,7 @@ mine ls                               # list sessions (tab-separated, script-fri
 mine new review --profile claude-b --model opus   # --account still works
 mine new dev                          # kind defaults to shell
 mine kill review                      # close a session (its directory and history stay)
+mine profile ls                       # list profiles (more under Configuration)
 mine projects                         # list registered projects
 mine --project ~/dev/app new dev      # pick the project explicitly
 ```
@@ -176,24 +177,67 @@ Freezes the scrollback so you can move around and copy with the keyboard.
 
 ## Configuration
 
-### Account labels
+### Profiles
 
-The UI shows a short name for each account instead of `claude-a` / `claude-b`:
+A profile is one login of Claude Code or Codex, with its own config home. Without any setup you have `claude-a` (your `~/.claude`), `codex` (your `~/.codex`), and `claude-b` if `~/.mine/profiles/claude-b` exists. Add as many more as you like:
 
-1. A label you set in `~/.mine/config.toml`:
+```sh
+mine profile ls                                   # id, kind, label, home, logged in, shared items (tab-separated)
+mine profile add team --kind claude --label work  # also --home PATH, --share a,b, --no-share
+mine profile login team                           # runs `claude auth login` (Codex: `codex login`) for that profile, in this terminal
+mine profile relink team [settings.json]          # puts a shared link back
+mine profile rm team                              # removes it from config.toml and keeps its directory
+mine new review --profile team                    # --account still works
+```
 
-   ```toml
-   [accounts.claude-a]
-   label = "personal"
+`mine new` without `--profile` uses the default profile of its kind. `add` and `rm` edit `~/.mine/config.toml` in place and keep your comments. A running daemon rereads the profiles right away. These commands never start one.
 
-   [accounts.claude-b]
-   label = "work"
-   ```
+Profiles live in `~/.mine/config.toml`, in the order the launcher shows them (and the order colors are handed out):
 
-2. Otherwise, the part before `@` in that Claude profile's login email. Codex shows as `Codex`.
-3. Otherwise, the account id.
+```toml
+[profiles.claude-a]          # your own ~/.claude
+kind = "claude"
+home = "default"
+default = true
+label = "personal"
 
-mine never reads or stores credentials. For automatic names it reads a single field, the login email in `.claude.json`, and never logs it. Labels are display-only: `mine ls`, `mine new --profile`, and the launcher's `n` prompt use the account ids.
+[profiles.team]
+kind = "claude"
+label = "work"
+color = "teal"
+share = ["skills", "commands"]   # only these are shared
+```
+
+| Key | Meaning |
+|---|---|
+| `kind` | `claude` or `codex`. Required. |
+| `home` | `"default"` is the CLI's own home (`~/.claude` with `~/.claude.json`, or `~/.codex`), for at most one profile per kind. A path (absolute, or starting with `~/`) is an existing directory, such as an older second login. Without `home`, mine uses `~/.mine/profiles/<id>`. |
+| `default` | `true` makes it the default of its kind: the launcher's Enter row, and the profile the others share from. Without any, the profile with `home = "default"` is the default, else the first of that kind. Moving it never moves anyone's home. |
+| `label` | The name shown in the UI. Without it, a Claude profile shows the part before `@` in its login email, a Codex profile at the default home shows `Codex`, and anything else shows its id. |
+| `color` | A palette name (`gold`, `violet`, `teal`, `green`, `blue`, `red`) or `#rrggbb`. Without it, colors follow the palette in file order. |
+| `share` | `true` (the default), `false`, or a list of items. See below. |
+
+A profile id is the key sessions store: letters, digits, and `_~-`, up to 64 characters, and it is never renamed (use `label`). Old `[accounts.<id>] label = "…"` entries still work as labels. A broken profile entry or an unknown key gives a warning that names the line or key, and a broken `[profiles]` table falls back to the built-in profiles, so a typo never leaves you without a login.
+
+**Exported `CLAUDE_CONFIG_DIR` and `CODEX_HOME` no longer apply to sessions.** A session uses its profile's home, whatever the shell that started the daemon exported. API keys such as `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` are removed from Claude and Codex sessions the same way, so nothing routes a profile around its login (shell sessions keep everything). If you pointed one of those variables at a second login, point a profile at it instead: `home = "~/path/to/that/directory"`.
+
+#### Sharing
+
+Profiles other than the default of their kind share your common setup by linking to the default profile's files:
+
+- Claude: `skills`, `commands`, `agents`, `CLAUDE.md`, `settings.json`, `plugins`, and `mcpServers`.
+- Codex: `AGENTS.md`, `prompts`, `config.toml`.
+
+Logins (`.claude.json`, `.credentials.json`, `auth.json`), conversations, and caches are never shared. `share = false` turns sharing off and a list shares only those items.
+
+- mine makes the links in `mine profile add` and checks them before each session launch. A missing link is created. A real file or directory at that path stays, which is how you split an item off, and `mine profile ls` shows it as `own`. A link that points somewhere else is left alone and reported.
+- `mcpServers` can't be a link, because `~/.claude.json` also holds the login. Before each launch of a non-default Claude profile, mine copies that one key from the default's `.claude.json` into the profile's. Servers with the same name are overwritten and the profile's other servers are kept.
+- When a CLI saves a linked file by writing a temporary file and renaming it, the link becomes a real file. `mine profile ls` shows it as `split`, and mine doesn't change it by itself. `mine profile relink team [item]` puts the link back and keeps the file it replaced as `<item>.mine-bak`.
+- If a shared `settings.json` sets `apiKeyHelper`, or an `env` entry such as `ANTHROPIC_API_KEY`, every profile would use that key. `mine profile ls` and the launch log warn about it (key names only) and mine leaves the file alone.
+
+The `share` column of `mine profile ls` reads `linked:N own:a,b split:c` (`elsewhere:` and `missing:` show when they apply), `off` when nothing is shared, and `-` for a profile that has no links.
+
+mine never reads or stores credentials. Whether a profile is logged in is decided by existence only: an `oauthAccount` field in `.claude.json`, or Codex's `auth.json` being there (it is never opened). For automatic names it reads one more field, the login email in `.claude.json`, and never logs it. Labels are display-only: `mine ls`, `mine new --profile`, and the launcher's `n` prompt use the profile ids.
 
 ### State directory
 
@@ -203,12 +247,13 @@ State lives in `~/.mine` (override with `MINE_STATE_DIR`).
 ~/.mine/
   daemon.sock           Unix socket clients attach to
   daemon.pid            lock file that keeps a single daemon running
-  config.toml           account labels (optional)
+  config.toml           profiles and labels (optional)
   projects/<key>.json   registered project paths
   sessions/<id>/        meta.json, events.jsonl (hook events), exit
   run/                  holder process sockets
   logs/                 daemon.log, hold-<id>.log
-  profiles/claude-b/    CLAUDE_CONFIG_DIR for the second Claude account
+  profiles/<id>/        config home of a profile without a `home` (`claude-b` is one)
+  profiles/<id>.links   the shared links mine made for that profile
 ```
 
 ### Upgrading

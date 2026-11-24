@@ -108,6 +108,7 @@ mine ls                               # 세션 목록 (탭으로 나눈 스크�
 mine new review --profile claude-b --model opus   # --account도 돼요
 mine new dev                          # 종류를 생략하면 shell
 mine kill review                      # 세션을 닫는다 (세션 폴더와 기록은 남는다)
+mine profile ls                       # 프로필 목록 (자세한 건 설정 참고)
 mine projects                         # 등록된 프로젝트
 mine --project ~/dev/app new dev      # 프로젝트를 직접 지정한다
 ```
@@ -176,24 +177,67 @@ mine --project ~/dev/app new dev      # 프로젝트를 직접 지정한다
 
 ## 설정
 
-### 계정 이름
+### 프로필
 
-화면에는 `claude-a` / `claude-b` 대신 짧은 이름이 보여요.
+프로필은 Claude Code나 Codex의 로그인 하나이고, 설정 폴더를 따로 가져요. 따로 설정하지 않아도 `claude-a`(`~/.claude`), `codex`(`~/.codex`)가 있고, `~/.mine/profiles/claude-b`가 있으면 `claude-b`도 있어요. 더 필요하면 얼마든지 추가해요.
 
-1. `~/.mine/config.toml`에 직접 정한 별칭:
+```sh
+mine profile ls                                   # id, 종류, 별칭, 홈, 로그인 여부, 공유 항목 (탭으로 나눔)
+mine profile add team --kind claude --label work  # --home PATH, --share a,b, --no-share도 돼요
+mine profile login team                           # 그 프로필로 `claude auth login`(Codex는 `codex login`)을 이 터미널에서 실행해요
+mine profile relink team [settings.json]          # 공유 링크를 되돌려요
+mine profile rm team                              # config.toml에서 지우고 폴더는 남겨요
+mine new review --profile team                    # --account도 돼요
+```
 
-   ```toml
-   [accounts.claude-a]
-   label = "personal"
+`--profile` 없이 `mine new`를 하면 그 종류의 기본 프로필을 써요. `add`와 `rm`은 `~/.mine/config.toml`을 그 자리에서 고치고 주석은 그대로 둬요. 실행 중인 데몬은 바로 프로필을 다시 읽어요. 이 명령들은 데몬을 새로 띄우지 않아요.
 
-   [accounts.claude-b]
-   label = "work"
-   ```
+프로필은 `~/.mine/config.toml`에 있고, 시작 화면에 보이는 순서(색을 나눠 주는 순서이기도 해요)는 파일 순서예요.
 
-2. 없으면 그 Claude 프로필의 로그인 이메일에서 `@` 앞부분. Codex는 `Codex`예요.
-3. 그것도 없으면 계정 id예요.
+```toml
+[profiles.claude-a]          # 내 ~/.claude
+kind = "claude"
+home = "default"
+default = true
+label = "personal"
 
-mine은 자격 증명을 읽거나 저장하지 않아요. 자동 이름을 위해 `.claude.json`의 로그인 이메일 한 필드만 읽고, 로그에 남기지 않아요. 별칭은 화면에만 쓰여서 `mine ls`, `mine new --profile`, 시작 화면의 `n` 입력은 계정 id를 그대로 써요.
+[profiles.team]
+kind = "claude"
+label = "work"
+color = "teal"
+share = ["skills", "commands"]   # 이 항목만 공유해요
+```
+
+| 키 | 뜻 |
+|---|---|
+| `kind` | `claude` 또는 `codex`예요. 꼭 있어야 해요. |
+| `home` | `"default"`는 CLI 자신의 홈(`~/.claude`와 `~/.claude.json`, 또는 `~/.codex`)이고, 종류마다 프로필 하나만 쓸 수 있어요. 경로(절대 경로나 `~/`로 시작)는 이미 있는 폴더예요. 예전에 로그인해 둔 두 번째 계정 같은 거요. `home`이 없으면 `~/.mine/profiles/<id>`를 써요. |
+| `default` | `true`면 그 종류의 기본 프로필이에요. 시작 화면의 Enter 줄이 되고, 다른 프로필이 공유를 받아 오는 곳이에요. 하나도 없으면 `home = "default"`인 프로필, 그것도 없으면 그 종류의 첫 프로필이 기본이에요. 기본을 옮겨도 누구의 홈도 옮겨지지 않아요. |
+| `label` | 화면에 보이는 이름이에요. 없으면 Claude 프로필은 로그인 이메일의 `@` 앞부분, 기본 홈의 Codex 프로필은 `Codex`, 나머지는 id가 보여요. |
+| `color` | 팔레트 이름(`gold`, `violet`, `teal`, `green`, `blue`, `red`)이나 `#rrggbb`예요. 없으면 파일 순서대로 팔레트에서 나눠 줘요. |
+| `share` | `true`(기본), `false`, 또는 항목 목록이에요. 아래를 보세요. |
+
+프로필 id는 세션이 저장하는 키예요. 글자, 숫자, `_~-`로 64자까지 쓰고, 한번 정하면 바꾸지 않아요(화면에 보이는 이름은 `label`로 바꿔요). 예전 `[accounts.<id>] label = "…"`도 별칭으로 계속 먹어요. 프로필 항목이 깨졌거나 모르는 키가 있으면 줄이나 키 이름을 알려 주는 경고만 나와요. `[profiles]` 표가 통째로 깨지면 내장 프로필로 돌아가서, 오타 때문에 로그인을 못 쓰는 일은 없어요.
+
+**셸에서 내보낸 `CLAUDE_CONFIG_DIR`과 `CODEX_HOME`은 이제 세션에 적용되지 않아요.** 세션은 데몬을 띄운 셸이 무엇을 내보냈든 자기 프로필의 홈을 써요. `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` 같은 API 키도 Claude와 Codex 세션에서는 같은 방식으로 빠져서, 프로필의 로그인을 우회하는 길이 없어요(셸 세션은 전부 그대로예요). 이 변수로 두 번째 로그인을 가리키고 있었다면, 대신 프로필이 그 폴더를 가리키게 하세요: `home = "~/그/폴더"`.
+
+#### 공유
+
+그 종류의 기본 프로필이 아닌 프로필은 기본 프로필의 파일에 링크를 걸어 공통 설정을 같이 써요.
+
+- Claude: `skills`, `commands`, `agents`, `CLAUDE.md`, `settings.json`, `plugins`, `mcpServers`.
+- Codex: `AGENTS.md`, `prompts`, `config.toml`.
+
+로그인(`.claude.json`, `.credentials.json`, `auth.json`), 대화, 캐시는 절대 공유하지 않아요. `share = false`면 공유하지 않고, 목록을 주면 그 항목만 공유해요.
+
+- 링크는 `mine profile add`가 만들고, 세션을 시작하기 전마다 확인해요. 없는 링크는 만들어요. 그 자리에 진짜 파일이나 폴더가 있으면 그대로 두는데, 항목을 따로 떼어 쓰는 방법이 이거예요. `mine profile ls`에는 `own`으로 보여요. 다른 곳을 가리키는 링크는 건드리지 않고 알려 줘요.
+- `mcpServers`는 `~/.claude.json`에 로그인도 같이 들어 있어서 링크로 걸 수 없어요. 기본이 아닌 Claude 프로필을 시작하기 전마다, 기본 프로필의 `.claude.json`에서 그 키 하나만 프로필의 `.claude.json`으로 복사해요. 이름이 같은 서버는 덮어쓰고 프로필의 다른 서버는 그대로 둬요.
+- CLI가 임시 파일에 쓴 뒤 이름을 바꾸는 방식으로 링크된 파일을 저장하면, 링크가 진짜 파일로 바뀌어요. `mine profile ls`에는 `split`으로 보이고, mine은 스스로 바꾸지 않아요. `mine profile relink team [항목]`이 링크를 되돌리고, 바뀌었던 파일은 `<항목>.mine-bak`으로 남겨 둬요.
+- 공유되는 `settings.json`에 `apiKeyHelper`나 `ANTHROPIC_API_KEY` 같은 `env` 항목이 있으면 모든 프로필이 그 키를 써요. `mine profile ls`와 세션 시작 로그가 키 이름만 써서 경고하고, 파일은 건드리지 않아요.
+
+`mine profile ls`의 공유 칸은 `linked:N own:a,b split:c`처럼 보여요(`elsewhere:`와 `missing:`은 해당할 때만 나와요). 아무것도 공유하지 않으면 `off`, 링크가 없는 프로필은 `-`예요.
+
+mine은 자격 증명을 읽거나 저장하지 않아요. 로그인했는지는 파일이 있는지만 봐요. `.claude.json`의 `oauthAccount` 필드나 Codex의 `auth.json`이 있는지만 보고, 열어 보지는 않아요. 자동 이름을 위해서는 `.claude.json`의 로그인 이메일 한 필드만 더 읽고, 로그에 남기지 않아요. 별칭은 화면에만 쓰여서 `mine ls`, `mine new --profile`, 시작 화면의 `n` 입력은 프로필 id를 그대로 써요.
 
 ### 상태 폴더
 
@@ -203,12 +247,13 @@ mine은 자격 증명을 읽거나 저장하지 않아요. 자동 이름을 위�
 ~/.mine/
   daemon.sock           클라이언트가 붙는 유닉스 소켓
   daemon.pid            데몬이 하나만 뜨게 하는 잠금 파일
-  config.toml           계정 별칭(선택)
+  config.toml           프로필과 별칭(선택)
   projects/<key>.json   등록된 프로젝트 경로
   sessions/<id>/        meta.json, events.jsonl(훅 이벤트), exit
   run/                  보관 프로세스 소켓
   logs/                 daemon.log, hold-<id>.log
-  profiles/claude-b/    두 번째 Claude 계정의 CLAUDE_CONFIG_DIR
+  profiles/<id>/        `home`이 없는 프로필의 설정 폴더(`claude-b`도 그래요)
+  profiles/<id>.links   mine이 그 프로필에 만든 공유 링크 기록
 ```
 
 ### 업그레이드

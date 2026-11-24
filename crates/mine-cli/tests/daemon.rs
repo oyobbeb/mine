@@ -1317,6 +1317,86 @@ fn unknown_profile_refuses_to_start() {
     assert_eq!(ls(&st)[0][4], "ended");
 }
 
+#[test]
+fn session_without_a_profile_gets_the_default_of_its_kind() {
+    // The id is stored at creation, so a session keeps its login even after the default of its kind moves to another profile.
+    let bin = tmp();
+    env_dumpers(bin.path());
+    let st = state_with_path(bin.path());
+    fs::create_dir_all(&st.root).unwrap();
+    let config = st.root.join("config.toml");
+    // `b` is the Claude default (it has the CLI's own home); no Codex profile is marked, so the first one is.
+    fs::write(
+        &config,
+        "[profiles.a]\nkind = \"claude\"\n[profiles.b]\nkind = \"claude\"\nhome = \"default\"\n\
+         [profiles.c]\nkind = \"codex\"\n[profiles.d]\nkind = \"codex\"\n",
+    )
+    .unwrap();
+    mine(&st, &["new", "x", "--kind", "claude"]);
+    mine(&st, &["new", "y", "--kind", "codex"]);
+    mine(&st, &["new", "s"]);
+    let account = |name: &str| {
+        let dir = st.root.join("sessions").join(st.id(name));
+        Meta::load(&dir).unwrap().account
+    };
+    assert_eq!(account("x").as_deref(), Some("b"));
+    assert_eq!(account("y").as_deref(), Some("c"));
+    assert_eq!(account("s"), None);
+    // An explicit profile still wins.
+    mine(&st, &["new", "z", "--profile", "a"]);
+    assert_eq!(account("z").as_deref(), Some("a"));
+    // Moving the default doesn't move the session: it still runs on `b`.
+    fs::write(
+        &config,
+        "[profiles.a]\nkind = \"claude\"\ndefault = true\n[profiles.b]\nkind = \"claude\"\nhome = \"default\"\n",
+    )
+    .unwrap();
+    assert_eq!(ls(&st).iter().find(|r| r[2] == "x").unwrap()[3], "b");
+}
+
+/// Every `Profiles` message the client has already been sent, read until `List` is answered.
+fn profile_ids_after_list(c: &mut Client) -> Vec<Vec<String>> {
+    c.send(&ToDaemon::List);
+    let mut lists = Vec::new();
+    loop {
+        match c.recv().expect("the connection dropped") {
+            FromDaemon::Profiles { profiles } => {
+                lists.push(profiles.into_iter().map(|p| p.id).collect());
+            }
+            FromDaemon::Sessions { .. } => return lists,
+            _ => {}
+        }
+    }
+}
+
+#[test]
+fn profile_add_and_rm_reach_a_running_daemon() {
+    let bin = tmp();
+    fake_claude(bin.path());
+    let st = state_with_path(bin.path());
+    ls(&st); // Starts the daemon.
+    let mut c = client(&st);
+    mine(&st, &["profile", "add", "team", "--kind", "claude"]);
+    // The command doesn't return before the daemon has reloaded, so a new session can use the profile right away.
+    mine(&st, &["new", "t", "--profile", "team"]);
+    mine(&st, &["profile", "rm", "team"]);
+    let lists = profile_ids_after_list(&mut c);
+    assert_eq!(lists.len(), 2, "{lists:?}");
+    assert!(lists[0].contains(&"team".to_string()), "{lists:?}");
+    assert!(!lists[1].contains(&"team".to_string()), "{lists:?}");
+    // Nothing else is touched: the running session keeps its profile.
+    assert_eq!(ls(&st)[0][3], "team");
+}
+
+#[test]
+fn profile_commands_never_start_a_daemon() {
+    let st = state();
+    mine(&st, &["profile", "add", "team", "--kind", "claude"]);
+    mine(&st, &["profile", "rm", "team"]);
+    assert!(daemon_pid(&st).is_none());
+    assert!(!st.sock().exists());
+}
+
 #[tokio::test]
 async fn spawned_daemon_uses_given_env() {
     // The desktop app starts the daemon with the login shell's environment instead of its own.

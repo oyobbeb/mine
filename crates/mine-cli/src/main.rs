@@ -13,6 +13,7 @@ use mine_core::{hooks, paths, project};
 mod client;
 mod daemon;
 mod hold;
+mod profile_cmd;
 
 #[derive(Parser)]
 #[command(name = "mine", version, about = "AI coding agent session multiplexer")]
@@ -39,6 +40,9 @@ enum Cmd {
         /// Session name.
         name: String,
     },
+    /// Claude and Codex profiles: list, add, log in, relink shared items, remove.
+    #[command(subcommand)]
+    Profile(profile_cmd::Cmd),
     /// Open the desktop app: the installed mine.app, else a `mine-app` next to `mine` or on PATH.
     App,
     /// Holder process that owns a session's PTY. The daemon starts it.
@@ -187,6 +191,7 @@ fn main() -> Result<()> {
                 .and_then(|state| hooks::run_event_cmd(&state, &dir, std::io::stdin().lock()));
         }
         Some(Cmd::App) => run_app()?,
+        Some(Cmd::Profile(cmd)) => profile_cmd::run(cmd)?,
         Some(Cmd::Projects) => {
             let state = paths::State::from_env()?;
             for p in project::registered(&state)? {

@@ -171,7 +171,7 @@ pub(crate) fn aliases(config: &toml::Table) -> HashMap<String, String> {
 }
 
 /// Text to show on screen. Trims surrounding whitespace; if it is empty or has control characters it could break the display, so it isn't used.
-pub(crate) fn clean(text: &str) -> Option<String> {
+pub fn clean(text: &str) -> Option<String> {
     let text = text.trim();
     (!text.is_empty() && !text.chars().any(char::is_control)).then(|| text.to_string())
 }

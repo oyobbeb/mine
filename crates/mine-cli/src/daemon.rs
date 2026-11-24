@@ -40,7 +40,7 @@ use crate::hold;
 use mine_core::conn::restart_hint;
 use mine_core::hooks::{self, Event, EventKind, now_ms};
 use mine_core::paths::{State, check_sock_path, ensure_dir};
-use mine_core::profiles::{self, ProfileInfo, Profiles};
+use mine_core::profiles::{self, ProfileInfo, ProfileKind, Profiles};
 use mine_core::project::{self, project_key};
 use mine_core::proto::{
     DaemonInfo, FromDaemon, HOLD_VERSION, HoldIn, HoldOut, MIN_CLIENT_VERSION, ToDaemon, VERSION,
@@ -468,7 +468,7 @@ async fn create(shared: &Shared, spec: NewSession) -> Result<()> {
         )
     })?;
     let id = session_id(&project_key(&project), &spec.name);
-    let start = {
+    let (start, account) = {
         let mut d = shared.lock().await;
         if d.closing.contains_key(&id) {
             bail!(
@@ -481,7 +481,14 @@ async fn create(shared: &Shared, spec: NewSession) -> Result<()> {
         if d.sessions.contains_key(&id) || !d.starting.insert(id.clone()) {
             bail!("A session with the same name already exists: {}", spec.name);
         }
-        d.start()
+        // No profile means the default of the kind. Its id is stored now, so the session keeps that login if the default moves.
+        let default = match spec.kind {
+            Kind::Claude => d.profiles.default_of(ProfileKind::Claude),
+            Kind::Codex => d.profiles.default_of(ProfileKind::Codex),
+            Kind::Shell => None,
+        };
+        let account = spec.account.or(default.map(|p| p.id.clone()));
+        (d.start(), account)
     };
     let restore = match spec.kind {
         Kind::Shell => Restore::None,
@@ -492,7 +499,7 @@ async fn create(shared: &Shared, spec: NewSession) -> Result<()> {
         project,
         name: spec.name,
         kind: spec.kind,
-        account: spec.account,
+        account,
         model: spec.model,
         restore,
         created_ms: now_ms(),
@@ -629,9 +636,11 @@ async fn start_holder(start: &Start, meta: &Meta) -> Result<Started> {
     if let Some(profile) = session::profile(meta.kind, meta.account.as_deref(), profiles)? {
         let why = |what: &str| format!("{}: profile {}: {what}", meta.id, profile.id);
         match share::prepare(profile, profiles, state, user_home) {
-            Ok(report) => report.warnings.iter().for_each(|w| eprintln!("{}", why(w))),
-            Err(e) if !profile.home_dir(state, user_home).is_dir() => return Err(e),
-            Err(e) => eprintln!("{}", why(&format!("{e:#}"))),
+            Ok(report) => {
+                (report.warnings.iter().chain(&report.errors)).for_each(|w| eprintln!("{}", why(w)))
+            }
+            // Only a home that can't be created stops the start.
+            Err(e) => return Err(e),
         }
     }
     let dir = state.session_dir(&meta.id);
@@ -655,14 +664,8 @@ async fn start_holder(start: &Start, meta: &Meta) -> Result<Started> {
     let mut cmd = tokio::process::Command::new(exe);
     // portable-pty passes the holder process's environment to the child as it is, so the environment of the shell that started the daemon is cleared here,
     // along with the variables that would route claude or codex around the profile's login.
-    let bypass = session::bypass_vars(meta.kind);
-    for (key, _) in std::env::vars_os() {
-        if key
-            .to_str()
-            .is_some_and(|key| session::is_leaked_env(key) || bypass.contains(&key))
-        {
-            cmd.env_remove(&key);
-        }
+    for key in session::env_to_remove(meta.kind) {
+        cmd.env_remove(key);
     }
     cmd.arg("hold")
         .arg("--sock")

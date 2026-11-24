@@ -55,6 +55,25 @@ impl Conn {
         Conn::handshake(stream, state)
     }
 
+    /// Tells a running daemon to reread `config.toml` (`ReloadProfiles`). Never starts one: with none running, it returns
+    /// `Ok(false)` and there is nothing to tell (the next daemon reads the file itself).
+    ///
+    /// `request` can't carry this message: the daemon answers it with `Profiles`, which `request` skips, so it would wait out
+    /// `REPLY_WAIT`. Instead the message is followed by a `List`. A daemon handles one client's messages in order, so its answer
+    /// means the reload is done, and a `mine new` right after sees the new list.
+    pub fn reload_profiles(state: &State) -> Result<bool> {
+        let sock = state.daemon_sock();
+        check_sock_path(&sock)?;
+        let Ok(stream) = UnixStream::connect(&sock) else {
+            return Ok(false);
+        };
+        let mut conn = Conn::handshake(stream, state)?;
+        write_msg(&mut conn.writer, &ToDaemon::ReloadProfiles)
+            .context("Couldn't send the request to the daemon")?;
+        conn.request(&ToDaemon::List)?;
+        Ok(true)
+    }
+
     /// Async version of [`Conn::connect_or_spawn`]. Starts and waits for the daemon the same way.
     pub async fn connect_or_spawn_async(state: &State) -> Result<AsyncConn> {
         connect_or_spawn_async_with(state, &current_exe()?, None).await

@@ -203,6 +203,17 @@ pub fn bypass_vars(kind: Kind) -> &'static [&'static str] {
     }
 }
 
+/// The variables in this process's environment that a claude or codex child must not inherit: [`is_leaked_env`] and [`bypass_vars`].
+/// The daemon removes them when it starts a holder process, and `mine profile login` removes them from the CLI it runs, so a session
+/// and a login get the same environment. Nothing is removed for a shell, except what [`is_leaked_env`] names.
+pub fn env_to_remove(kind: Kind) -> impl Iterator<Item = std::ffi::OsString> {
+    let bypass = bypass_vars(kind);
+    std::env::vars_os().map(|(key, _)| key).filter(move |key| {
+        key.to_str()
+            .is_some_and(|key| is_leaked_env(key) || bypass.contains(&key))
+    })
+}
+
 /// Login shell path. `/bin/zsh` if `SHELL` is empty or unset.
 pub fn login_shell() -> String {
     std::env::var("SHELL")

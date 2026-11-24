@@ -176,6 +176,9 @@ impl Profile {
 pub struct Profiles {
     /// In config order, which is the launcher order and the color order.
     pub list: Vec<Profile>,
+    /// `list` is the built-in list, not the config's: there is no `[profiles]` table, or it is empty or has no usable profile, or the
+    /// file couldn't be read. `mine profile add` and `rm` write the built-ins out before they change anything, so they don't disappear.
+    pub builtin: bool,
 }
 
 impl Profiles {
@@ -221,13 +224,14 @@ impl Profiles {
                 return (
                     Profiles {
                         list: builtin(state),
+                        builtin: true,
                     },
                     warnings,
                 );
             }
         };
-        let mut list = match table.get("profiles") {
-            None => builtin(state),
+        let (mut list, is_builtin) = match table.get("profiles") {
+            None => (builtin(state), true),
             Some(toml::Value::Table(entries)) => {
                 let mut list: Vec<Profile> = Vec::new();
                 for (id, value) in entries {
@@ -262,9 +266,9 @@ impl Profiles {
                     warnings.push(
                         "[profiles] has no usable profile; using the built-in profiles".into(),
                     );
-                    builtin(state)
+                    (builtin(state), true)
                 } else {
-                    list
+                    (list, false)
                 }
             }
             Some(_) => {
@@ -272,7 +276,7 @@ impl Profiles {
                     "profiles must be a table ([profiles.<id>]); using the built-in profiles"
                         .into(),
                 );
-                builtin(state)
+                (builtin(state), true)
             }
         };
         // Old `[accounts.<id>] label` entries fill in the profiles that have no label of their own.
@@ -280,7 +284,13 @@ impl Profiles {
         for profile in list.iter_mut().filter(|p| p.label.is_none()) {
             profile.label = aliases.get(&profile.id).cloned();
         }
-        (Profiles { list }, warnings)
+        (
+            Profiles {
+                list,
+                builtin: is_builtin,
+            },
+            warnings,
+        )
     }
 
     pub fn get(&self, id: &str) -> Option<&Profile> {
@@ -1091,6 +1101,32 @@ mod tests {
             get("cold").env(state, home),
             Some(("CODEX_HOME", home.join("cold")))
         );
+    }
+
+    #[test]
+    fn builtin_flag_says_where_the_list_came_from() {
+        let env = Env::new();
+        // The built-in list: no file, no table, an empty table, a table with nothing usable, a table of the wrong type, a bad file.
+        for text in [
+            None,
+            Some("[hosts]\nbox = \"ssh\"\n"),
+            Some("[profiles]\n"),
+            Some("[profiles.a]\nkind = \"claud\"\n"),
+            Some("profiles = 3\n"),
+            Some("[profiles\n"),
+        ] {
+            if let Some(text) = text {
+                env.config(text);
+            }
+            let (p, _) = env.load();
+            assert!(p.builtin, "{text:?}");
+            assert_eq!(ids(&p), ["claude-a", "codex"], "{text:?}");
+        }
+        // One usable profile is the config's own list, even next to a broken one.
+        env.config("[profiles.a]\nkind = \"claud\"\n[profiles.b]\nkind = \"codex\"\n");
+        let (p, _) = env.load();
+        assert!(!p.builtin);
+        assert_eq!(ids(&p), ["b"]);
     }
 
     #[test]

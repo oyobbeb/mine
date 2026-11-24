@@ -42,6 +42,8 @@ pub enum LinkState {
     NoSource,
     /// `share` leaves the item out.
     Off,
+    /// Not linked yet: the next [`prepare`] links it. Only [`inspect`] reports this; `prepare` links it instead.
+    Missing,
 }
 
 #[derive(Debug, Default)]
@@ -50,6 +52,9 @@ pub struct ShareReport {
     pub items: Vec<(String, LinkState)>,
     /// Auth settings found in the profile's `settings.json` (key names only).
     pub warnings: Vec<String>,
+    /// What [`prepare`] couldn't do: a link, the `.links` record, or the MCP copy. One entry per failure, in that order. The rest
+    /// of the work is still done.
+    pub errors: Vec<String>,
 }
 
 /// Where a profile's links point.
@@ -90,8 +95,9 @@ fn wants(profile: &Profile, item: &str) -> bool {
 /// reports what it found. A real file or a link to something else is left alone. A profile that keeps the CLI's own home, or
 /// is the default of its kind, has no links: the report is empty and nothing is touched.
 ///
-/// Fails when the home, a link, `.links`, or `.claude.json` can't be written, or when a `.claude.json` that has to be changed
-/// isn't JSON (it is never overwritten). The caller decides whether that stops the launch.
+/// Fails only when the home can't be created. A link, the `.links` record, or `.claude.json` that can't be written (or a
+/// `.claude.json` that has to be changed but isn't JSON: it is never overwritten) goes in `ShareReport::errors`, and the steps
+/// after it still run, so one bad item doesn't hide the MCP copy or the auth warnings. The caller decides what the errors mean.
 pub fn prepare(
     profile: &Profile,
     profiles: &Profiles,
@@ -134,16 +140,61 @@ pub fn prepare(
         }
         Ok(())
     })();
-    links.save(state, profile.kind)?;
-    linked?;
+    // The link error comes first: a record that can't be saved is usually the same trouble, and shouldn't be what the user reads.
+    let saved = links.save(state, profile.kind);
+    for failed in [linked, saved].into_iter().filter_map(Result::err) {
+        report.errors.push(format!("{failed:#}"));
+    }
     if profile.kind.shareable().contains(&MCP) && wants(profile, MCP) {
         let from = plan.source.claude_json(state, user_home);
-        let item = if copy_mcp(&from, &profile.claude_json(state, user_home))? {
-            LinkState::Linked
+        match copy_mcp(&from, &profile.claude_json(state, user_home)) {
+            Ok(true) => report.items.push((MCP.to_string(), LinkState::Linked)),
+            Ok(false) => report.items.push((MCP.to_string(), LinkState::NoSource)),
+            Err(e) => report.errors.push(format!("{e:#}")),
+        }
+    }
+    if profile.kind == ProfileKind::Claude {
+        report.warnings = auth_warnings(&plan.home.join("settings.json"));
+    }
+    Ok(report)
+}
+
+/// What [`prepare`] would find, without changing anything: no home is created, no link made, nothing copied (`mine profile ls`).
+/// What `prepare` would still link shows as [`LinkState::Missing`]. Fails only on a file it can't read: an item that can't be
+/// looked at, or a `.claude.json` that isn't JSON.
+pub fn inspect(
+    profile: &Profile,
+    profiles: &Profiles,
+    state: &State,
+    user_home: &Path,
+) -> Result<ShareReport> {
+    let mut report = ShareReport::default();
+    let Some(plan) = plan(profile, profiles, state, user_home) else {
+        return Ok(report);
+    };
+    let links = Links::load(state, &profile.id);
+    for &name in profile.kind.shareable() {
+        let item = if !wants(profile, name) {
+            LinkState::Off
+        } else if name == MCP {
+            let from = servers(&plan.source.claude_json(state, user_home))?;
+            let own = servers(&profile.claude_json(state, user_home))?;
+            match from {
+                None => LinkState::NoSource,
+                Some(from) if own.is_some_and(|own| from.keys().all(|k| own.contains_key(k))) => {
+                    LinkState::Linked
+                }
+                Some(_) => LinkState::Missing,
+            }
         } else {
-            LinkState::NoSource
+            let from = plan.source_home.join(name);
+            match probe(&plan.home.join(name), &from, links.has(name))? {
+                Some(item) => item,
+                None if from.exists() => LinkState::Missing,
+                None => LinkState::NoSource,
+            }
         };
-        report.items.push((MCP.to_string(), item));
+        report.items.push((name.to_string(), item));
     }
     if profile.kind == ProfileKind::Claude {
         report.warnings = auth_warnings(&plan.home.join("settings.json"));
@@ -340,11 +391,7 @@ pub fn sync_mcp(default_json: &Path, profile_json: &Path) -> Result<()> {
 
 /// [`sync_mcp`], returning whether the default has servers to share.
 fn copy_mcp(default_json: &Path, profile_json: &Path) -> Result<bool> {
-    let servers = read_json(default_json)?.and_then(|mut config| match config.remove(MCP) {
-        Some(Value::Object(servers)) if !servers.is_empty() => Some(servers),
-        _ => None,
-    });
-    let Some(servers) = servers else {
+    let Some(servers) = servers(default_json)? else {
         return Ok(false);
     };
     let mut config = read_json(profile_json)?.unwrap_or_default();
@@ -361,6 +408,16 @@ fn copy_mcp(default_json: &Path, profile_json: &Path) -> Result<bool> {
         write_atomic(profile_json, &bytes)?;
     }
     Ok(true)
+}
+
+/// The `mcpServers` object of a `.claude.json`. `None` when the file is missing or has no servers.
+fn servers(json: &Path) -> Result<Option<Map<String, Value>>> {
+    Ok(
+        read_json(json)?.and_then(|mut config| match config.remove(MCP) {
+            Some(Value::Object(servers)) if !servers.is_empty() => Some(servers),
+            _ => None,
+        }),
+    )
 }
 
 /// A `.claude.json` as a JSON object. `None` for a missing or empty file. Errors name the file and the position, never the content.
@@ -381,7 +438,8 @@ fn read_json(path: &Path) -> Result<Option<Map<String, Value>>> {
 }
 
 /// Writes `bytes` to a temp file beside `path` and renames it over `path`. A new file is private (0600); an existing file keeps its mode.
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+/// `mine profile` uses it for `config.toml` too.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let mut name = OsString::from(".");
     name.push(path.file_name().unwrap_or_default());
@@ -1088,12 +1146,135 @@ mod tests {
             r#"{"mcpServers":{"a":{"command":"x"}}}"#,
         );
         write(env.team().join(".claude.json"), "{not json");
-        let team = env.profile("team");
-        assert!(prepare(team, &env.profiles, &env.state, &env.home).is_err());
+        let report = env.prepare("team");
+        assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
+        assert!(report.errors[0].contains(".claude.json"));
         assert!(is_link_to(
             &env.team().join("skills"),
             &env.src().join("skills")
         ));
         assert_eq!(env.links("team"), FILES_AND_DIRS);
+    }
+
+    /// Makes a directory read-only until dropped, so a test that fails halfway still leaves a temp directory that can be removed.
+    struct ReadOnly(PathBuf);
+
+    impl ReadOnly {
+        fn new(path: PathBuf) -> ReadOnly {
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o500)).unwrap();
+            ReadOnly(path)
+        }
+    }
+
+    impl Drop for ReadOnly {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o700));
+        }
+    }
+
+    #[test]
+    fn a_failed_link_still_copies_mcp_and_reports_warnings() {
+        // Nothing can be linked into a read-only home. The MCP copy is still tried (it fails here: the profile's `.claude.json`
+        // isn't JSON), and the auth setting in the profile's own `settings.json` is still reported.
+        let env = Env::seeded("");
+        write(
+            env.home.join(".claude.json"),
+            r#"{"mcpServers":{"a":{"command":"x"}}}"#,
+        );
+        write(env.team().join(".claude.json"), "{not json");
+        write(
+            env.team().join("settings.json"),
+            r#"{"apiKeyHelper":"/bin/k"}"#,
+        );
+        let _read_only = ReadOnly::new(env.team());
+        let report = env.prepare("team");
+        assert_eq!(report.errors.len(), 2, "{:?}", report.errors);
+        assert!(
+            report.errors[0].contains("Couldn't link"),
+            "{:?}",
+            report.errors
+        );
+        assert!(
+            report.errors[1].contains(".claude.json"),
+            "{:?}",
+            report.errors
+        );
+        assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+        assert!(!report.errors.concat().contains("/bin/k"));
+    }
+
+    #[test]
+    fn a_links_file_error_does_not_hide_the_link_error() {
+        // The record lists `skills`, which the default profile no longer has, so the record has to be rewritten. It can't be (the
+        // profiles directory is read-only), and the next item can't be linked either (the profile's home is read-only).
+        let env = Env::seeded("");
+        fs::remove_dir_all(env.src().join("skills")).unwrap();
+        write(env.links_file("team"), "skills\n");
+        fs::create_dir_all(env.team()).unwrap();
+        let _home = ReadOnly::new(env.team());
+        let _profiles = ReadOnly::new(env.state.profiles_dir());
+        let report = env.prepare("team");
+        assert_eq!(report.errors.len(), 2, "{:?}", report.errors);
+        assert!(
+            report.errors[0].contains("Couldn't link"),
+            "{:?}",
+            report.errors
+        );
+        assert!(
+            report.errors[1].contains("team.links"),
+            "{:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn inspect_changes_nothing_and_reports_what_prepare_would_do() {
+        let env = Env::seeded("share = [\"skills\", \"commands\", \"settings.json\", \"plugins\"]");
+        write(env.team().join("settings.json"), "{}");
+        let report = inspect(env.profile("team"), &env.profiles, &env.state, &env.home).unwrap();
+        // Missing items are not linked by looking at them. A real file is the profile's own.
+        assert_eq!(state_of(&report, "skills"), LinkState::Missing);
+        assert_eq!(state_of(&report, "settings.json"), LinkState::Own);
+        assert_eq!(state_of(&report, "agents"), LinkState::Off);
+        assert!(!env.team().join("skills").exists() && !env.links_file("team").exists());
+        // After a prepare, the same view says linked, and a rename-over is split.
+        env.prepare("team");
+        let look = || inspect(env.profile("team"), &env.profiles, &env.state, &env.home).unwrap();
+        assert_eq!(state_of(&look(), "skills"), LinkState::Linked);
+        fs::remove_file(env.team().join("skills")).unwrap();
+        write(env.team().join("skills/mine"), "x");
+        assert_eq!(state_of(&look(), "skills"), LinkState::Split);
+        assert!(!is_link_to(
+            &env.team().join("skills"),
+            &env.src().join("skills")
+        ));
+    }
+
+    #[test]
+    fn inspect_sees_the_mcp_copy() {
+        let env = Env::seeded("");
+        write(
+            env.home.join(".claude.json"),
+            r#"{"mcpServers":{"a":{"command":"x"}}}"#,
+        );
+        let look = || inspect(env.profile("team"), &env.profiles, &env.state, &env.home).unwrap();
+        assert_eq!(state_of(&look(), "mcpServers"), LinkState::Missing);
+        env.prepare("team");
+        assert_eq!(state_of(&look(), "mcpServers"), LinkState::Linked);
+        // The default has none: nothing to share.
+        write(env.home.join(".claude.json"), "{}");
+        assert_eq!(state_of(&look(), "mcpServers"), LinkState::NoSource);
+        // The default profile itself has no links to look at.
+        assert!(
+            inspect(
+                env.profile("claude-a"),
+                &env.profiles,
+                &env.state,
+                &env.home
+            )
+            .unwrap()
+            .items
+            .is_empty()
+        );
     }
 }

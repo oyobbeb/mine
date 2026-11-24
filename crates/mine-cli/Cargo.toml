@@ -20,6 +20,7 @@ mine-core = { path = "../mine-core" }
 portable-pty.workspace = true
 ratatui.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+toml_edit.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
