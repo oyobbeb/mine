@@ -812,6 +812,136 @@ fn input_during_approval_returns_to_working() {
     wait_until(|| ls(&st)[0][4] == "working");
 }
 
+/// A fake `claude` and `codex` that stay up in raw mode, as the real ones do: a written `\x03` is a byte, not a SIGINT that ends them.
+/// They print `READY` once the terminal is raw. Returns the session (`w`) of that kind, given a prompt so it is Working, with a
+/// client attached to it.
+fn working_session(kind: &str) -> (tempfile::TempDir, St, Client) {
+    let bin = tmp();
+    for name in ["claude", "codex"] {
+        let path = bin.path().join(name);
+        fs::write(
+            &path,
+            "#!/bin/sh\nstty raw -echo\necho READY\nexec sleep 60\n",
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let st = state_with_path(bin.path());
+    mine(&st, &["new", "w", "--kind", kind]);
+    let mut c = client(&st);
+    // A slow start must not let the first `\x03` reach a terminal that isn't raw yet.
+    if !c.attach("w").contains("READY") {
+        c.wait_output("READY");
+    }
+    prompt(&st);
+    (bin, st, c)
+}
+
+/// The hook of a prompt to session `w`, then waits for the daemon to show it Working.
+fn prompt(st: &St) {
+    mine_stdin(
+        st,
+        &["_event", &session_dir(st, "w")],
+        r#"{"hook_event_name":"UserPromptSubmit","prompt":"go"}"#,
+    );
+    wait_until(|| ls(st)[0][4] == "working");
+}
+
+/// Sends `data` as input and waits until the daemon has handled it. Messages on one connection are handled in order, so the
+/// `Snapshot` that answers a new `Attach` can only arrive after the `Input`.
+fn input_and_sync(c: &mut Client, data: &[u8]) {
+    let id = c.attached.clone().expect("no attached session");
+    c.send(&ToDaemon::Input {
+        id,
+        data: data.to_vec(),
+    });
+    c.attach("w");
+}
+
+#[test]
+fn bare_ctrl_c_while_working_goes_idle() {
+    for kind in ["claude", "codex"] {
+        let (_bin, st, mut c) = working_session(kind);
+        input_and_sync(&mut c, b"\x03");
+        wait_until(|| ls(&st)[0][4] == "idle");
+        // Any later hook event wins, and a bare Esc interrupts the next turn the same way.
+        prompt(&st);
+        input_and_sync(&mut c, b"\x1b");
+        wait_until(|| ls(&st)[0][4] == "idle");
+    }
+}
+
+#[test]
+fn escape_sequence_keeps_working() {
+    let (_bin, st, mut c) = working_session("claude");
+    // An arrow key, and a bare byte inside a longer input.
+    for data in [&b"\x1b[A"[..], b"\x03\x03", b"a\x03"] {
+        input_and_sync(&mut c, data);
+        assert_eq!(ls(&st)[0][4], "working", "{data:?}");
+    }
+}
+
+#[test]
+fn paste_with_ctrl_c_keeps_working() {
+    let (_bin, st, mut c) = working_session("claude");
+    input_and_sync(&mut c, b"\x1b[200~a\x03b\x1b[201~");
+    assert_eq!(ls(&st)[0][4], "working");
+}
+
+#[test]
+fn bare_ctrl_c_outside_working_changes_nothing() {
+    let (_bin, st, mut c) = working_session("claude");
+    mine_stdin(
+        &st,
+        &["_event", &session_dir(&st, "w")],
+        r#"{"hook_event_name":"Stop"}"#,
+    );
+    // The attached client is looking at it, so the finished turn counts as read.
+    wait_until(|| ls(&st)[0][4] == "idle");
+    input_and_sync(&mut c, b"\x03");
+    let events =
+        fs::read_to_string(Path::new(&session_dir(&st, "w")).join("events.jsonl")).unwrap();
+    assert!(!events.contains("Interrupt"), "{events}");
+}
+
+#[test]
+fn event_cmd_fails_open() {
+    let st = state();
+    let payload = r#"{"hook_event_name":"Stop","last_assistant_message":"SECRET-REPLY"}"#;
+    let exists = st.root.join("sessions").join("k1-rust");
+    fs::create_dir_all(&exists).unwrap();
+    let missing = st.root.join("sessions").join("gone");
+    let check = |out: Output| {
+        assert!(out.status.success(), "{:?}", out.status);
+        assert!(out.stdout.is_empty(), "{:?}", out.stdout);
+    };
+    // A session directory that no longer exists, garbage on stdin, and no daemon (the payload is fine, the directory exists).
+    check(mine_stdin(
+        &st,
+        &["_event", &missing.to_string_lossy()],
+        payload,
+    ));
+    check(mine_stdin(
+        &st,
+        &["_event", &exists.to_string_lossy()],
+        "SECRET-NOT-JSON",
+    ));
+    check(mine_stdin(
+        &st,
+        &["_event", &exists.to_string_lossy()],
+        payload,
+    ));
+    // Arguments the hook could not parse still must not fail the CLI (exit code 2 would block it).
+    check(mine_raw(&st, &["_event"]));
+    check(mine_raw(&st, &["_event", "--nonsense"]));
+    // One short line per failure, never the payload.
+    let log = fs::read_to_string(st.root.join("logs").join("hooks.log")).unwrap();
+    assert_eq!(log.lines().count(), 3, "{log}");
+    assert!(!log.contains("SECRET"), "{log}");
+    // And no daemon was started on the way.
+    assert!(daemon_pid(&st).is_none());
+}
+
 #[test]
 fn viewing_a_done_session_makes_it_idle() {
     let st = state();

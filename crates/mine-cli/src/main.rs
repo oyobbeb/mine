@@ -175,7 +175,12 @@ fn parse_env(s: &str) -> Result<(String, String), String> {
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        // Arguments `_event` can't parse still must not fail the stock CLI: clap would exit with 2, and a hook exiting 2 blocks it.
+        Err(_) if std::env::args().nth(1).as_deref() == Some("_event") => return Ok(()),
+        Err(e) => e.exit(),
+    };
     match cli.cmd {
         // The holder process doesn't use the state directory, so it starts even without HOME.
         Some(Cmd::Hold {
@@ -185,10 +190,12 @@ fn main() -> Result<()> {
             env,
             argv,
         }) => hold::run(&sock, &exit, &cwd, env, argv)?,
-        // A hook must not block or fail the stock CLI, so no error is reflected in the exit code.
+        // A hook must not block or fail the stock CLI: it exits 0 and prints nothing, and a failure goes to logs/hooks.log.
+        // Without a state directory there is nowhere to note it.
         Some(Cmd::Event { dir }) => {
-            let _ = paths::State::from_env()
-                .and_then(|state| hooks::run_event_cmd(&state, &dir, std::io::stdin().lock()));
+            if let Ok(state) = paths::State::from_env() {
+                hooks::run_event_cmd(&state, &dir, std::io::stdin().lock());
+            }
         }
         Some(Cmd::App) => run_app()?,
         Some(Cmd::Profile(cmd)) => profile_cmd::run(cmd)?,

@@ -312,7 +312,8 @@ pub fn launch(
                 json!(command)
             );
             argv.push("codex".to_string());
-            for event in ["UserPromptSubmit", "Stop"] {
+            // Codex 0.171 knows `PermissionRequest`; mine only listens to it. The hook prints nothing, so Codex's own prompt decides.
+            for event in ["UserPromptSubmit", "Stop", "PermissionRequest"] {
                 argv.extend(["-c".to_string(), format!("hooks.{event}={value}")]);
             }
             if let Some(model) = &meta.model {
@@ -569,7 +570,11 @@ mod tests {
                 .iter()
                 .any(|a| { a.starts_with("hooks.Stop=[{hooks=[{type=\"command\",command=\"") })
         );
-        assert_eq!(l.argv.iter().filter(|a| *a == "-c").count(), 2);
+        // The installed Codex (0.171) has a `PermissionRequest` hook. mine only reads it: it sets Needs approval and never decides.
+        assert!(l.argv.iter().any(|a| {
+            a.starts_with("hooks.PermissionRequest=[{hooks=[{type=\"command\",command=\"")
+        }));
+        assert_eq!(l.argv.iter().filter(|a| *a == "-c").count(), 3);
         assert_eq!(session_env(&l), Some("k1-rust"));
         assert!(!l.env.iter().any(|(k, _)| k == "CLAUDE_CONFIG_DIR"));
         // A string inside a TOML value must read as a JSON string and give back the original command.

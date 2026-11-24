@@ -1358,7 +1358,9 @@ impl Daemon {
         self.publish();
     }
 
-    /// `Input`: sends it to the holder process. If it was waiting for approval, records an `Input` event.
+    /// `Input`: sends it to the holder process. If it was waiting for approval, records an `Input` event. If a claude or codex session
+    /// was Working and the input is exactly one ⌃C or one Esc, records an `Interrupt`: neither CLI fires a `Stop` for that, so the
+    /// session would stay Working forever. An arrow key (`\x1b[A`) or a paste that contains a ⌃C is longer than one byte and is no interrupt.
     fn input(&mut self, client: u64, id: &str, data: Vec<u8>) {
         let Some(c) = self.clients.get(&client) else {
             return;
@@ -1374,20 +1376,26 @@ impl Daemon {
         if let Some(size) = size {
             s.resize(size);
         }
+        let bare_interrupt = matches!(data.as_slice(), [0x03] | [0x1b]);
         s.send_hold(HoldIn::Input { data });
-        if s.state == SessionState::Approval {
-            let ev = Event {
-                ms: now_ms(),
-                kind: EventKind::Input,
-                text: None,
-                resume_id: None,
-            };
-            if let Err(e) = hooks::append(&dir, &ev) {
-                eprintln!("{e:#}");
+        let kind = match s.state {
+            SessionState::Approval => EventKind::Input,
+            SessionState::Working if bare_interrupt && s.meta.kind != Kind::Shell => {
+                EventKind::Interrupt
             }
-            self.refresh(id);
-            self.publish();
+            _ => return,
+        };
+        let ev = Event {
+            ms: now_ms(),
+            kind,
+            text: None,
+            resume_id: None,
+        };
+        if let Err(e) = hooks::append(&dir, &ev) {
+            eprintln!("{e:#}");
         }
+        self.refresh(id);
+        self.publish();
     }
 
     /// `Colors`: makes the outer terminal's colors the default colors of every current screen and of screens to be attached later (`install`).
