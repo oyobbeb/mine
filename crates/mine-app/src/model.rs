@@ -564,7 +564,6 @@ impl Model {
 
     /// Sends key input and paste to the attached session. A scrolled-back screen is returned to the bottom. With no
     /// connection, nothing is sent (it would only pile up in the link thread's queue and be dropped on reconnect).
-    #[allow(dead_code, reason = "used by Task 5's key input")]
     pub fn input(&mut self, data: Vec<u8>) -> Vec<Effect> {
         let Some(id) = self.attached.clone().filter(|_| self.connected) else {
             return Vec::new();

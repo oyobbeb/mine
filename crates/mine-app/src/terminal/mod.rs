@@ -1,26 +1,42 @@
-//! The terminal pane: draws the attached session's screen (`Model::screen`) and wires pane size, wheel scrolling, and link presses to the model.
+//! The terminal pane: draws the attached session's screen (`Model::screen`) and wires pane size, wheel scrolling, link
+//! presses, keys, the input method, and paste to the model.
 //!
 //! The structure is the same as Zed's terminal: inside the `div` that [`render`] builds (focus, key context [`CONTEXT`],
-//! mouse handling) there is a single `canvas`.
+//! mouse and key handling) there is a single `canvas`.
 //! - prepaint: derives rows and columns from the pane size and reports them to the model (`Attach` the first time,
 //!   `Resize` when it changes). Then, for each visible row, builds text runs with [`render::row_runs`] and shapes them.
-//! - paint: draws background rectangles, text, then the cursor, in that order.
+//! - paint: registers the input method handler, then draws background rectangles, text, the cursor, and the text being
+//!   composed, in that order.
+//!
+//! Keys take two paths, so none is sent twice. A key with an encoding of its own (Enter, arrows, Ctrl+C) is sent from
+//! the key-down listener, which stops it there. A key that types a character is left alone, and its text arrives
+//! through the input method (`EntityInputHandler`). While a syllable is being composed, macOS hands every key to the
+//! input method first, so the syllable is committed before the key's own bytes: 한 then Enter sends "한" then "\r".
 
+pub mod ime;
+pub mod keys;
 pub mod render;
 
+use std::ops::Range;
 use std::time::Instant;
 
+use alacritty_terminal::term::TermMode;
 use alacritty_terminal::vte::ansi::CursorShape;
 use gpui::{
-    App, Bounds, ContentMask, Context, Entity, FocusHandle, FontStyle, FontWeight, Hsla,
-    InteractiveElement, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    App, Bounds, ContentMask, Context, ElementInputHandler, Entity, EntityInputHandler,
+    FocusHandle, FontStyle, FontWeight, Hsla, InputHandler, InteractiveElement, IntoElement,
+    KeyDownEvent, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     ParentElement, Pixels, Point, ScrollWheelEvent, ShapedLine, StrikethroughStyle, Styled,
-    TextRun, TouchPhase, UnderlineStyle, Window, WindowTextSystem, canvas, div, fill, font,
-    outline, point, px, rgb, size,
+    TextRun, TouchPhase, UTF16Selection, UnderlineStyle, Window, WindowTextSystem, canvas, div,
+    fill, font, outline, point, px, rgb, size,
 };
+use mine_core::keys::KeyModes;
 
-use crate::theme::{TERM_BG, TERM_CURSOR};
+use crate::actions::Paste;
+use crate::theme::{TERM_BG, TERM_CURSOR, TERM_FG};
 use crate::workspace::Workspace;
+use ime::Ime;
+use keys::KeyIn;
 use render::{CellRun, CursorCell};
 
 /// The terminal pane's key context. It is inside the `Workspace` context, so ⌘ shortcuts still arrive even when the pane has focus.
@@ -91,8 +107,10 @@ impl Geometry {
 
 /// View state of the terminal pane. The screen, attaching and size live in `Model`; only GPUI-side work is here.
 pub struct Pane {
-    /// While a session is attached and the launcher is closed, focus is always here. Task 5's key input and input method hook in here.
+    /// While a session is attached and the launcher is closed, focus is always here. Keys and the input method arrive here.
     pub focus: FocusHandle,
+    /// The text the input method is composing. Drawn at the cursor, sent once committed.
+    ime: Ime,
     /// The pane as last drawn. None before the first draw.
     pub geometry: Option<Geometry>,
     /// The remainder (pixels) of wheel movement that doesn't make a full line.
@@ -107,6 +125,7 @@ impl Pane {
     pub fn new(cx: &mut App) -> Pane {
         Pane {
             focus: cx.focus_handle(),
+            ime: Ime::default(),
             geometry: None,
             scroll_acc: 0.0,
             press: None,
@@ -167,6 +186,49 @@ impl Workspace {
         }
     }
 
+    /// A key with an encoding of its own goes to the session in the session's key modes, and stops here so the input
+    /// method doesn't send it again. Keys that type a character pass on to the input method.
+    fn term_key(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) {
+        let modes = self.model.screen.as_ref().map(KeyModes::of);
+        let Some(bytes) = keys::encode_key(&key_in(&ev.keystroke), &modes.unwrap_or_default())
+        else {
+            return;
+        };
+        self.term_send(bytes, cx);
+        cx.stop_propagation();
+    }
+
+    /// ⌘V: the clipboard text, bracketed if the session turned on bracketed paste.
+    fn term_paste(&mut self, cx: &mut Context<Self>) {
+        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+            return;
+        };
+        let bracketed = self
+            .model
+            .screen
+            .as_ref()
+            .is_some_and(|s| s.mode().contains(TermMode::BRACKETED_PASTE));
+        self.term_send(keys::paste_bytes(&text, bracketed), cx);
+    }
+
+    /// Sends input to the session. The model returns a scrolled-back view to the bottom, so it redraws.
+    fn term_send(&mut self, bytes: Vec<u8>, cx: &mut Context<Self>) {
+        if !bytes.is_empty() {
+            let effects = self.model.input(bytes);
+            self.apply(effects);
+        }
+        cx.notify();
+    }
+
+    /// The visible cell of the session cursor, where the input method composes. It follows the cursor even while the
+    /// session hides it (Claude Code draws its own).
+    fn ime_cell(&self) -> Option<(u16, u16)> {
+        let screen = self.model.screen.as_ref()?;
+        let (col, row) = screen.cursor();
+        let offset = screen.term().grid().display_offset();
+        Some((col, row.saturating_add(offset as u16)))
+    }
+
     /// Sets a GPUI timer for the attached session's unfinished synchronized update (`?2026`). When the deadline passes, ends it and redraws.
     pub(crate) fn watch_sync(&mut self, cx: &mut Context<Self>) {
         let Some(deadline) = self.model.sync_deadline() else {
@@ -195,6 +257,7 @@ impl Workspace {
 /// The pane of the attached session. Clicking the pane gives it focus.
 pub fn render(ws: &Workspace, window: &Window, cx: &mut Context<Workspace>) -> impl IntoElement {
     let entity = cx.entity();
+    let input = (ws.term.focus.clone(), entity.clone());
     let focused = ws.term.focus.is_focused(window);
     div()
         .flex_1()
@@ -203,6 +266,8 @@ pub fn render(ws: &Workspace, window: &Window, cx: &mut Context<Workspace>) -> i
         .bg(rgb(TERM_BG))
         .track_focus(&ws.term.focus)
         .key_context(CONTEXT)
+        .on_key_down(cx.listener(|ws, ev: &KeyDownEvent, _, cx| ws.term_key(ev, cx)))
+        .on_action(cx.listener(|ws, _: &Paste, _, cx| ws.term_paste(cx)))
         .on_scroll_wheel(cx.listener(|ws, ev: &ScrollWheelEvent, _, cx| ws.term_scroll(ev, cx)))
         .on_mouse_down(
             MouseButton::Left,
@@ -216,7 +281,12 @@ pub fn render(ws: &Workspace, window: &Window, cx: &mut Context<Workspace>) -> i
         .child(
             canvas(
                 move |bounds, window, cx| layout(&entity, focused, bounds, window, cx),
-                |_, frame, window, cx| frame.paint(window, cx),
+                move |bounds, frame, window, cx| {
+                    let (focus, entity) = input;
+                    let handler = TermInput(ElementInputHandler::new(bounds, entity));
+                    window.handle_input(&focus, handler, cx);
+                    frame.paint(window, cx)
+                },
             )
             .size_full(),
         )
@@ -244,12 +314,13 @@ fn layout(
         rows,
     };
     // The view's render is done, so the view can be modified. The screen is fitted to the pane size here, so this frame is drawn at the new size.
-    let (runs, cursor) = ws.update(cx, |ws, _| {
+    let (runs, cursor, composing) = ws.update(cx, |ws, _| {
         ws.term.geometry = Some(geometry);
         let effects = ws.model.set_grid(cols, rows);
         ws.apply(effects);
+        let composing = ws.term.ime.marked().zip(ws.ime_cell()).map(composing_run);
         let Some(screen) = &ws.model.screen else {
-            return (Vec::new(), None);
+            return (Vec::new(), None, None);
         };
         let runs: Vec<(u16, CellRun)> = (0..rows)
             .flat_map(|row| {
@@ -258,7 +329,7 @@ fn layout(
                     .map(move |run| (row, run))
             })
             .collect();
-        (runs, render::cursor(screen))
+        (runs, render::cursor(screen), composing)
     });
     let text = window.text_system().clone();
     let cells = runs
@@ -268,12 +339,39 @@ fn layout(
     let caret = cursor
         .filter(|c| c.col < cols && c.row < rows)
         .map(|c| Caret::shape(&text, &geometry, &c, focused));
+    let composing = composing
+        .filter(|(row, run)| run.col < cols && *row < rows)
+        .map(|(row, run)| Painted::shape(&text, &geometry, row, &run));
     Frame {
         bounds,
         line_h: metrics.line_h,
         cells,
         caret,
+        composing,
     }
+}
+
+/// The text being composed as a run at (`col`, `row`): underlined, on the pane background so it covers the cells
+/// under it.
+///
+/// ponytail: a non-ASCII character counts as two cells (input methods compose CJK). A narrow one (a dead-key accent)
+/// gets a wide slot; it is only on screen until committed.
+fn composing_run((text, (col, row)): (&str, (u16, u16))) -> (u16, CellRun) {
+    let cells = text.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum();
+    let run = CellRun {
+        col,
+        cells,
+        text: text.to_string(),
+        fg: TERM_FG,
+        bg: Some(TERM_BG),
+        bold: false,
+        italic: false,
+        underline: true,
+        strike: false,
+        dim: false,
+        link: None,
+    };
+    (row, run)
 }
 
 /// What to draw in one frame.
@@ -282,6 +380,8 @@ struct Frame {
     line_h: Pixels,
     cells: Vec<Painted>,
     caret: Option<Caret>,
+    /// The text being composed, drawn over the cursor.
+    composing: Option<Painted>,
 }
 
 impl Frame {
@@ -306,7 +406,192 @@ impl Frame {
             if let Some(caret) = &self.caret {
                 caret.paint(self.line_h, window, cx);
             }
+            if let Some(c) = &self.composing {
+                window.paint_quad(fill(c.bounds, hsla(TERM_BG)));
+                let _ = c.line.paint(c.text_at, self.line_h, window, cx);
+            }
         });
+    }
+}
+
+/// The input method of the terminal pane. Its document is only the text being composed: what was typed before belongs
+/// to the session, so there is nothing else to read back or select.
+impl EntityInputHandler for Workspace {
+    /// The macOS Korean input method reads the composition back after every jamo. Given nothing, it commits each jamo
+    /// on its own (ㅎㅏㄴ instead of 한).
+    fn text_for_range(
+        &mut self,
+        range: Range<usize>,
+        adjusted: &mut Option<Range<usize>>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<String> {
+        let (text, covered) = self.term.ime.text_utf16(range)?;
+        *adjusted = Some(covered);
+        Some(text)
+    }
+
+    /// The caret sits at the end of the composition.
+    fn selected_text_range(
+        &mut self,
+        _: bool,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        let end = self
+            .term
+            .ime
+            .marked()
+            .map_or(0, |t| t.encode_utf16().count());
+        Some(UTF16Selection {
+            range: end..end,
+            reversed: false,
+        })
+    }
+
+    fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<Range<usize>> {
+        self.term.ime.marked().map(|t| 0..t.encode_utf16().count())
+    }
+
+    fn unmark_text(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        self.term.ime.unmark();
+        cx.notify();
+    }
+
+    /// Committed text (a finished syllable, or a plain character) goes to the session.
+    fn replace_text_in_range(
+        &mut self,
+        _: Option<Range<usize>>,
+        text: &str,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let bytes = self.term.ime.commit(text);
+        self.term_send(bytes, cx);
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        _: Option<Range<usize>>,
+        text: &str,
+        _: Option<Range<usize>>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.term.ime.mark(text);
+        cx.notify();
+    }
+
+    /// The cursor cell, so the input method's candidate window opens next to it.
+    fn bounds_for_range(
+        &mut self,
+        _: Range<usize>,
+        _: Bounds<Pixels>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        let (col, row) = self.ime_cell()?;
+        Some(self.term.geometry?.cell_bounds(col, row, 1))
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _: Point<Pixels>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<usize> {
+        None
+    }
+}
+
+/// The pane's input handler: the `EntityInputHandler` above with macOS press-and-hold turned off, so a held letter key
+/// repeats as in a terminal instead of opening the accent menu (Zed's terminal does the same).
+///
+/// No unit test: building one needs a live `Entity<Workspace>`, and the only logic is the constant below.
+struct TermInput(ElementInputHandler<Workspace>);
+
+impl InputHandler for TermInput {
+    fn selected_text_range(
+        &mut self,
+        ignore_disabled_input: bool,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<UTF16Selection> {
+        self.0
+            .selected_text_range(ignore_disabled_input, window, cx)
+    }
+
+    fn marked_text_range(&mut self, window: &mut Window, cx: &mut App) -> Option<Range<usize>> {
+        self.0.marked_text_range(window, cx)
+    }
+
+    fn text_for_range(
+        &mut self,
+        range: Range<usize>,
+        adjusted: &mut Option<Range<usize>>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<String> {
+        self.0.text_for_range(range, adjusted, window, cx)
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        range: Option<Range<usize>>,
+        text: &str,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.0.replace_text_in_range(range, text, window, cx)
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range: Option<Range<usize>>,
+        text: &str,
+        selected: Option<Range<usize>>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.0
+            .replace_and_mark_text_in_range(range, text, selected, window, cx)
+    }
+
+    fn unmark_text(&mut self, window: &mut Window, cx: &mut App) {
+        self.0.unmark_text(window, cx)
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        range: Range<usize>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<Bounds<Pixels>> {
+        self.0.bounds_for_range(range, window, cx)
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        point: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<usize> {
+        self.0.character_index_for_point(point, window, cx)
+    }
+
+    fn apple_press_and_hold_enabled(&mut self) -> bool {
+        false
+    }
+}
+
+fn key_in(k: &Keystroke) -> KeyIn {
+    KeyIn {
+        key: k.key.clone(),
+        key_char: k.key_char.clone(),
+        ctrl: k.modifiers.control,
+        alt: k.modifiers.alt,
+        shift: k.modifiers.shift,
+        cmd: k.modifiers.platform,
     }
 }
 
@@ -482,6 +767,28 @@ mod tests {
             g.cell_bounds(2, 1, 2),
             Bounds::new(point(px(116.), px(66.)), size(px(16.), px(16.)))
         );
+    }
+
+    /// 한 then Enter as macOS delivers it while composing: the input method gets the Enter first, commits the syllable,
+    /// then passes the key back. Each is sent once, the syllable first. The jamo typed to build it go to the input
+    /// method only (the key path sends nothing for them).
+    #[test]
+    fn hangul_then_enter_sends_the_syllable_then_cr() {
+        let modes = KeyModes::default();
+        let key = |key: &str, ch: Option<&str>| KeyIn {
+            key: key.into(),
+            key_char: ch.map(str::to_string),
+            ..KeyIn::default()
+        };
+        let mut ime = Ime::default();
+        let mut sent = Vec::new();
+        for (k, marked) in [("g", "ㅎ"), ("k", "하"), ("s", "한")] {
+            sent.extend(keys::encode_key(&key(k, Some(k)), &modes));
+            ime.mark(marked);
+        }
+        sent.push(ime.commit("한"));
+        sent.extend(keys::encode_key(&key("enter", Some("\n")), &modes));
+        assert_eq!(sent, ["한".as_bytes(), b"\r"]);
     }
 
     #[test]

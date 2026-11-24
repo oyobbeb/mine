@@ -1,7 +1,7 @@
 //! App shortcuts. The table follows the plan's Global Constraints. The terminal pane binds ⌘C·⌘V (Tasks 5·6) and
 //! ⌘F (Task 6). When the terminal pane has focus, every key without ⌘ goes to the session.
 
-use gpui::{Action, KeyBinding, actions};
+use gpui::{Action, KeyBinding, NoAction, actions};
 
 actions!(
     mine,
@@ -13,7 +13,8 @@ actions!(
         NextSession,
         PrevProject,
         NextProject,
-        ToggleSidebar
+        ToggleSidebar,
+        Paste
     ]
 );
 
@@ -28,6 +29,7 @@ pub const CONTEXT: &str = "Workspace";
 /// The shortcuts the app binds. Only ⌘Q is heard everywhere; the rest are heard when focus is inside the root view.
 pub fn bindings() -> Vec<KeyBinding> {
     let ws = Some(CONTEXT);
+    let term = Some(crate::terminal::CONTEXT);
     let mut keys = vec![
         KeyBinding::new("cmd-q", Quit, None),
         KeyBinding::new("cmd-n", NewTask, ws),
@@ -38,6 +40,11 @@ pub fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-{", PrevProject, ws),
         KeyBinding::new("cmd-}", NextProject, ws),
         KeyBinding::new("cmd-b", ToggleSidebar, ws),
+        KeyBinding::new("cmd-v", Paste, term),
+        // gpui-component's Root binds Tab and Shift+Tab to move focus, and bindings run before the pane's key-down
+        // listener. NoAction in the deeper Terminal context masks them, so the session gets both keys.
+        KeyBinding::new("tab", NoAction, term),
+        KeyBinding::new("shift-tab", NoAction, term),
     ];
     keys.extend((1..=9).map(|n| KeyBinding::new(&format!("cmd-{n}"), SelectTab(n - 1), ws)));
     keys
@@ -46,7 +53,39 @@ pub fn bindings() -> Vec<KeyBinding> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{Keystroke, Modifiers};
+    use gpui::{KeyContext, Keymap, Keystroke, Modifiers};
+
+    // Stands in for gpui-component's Root `Tab`/`TabPrev` (private), bound the same way: `tab`/`shift-tab` in "Root".
+    actions!(test_root, [RootTab]);
+
+    #[test]
+    fn terminal_masks_root_tab_so_the_session_gets_it() {
+        // The same order as main.rs: gpui-component's bindings first, then the app's.
+        let mut keymap = Keymap::default();
+        keymap.add_bindings([
+            KeyBinding::new("tab", RootTab, Some("Root")),
+            KeyBinding::new("shift-tab", RootTab, Some("Root")),
+        ]);
+        keymap.add_bindings(bindings());
+        let stack = |names: &[&str]| -> Vec<KeyContext> {
+            names
+                .iter()
+                .map(|n| KeyContext::parse(n).unwrap())
+                .collect()
+        };
+        let pane = stack(&["Root", "Workspace", crate::terminal::CONTEXT]);
+        let outside = stack(&["Root", "Workspace"]);
+        for key in ["tab", "shift-tab"] {
+            let input = [Keystroke::parse(key).unwrap()];
+            // No binding and nothing pending: gpui's dispatch_key_event then runs the key-down listeners, so the
+            // pane's listener sends the key to the session.
+            let (hits, pending) = keymap.bindings_for_input(&input, &pane);
+            assert!(hits.is_empty() && !pending, "{key} in the pane: {hits:?}");
+            // Outside the pane (launcher, list) Root still moves focus with it.
+            let (hits, _) = keymap.bindings_for_input(&input, &outside);
+            assert!(hits[0].action().partial_eq(&RootTab), "{key} outside");
+        }
+    }
 
     fn table() -> Vec<(String, String)> {
         bindings()
@@ -70,6 +109,7 @@ mod tests {
             ("cmd-{", "mine::PrevProject"),
             ("cmd-}", "mine::NextProject"),
             ("cmd-b", "mine::ToggleSidebar"),
+            ("cmd-v", "mine::Paste"),
         ] {
             assert!(
                 got.contains(&(keys.to_string(), action.to_string())),
@@ -86,7 +126,8 @@ mod tests {
                 .unwrap_or_else(|| panic!("{keys}"));
             assert!(b.action().partial_eq(&SelectTab(n - 1)), "{keys}");
         }
-        assert_eq!(all.len(), 8 + 9);
+        // 9 shortcuts, ⌘1–⌘9, and the two Tab masks.
+        assert_eq!(all.len(), 9 + 9 + 2);
     }
 
     #[test]
