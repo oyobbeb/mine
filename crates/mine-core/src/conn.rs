@@ -2,10 +2,10 @@
 //! and the client screen uses the asynchronous `AsyncConn`.
 
 use std::fs::OpenOptions;
-use std::io::{self, BufReader};
+use std::io::{self, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -25,6 +25,7 @@ const REPLY_WAIT: Duration = Duration::from_secs(15);
 pub struct Conn {
     reader: BufReader<UnixStream>,
     writer: UnixStream,
+    unknowns: Unknowns,
 }
 
 /// Asynchronous connection to the daemon (for the client screen). Messages sent on `tx` are written in order by a single write task,
@@ -65,6 +66,7 @@ impl Conn {
         let mut conn = Conn {
             writer: stream.try_clone()?,
             reader: BufReader::new(stream),
+            unknowns: Unknowns::new(state),
         };
         write_msg(&mut conn.writer, &ToDaemon::Hello { version: VERSION })?;
         let hello = conn.recv()?;
@@ -72,12 +74,14 @@ impl Conn {
         Ok(conn)
     }
 
-    /// Sends a request and waits for the response. Session output (`Output`) is skipped, and `Error` is returned as an error.
+    /// Sends a request and waits for the response. Session output (`Output`), the profile list and unknown messages are skipped, and
+    /// `Error` is returned as an error.
     pub fn request(&mut self, msg: &ToDaemon) -> Result<FromDaemon> {
         write_msg(&mut self.writer, msg).context("Couldn't send the request to the daemon")?;
         loop {
             match self.recv()? {
-                FromDaemon::Output { .. } => {}
+                FromDaemon::Output { .. } | FromDaemon::Profiles { .. } => {}
+                FromDaemon::Unknown => self.unknowns.note(),
                 FromDaemon::Error { message } => bail!("{message}"),
                 reply => return Ok(reply),
             }
@@ -140,14 +144,51 @@ pub async fn connect_or_spawn_async_with(
     // ponytail: the receiving side is an unbounded queue. The client feeds its screen the same amount of output as the daemon, so we assume it keeps up;
     // if it falls behind, client memory grows before the daemon drops this connection. If that becomes a problem, add a cap counted in bytes.
     let (incoming, rx) = mpsc::unbounded_channel::<FromDaemon>();
+    let mut unknowns = Unknowns::new(state);
     tokio::spawn(async move {
         while let Ok(Some(msg)) = recv(&mut reader).await {
+            if matches!(msg, FromDaemon::Unknown) {
+                unknowns.note();
+                continue;
+            }
             if incoming.send(msg).is_err() {
                 break;
             }
         }
     });
     Ok(AsyncConn { tx, rx })
+}
+
+/// Notes, once per connection, that the daemon sent a message type this client doesn't know. The message itself is skipped. The note goes
+/// to `logs/client.log`, not stderr, which is the TUI's screen.
+struct Unknowns {
+    log: PathBuf,
+    noted: bool,
+}
+
+impl Unknowns {
+    fn new(state: &State) -> Unknowns {
+        Unknowns {
+            log: state.log_dir().join("client.log"),
+            noted: false,
+        }
+    }
+
+    fn note(&mut self) {
+        if std::mem::replace(&mut self.noted, true) {
+            return;
+        }
+        let line = format!(
+            "pid {}: the daemon sent a message type this client doesn't know; ignoring it and any more like it\n",
+            std::process::id()
+        );
+        // Best effort: without a log directory only the note is lost.
+        let _ = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.log)
+            .and_then(|mut f| f.write_all(line.as_bytes()));
+    }
 }
 
 fn current_exe() -> Result<std::path::PathBuf> {
@@ -173,8 +214,8 @@ pub fn restart_hint(state: &State) -> String {
 /// Checks that the daemon's first message is a `Hello` of the same version.
 fn check_hello(msg: Option<FromDaemon>, state: &State) -> Result<()> {
     match msg {
-        Some(FromDaemon::Hello { version }) if version == VERSION => Ok(()),
-        Some(FromDaemon::Hello { version }) => {
+        Some(FromDaemon::Hello { version, .. }) if version == VERSION => Ok(()),
+        Some(FromDaemon::Hello { version, .. }) => {
             bail!(
                 "Daemon protocol version mismatch (daemon {version}, this command {VERSION}). {}",
                 restart_hint(state)
@@ -260,8 +301,89 @@ mod tests {
         };
         let hello = FromDaemon::Hello {
             version: VERSION + 1,
+            features: Vec::new(),
+            daemon: None,
         };
         let e = check_hello(Some(hello), &state).unwrap_err().to_string();
         assert!(e.contains("kill \"$(cat '/s s/daemon.pid')\""), "{e}");
+    }
+
+    fn temp_state() -> (tempfile::TempDir, State) {
+        let dir = tempfile::Builder::new()
+            .prefix("m")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let state = State {
+            root: dir.path().to_path_buf(),
+        };
+        ensure_dir(&state.log_dir()).unwrap();
+        (dir, state)
+    }
+
+    fn client_log(state: &State) -> String {
+        std::fs::read_to_string(state.log_dir().join("client.log")).unwrap_or_default()
+    }
+
+    /// A newer daemon on `state`'s socket. It answers one connection's Hello, sends two message types this client doesn't know,
+    /// the profile list and an empty session list, then reads one more message (or the hang-up) and ends.
+    fn newer_daemon(state: &State) -> std::thread::JoinHandle<()> {
+        use std::io::Write;
+        let listener = std::os::unix::net::UnixListener::bind(state.daemon_sock()).unwrap();
+        std::thread::spawn(move || {
+            let (mut writer, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(writer.try_clone().unwrap());
+            let _: Option<ToDaemon> = read_msg(&mut reader).unwrap();
+            let hello = FromDaemon::Hello {
+                version: VERSION,
+                features: Vec::new(),
+                daemon: None,
+            };
+            write_msg(&mut writer, &hello).unwrap();
+            for _ in 0..2 {
+                writer
+                    .write_all(b"{\"t\":\"FromTheFuture\",\"x\":1}\n")
+                    .unwrap();
+            }
+            write_msg(&mut writer, &FromDaemon::Profiles { profiles: vec![] }).unwrap();
+            write_msg(&mut writer, &FromDaemon::Sessions { sessions: vec![] }).unwrap();
+            let _ = read_msg::<_, ToDaemon>(&mut reader);
+        })
+    }
+
+    #[test]
+    fn conn_skips_unknown_messages_and_the_profile_list() {
+        let (_dir, state) = temp_state();
+        let daemon = newer_daemon(&state);
+        let mut conn = Conn::connect_or_spawn(&state).unwrap();
+        let reply = conn.request(&ToDaemon::List).unwrap();
+        assert_eq!(reply, FromDaemon::Sessions { sessions: vec![] });
+        drop(conn);
+        daemon.join().unwrap();
+        // Logged once per connection.
+        assert_eq!(
+            client_log(&state).lines().count(),
+            1,
+            "{}",
+            client_log(&state)
+        );
+    }
+
+    #[tokio::test]
+    async fn async_conn_skips_unknown_messages() {
+        let (_dir, state) = temp_state();
+        let _daemon = newer_daemon(&state);
+        let mut conn = connect_or_spawn_async_with(&state, Path::new("/nonexistent"), None)
+            .await
+            .unwrap();
+        let profiles = FromDaemon::Profiles { profiles: vec![] };
+        assert_eq!(conn.rx.recv().await, Some(profiles));
+        let sessions = FromDaemon::Sessions { sessions: vec![] };
+        assert_eq!(conn.rx.recv().await, Some(sessions));
+        assert_eq!(
+            client_log(&state).lines().count(),
+            1,
+            "{}",
+            client_log(&state)
+        );
     }
 }

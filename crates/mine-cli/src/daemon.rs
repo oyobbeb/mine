@@ -11,6 +11,8 @@
 //!   answers the inner app's color queries with those colors.
 //! - A client reports with `Focus` whether its window is the one the user is looking at. When a session newly needs approval and
 //!   no client is focused, the daemon shows a macOS notification (`MINE_NOTIFY`, default `osascript`).
+//! - Any client from `MIN_CLIENT_VERSION` up is served, and gets only what its version knows: the profile list goes to v4+ clients
+//!   only, right after `Hello` and again to all of them after `ReloadProfiles`. A message type the daemon doesn't know is ignored.
 //! - When the daemon starts again, it scans `sessions/*/meta.json`, reattaches to the holder processes that are alive, and rebuilds
 //!   the 80x24 screen from the holder process's output buffer. The first `Attach` changes it to the client's size.
 //!
@@ -38,9 +40,12 @@ use crate::hold;
 use mine_core::conn::restart_hint;
 use mine_core::hooks::{self, Event, EventKind, now_ms};
 use mine_core::paths::{State, check_sock_path, ensure_dir};
-use mine_core::profiles::Profiles;
+use mine_core::profiles::{self, ProfileInfo, Profiles};
 use mine_core::project::{self, project_key};
-use mine_core::proto::{FromDaemon, HOLD_VERSION, HoldIn, HoldOut, ToDaemon, VERSION, recv, send};
+use mine_core::proto::{
+    DaemonInfo, FromDaemon, HOLD_VERSION, HoldIn, HoldOut, MIN_CLIENT_VERSION, ToDaemon, VERSION,
+    recv, send,
+};
 use mine_core::screen::Screen;
 use mine_core::session::{
     self, Kind, Meta, NewSession, Restore, SessionInfo, SessionState, session_id, validate_name,
@@ -80,6 +85,10 @@ const HOLD_READ_BUF: usize = 64 * 1024;
 // the client queue has 1024 entries, so the output one lagging client piles up in the daemon is at most 32 MiB (snapshots are separate).
 // To cut it further, count the queue in bytes.
 const BATCH_MAX: usize = 16 * 1024;
+/// The features this daemon announces in its hello reply. Clients gate new behavior on these names, not on the version alone.
+const FEATURES: &[&str] = &["profiles"];
+/// The first client version that knows `FromDaemon::Profiles`.
+const PROFILES_SINCE: u32 = 4;
 
 // ponytail: global lock; per-session locks once there are hundreds of sessions
 type Shared = Arc<Mutex<Daemon>>;
@@ -88,11 +97,16 @@ type Shared = Arc<Mutex<Daemon>>;
 struct Daemon {
     state: State,
     exe: PathBuf,
-    /// Read once at startup.
-    // ponytail: no reload yet; `ToDaemon::ReloadProfiles` comes with the profile commands.
+    /// Read at startup and on `ReloadProfiles`.
     profiles: Profiles,
+    /// What clients show for `profiles`, computed with them.
+    // ponytail: login state is read at load, not per Hello (every hook poke says Hello, and Claude's `.claude.json` can be large);
+    // a login made outside `mine` shows after the next reload.
+    profile_infos: Vec<ProfileInfo>,
     /// The user's home (`HOME`), where the CLIs' default homes are.
     user_home: PathBuf,
+    /// When the daemon started (Unix milliseconds), for the hello reply.
+    started_ms: u64,
     sessions: BTreeMap<String, Sess>,
     /// Session ids for which `New` is starting a holder process. Keeps the same name from being created twice at once.
     starting: HashSet<String>,
@@ -158,6 +172,10 @@ struct Client {
     size: Option<(u16, u16)>,
     /// Reported with `Focus`: this client's window is the one the user is looking at. It goes away with the client.
     focused: bool,
+    /// The protocol version from the client's `Hello` (0 until then). Decides which messages it gets.
+    version: u32,
+    /// An unknown message type from this client was logged already.
+    noted_unknown: bool,
 }
 
 /// A just-attached holder process connection. It has read through `Hello` and the output buffer.
@@ -211,15 +229,14 @@ pub async fn run(state: State) -> Result<()> {
     fs::set_permissions(&sock, fs::Permissions::from_mode(0o600))?;
     let exe = std::env::current_exe().context("Couldn't determine the executable path")?;
     let user_home = std::env::home_dir().context("Couldn't determine the home directory")?;
-    let (profiles, warnings) = Profiles::load(&state);
-    for warning in warnings {
-        eprintln!("Warning: {warning}");
-    }
+    let (profiles, profile_infos) = load_profiles(&state, &user_home);
     let shared: Shared = Arc::new(Mutex::new(Daemon {
         state,
         exe,
         profiles,
+        profile_infos,
         user_home,
+        started_ms: now_ms(),
         sessions: BTreeMap::new(),
         starting: HashSet::new(),
         closing: HashMap::new(),
@@ -323,6 +340,16 @@ async fn restore(shared: &Shared) {
     shared.lock().await.publish();
 }
 
+/// Reads the profiles and what clients show for them. Warnings go to `daemon.log`; they give a line and a reason, never a value.
+fn load_profiles(state: &State, user_home: &Path) -> (Profiles, Vec<ProfileInfo>) {
+    let (profiles, warnings) = Profiles::load(state);
+    for warning in warnings {
+        eprintln!("Warning: {warning}");
+    }
+    let infos = profiles::infos(&profiles, state, Some(user_home));
+    (profiles, infos)
+}
+
 fn read_viewed(dir: &Path) -> Option<u64> {
     fs::read_to_string(dir.join(VIEWED_FILE))
         .ok()?
@@ -331,7 +358,7 @@ fn read_viewed(dir: &Path) -> Option<u64> {
         .ok()
 }
 
-/// Handles one client connection. The first message must be a `Hello` of the same version, except for a
+/// Handles one client connection. The first message must be a `Hello` of `MIN_CLIENT_VERSION` or newer, except for a
 /// hook's `Poke` (see below).
 async fn serve_client(shared: Shared, stream: UnixStream) {
     let (read, mut write) = stream.into_split();
@@ -345,41 +372,28 @@ async fn serve_client(shared: Shared, stream: UnixStream) {
     });
     let client = shared.lock().await.add_client(tx, writer.abort_handle());
     let mut reader = BufReader::new(read);
-    let mut mismatch = false;
-    let refused = match recv::<_, ToDaemon>(&mut reader).await {
-        Ok(Some(ToDaemon::Hello { version })) if version == VERSION => None,
+    let (hello, served) = match recv::<_, ToDaemon>(&mut reader).await {
         Ok(Some(ToDaemon::Hello { version })) => {
-            mismatch = true;
-            let hint = restart_hint(&shared.lock().await.state);
-            Some(format!(
-                "Protocol version mismatch (client {version}, daemon {VERSION}). {hint}"
-            ))
+            (true, shared.lock().await.greet(client, Some(version)))
         }
-        Ok(Some(_)) => Some("The first message must be Hello".to_string()),
-        Ok(None) | Err(_) => Some(String::new()),
+        Ok(Some(_)) => (false, shared.lock().await.greet(client, None)),
+        Ok(None) | Err(_) => (false, false),
     };
-    match refused {
-        None => {
-            while let Ok(Some(msg)) = recv::<_, ToDaemon>(&mut reader).await {
-                if !handle(&shared, client, msg).await {
-                    break;
-                }
+    if served {
+        while let Ok(Some(msg)) = recv::<_, ToDaemon>(&mut reader).await {
+            if !handle(&shared, client, msg).await {
+                break;
             }
         }
-        Some(message) if !message.is_empty() => {
-            shared
-                .lock()
-                .await
-                .send(client, FromDaemon::Error { message });
-        }
-        Some(_) => {}
     }
     // Dropping the sender makes the write task send the remaining messages (errors included) and close the connection.
     shared.lock().await.clients.remove(&client);
     // A session's hook runs the `mine` copy the session was started from, which can be another version than this
     // daemon (a bundle copy and a cargo copy are updated separately). A poke only says "re-read this session's
-    // events", and the events file is the real contract, so it is honoured across versions. Nothing else is.
-    if mismatch
+    // events", and the events file is the real contract, so it is honoured across versions, even one too old to be
+    // served. Nothing else is.
+    if hello
+        && !served
         && let Ok(Ok(Some(ToDaemon::Poke { id }))) =
             timeout(POKE_WAIT, recv::<_, ToDaemon>(&mut reader)).await
     {
@@ -393,6 +407,17 @@ async fn serve_client(shared: Shared, stream: UnixStream) {
 async fn handle(shared: &Shared, client: u64, msg: ToDaemon) -> bool {
     match msg {
         ToDaemon::Hello { .. } => {}
+        ToDaemon::Unknown => {
+            if let Some(c) = shared.lock().await.clients.get_mut(&client)
+                && !std::mem::replace(&mut c.noted_unknown, true)
+            {
+                eprintln!(
+                    "A client (protocol {}) sent a message type this daemon doesn't know; ignoring it and any more like it",
+                    c.version
+                );
+            }
+        }
+        ToDaemon::ReloadProfiles => shared.lock().await.reload_profiles(),
         ToDaemon::List => shared.lock().await.list(client),
         ToDaemon::New { spec } => new_session(shared, client, spec).await,
         ToDaemon::Attach { id, cols, rows } => attach(shared, client, &id, (cols, rows)).await,
@@ -1065,7 +1090,6 @@ impl Daemon {
 
     fn add_client(&mut self, tx: mpsc::Sender<FromDaemon>, writer: AbortHandle) -> u64 {
         let id = self.next_id();
-        let _ = tx.try_send(FromDaemon::Hello { version: VERSION });
         self.clients.insert(
             id,
             Client {
@@ -1075,9 +1099,68 @@ impl Daemon {
                 attached: None,
                 size: None,
                 focused: false,
+                version: 0,
+                noted_unknown: false,
             },
         );
         id
+    }
+
+    /// Answers a client's first message (`hello` is its `Hello` version, `None` if it sent something else). Sends `Hello` at the
+    /// version both sides speak, then the profile list if the client knows it. A refused client gets an `Error` after the `Hello`,
+    /// so an older client still shows its own version-mismatch hint. Returns whether the client is served.
+    fn greet(&mut self, client: u64, hello: Option<u32>) -> bool {
+        let served = hello.filter(|&v| v >= MIN_CLIENT_VERSION);
+        // A v3 client accepts only a Hello of its own version, and a newer client is served at this daemon's.
+        let version = served.map_or(VERSION, |v| v.min(VERSION));
+        let daemon = DaemonInfo {
+            pid: std::process::id(),
+            version: env!("CARGO_PKG_VERSION").into(),
+            started_ms: self.started_ms,
+        };
+        let features = FEATURES.iter().map(|f| f.to_string()).collect();
+        self.send(
+            client,
+            FromDaemon::Hello {
+                version,
+                features,
+                daemon: Some(daemon),
+            },
+        );
+        let Some(version) = served else {
+            let message = match hello {
+                Some(v) => format!(
+                    "Protocol version mismatch (client {v}, daemon {VERSION}, oldest client served {MIN_CLIENT_VERSION}). {}",
+                    restart_hint(&self.state)
+                ),
+                None => "The first message must be Hello".into(),
+            };
+            self.send(client, FromDaemon::Error { message });
+            return false;
+        };
+        if let Some(c) = self.clients.get_mut(&client) {
+            c.version = version;
+        }
+        if version >= PROFILES_SINCE {
+            let profiles = self.profile_infos.clone();
+            self.send(client, FromDaemon::Profiles { profiles });
+        }
+        true
+    }
+
+    /// `ReloadProfiles`: rereads the profiles and sends the new list to every client that knows it.
+    fn reload_profiles(&mut self) {
+        (self.profiles, self.profile_infos) = load_profiles(&self.state, &self.user_home);
+        let knows: Vec<u64> = self
+            .clients
+            .iter()
+            .filter(|(_, c)| c.version >= PROFILES_SINCE)
+            .map(|(&k, _)| k)
+            .collect();
+        for k in knows {
+            let profiles = self.profile_infos.clone();
+            self.send(k, FromDaemon::Profiles { profiles });
+        }
     }
 
     /// Puts it in the client queue. If the queue is full or closed, drops that client.

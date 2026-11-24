@@ -15,8 +15,10 @@ use std::time::{Duration, Instant};
 
 use mine_core::paths::State;
 use mine_core::project::project_key;
-use mine_core::proto::{FromDaemon, HoldIn, HoldOut, ToDaemon, VERSION, read_msg, write_msg};
-use mine_core::session::{Kind, Meta, Restore, SessionState, session_id};
+use mine_core::proto::{
+    FromDaemon, HoldIn, HoldOut, MIN_CLIENT_VERSION, ToDaemon, VERSION, read_msg, write_msg,
+};
+use mine_core::session::{Kind, Meta, NewSession, Restore, SessionState, session_id};
 
 /// Maximum time for socket reads and waiting on conditions. Generous so that it holds up even when many tests run together and slow things down.
 const WAIT: Duration = Duration::from_secs(10);
@@ -225,17 +227,23 @@ struct Client {
     attached: Option<String>,
 }
 
-/// Attaches to an already running daemon and exchanges Hello.
-fn client(st: &St) -> Client {
+/// Attaches to an already running daemon without saying Hello.
+fn connect(st: &St) -> Client {
     let stream = UnixStream::connect(st.sock()).expect("couldn't connect to the daemon");
-    let mut c = Client {
+    Client {
         writer: stream.try_clone().unwrap(),
         reader: BufReader::new(stream),
         key: project_key(&st.project),
         attached: None,
-    };
+    }
+}
+
+/// Attaches to an already running daemon, exchanges Hello, and takes the profile list that follows it.
+fn client(st: &St) -> Client {
+    let mut c = connect(st);
     c.send(&ToDaemon::Hello { version: VERSION });
-    assert!(matches!(c.recv(), Some(FromDaemon::Hello { version }) if version == VERSION));
+    assert!(matches!(c.recv(), Some(FromDaemon::Hello { version, .. }) if version == VERSION));
+    assert!(matches!(c.recv(), Some(FromDaemon::Profiles { .. })));
     c
 }
 
@@ -448,15 +456,14 @@ fn stale_socket_is_replaced() {
 }
 
 #[test]
-fn version_mismatch_is_rejected() {
+fn too_old_client_refused() {
     let st = state();
     ls(&st); // Starts the daemon.
-    let stream = UnixStream::connect(st.sock()).unwrap();
-    let mut r = BufReader::new(stream.try_clone().unwrap());
-    stream.set_read_timeout(Some(WAIT)).unwrap();
-    write_msg(&mut &stream, &ToDaemon::Hello { version: 999 }).unwrap();
+    let mut c = connect(&st);
+    // One below MIN_CLIENT_VERSION (3).
+    c.send(&ToDaemon::Hello { version: 2 });
     let mut error = None;
-    while let Some(msg) = read_msg::<_, FromDaemon>(&mut r).unwrap() {
+    while let Some(msg) = c.recv() {
         if let FromDaemon::Error { message } = msg {
             error = Some(message);
         }
@@ -465,6 +472,143 @@ fn version_mismatch_is_rejected() {
     let want = format!("kill \"$(cat {})\"", st.root.join("daemon.pid").display());
     let error = error.expect("no Error arrived");
     assert!(error.contains(&want), "{error}");
+}
+
+#[test]
+fn v4_hello_has_features_and_identity() {
+    let st = state();
+    let before = mine_core::hooks::now_ms();
+    ls(&st); // Starts the daemon.
+    let started = mine_core::hooks::now_ms();
+    // So that a start time taken at connect time would show.
+    std::thread::sleep(Duration::from_millis(20));
+    let mut c = connect(&st);
+    c.send(&ToDaemon::Hello { version: VERSION });
+    let Some(FromDaemon::Hello {
+        version,
+        features,
+        daemon,
+    }) = c.recv()
+    else {
+        panic!("no Hello");
+    };
+    assert_eq!(version, VERSION);
+    assert!(features.iter().any(|f| f == "profiles"), "{features:?}");
+    let daemon = daemon.expect("no daemon identity");
+    assert_eq!(Some(daemon.pid as i32), daemon_pid(&st));
+    assert_eq!(daemon.version, env!("CARGO_PKG_VERSION"));
+    assert!(
+        (before..=started).contains(&daemon.started_ms),
+        "{before} <= {} <= {started}",
+        daemon.started_ms
+    );
+}
+
+#[test]
+fn v4_client_gets_profiles_after_hello() {
+    let st = state();
+    ls(&st); // Starts the daemon.
+    let mut c = connect(&st);
+    c.send(&ToDaemon::Hello { version: VERSION });
+    assert!(matches!(c.recv(), Some(FromDaemon::Hello { .. })));
+    let Some(FromDaemon::Profiles { profiles }) = c.recv() else {
+        panic!("no Profiles right after Hello");
+    };
+    let ids: Vec<&str> = profiles.iter().map(|p| p.id.as_str()).collect();
+    assert_eq!(ids, ["claude-a", "codex"]);
+}
+
+#[test]
+fn v3_client_still_served() {
+    let st = state();
+    ls(&st); // Starts the daemon.
+    let mut c = connect(&st);
+    c.send(&ToDaemon::Hello { version: 3 });
+    // A v3 client accepts only a Hello of its own version.
+    assert!(matches!(
+        c.recv(),
+        Some(FromDaemon::Hello { version: 3, .. })
+    ));
+    // The next message, never `Profiles`, which a v3 client doesn't know.
+    let next = |c: &mut Client| match c.recv().expect("the connection dropped") {
+        FromDaemon::Profiles { .. } => panic!("a v3 client got Profiles"),
+        FromDaemon::Error { message } => panic!("{message}"),
+        msg => msg,
+    };
+    c.send(&ToDaemon::List);
+    assert!(matches!(next(&mut c), FromDaemon::Sessions { .. }));
+    c.send(&ToDaemon::New {
+        spec: NewSession {
+            project: st.project.clone(),
+            name: "old".into(),
+            kind: Kind::Shell,
+            account: None,
+            model: None,
+        },
+    });
+    while !matches!(next(&mut c), FromDaemon::Sessions { sessions } if sessions.iter().any(|s| s.meta.name == "old"))
+    {
+    }
+    let id = st.id("old");
+    c.send(&ToDaemon::Attach {
+        id: id.clone(),
+        cols: 80,
+        rows: 24,
+    });
+    while !matches!(next(&mut c), FromDaemon::Snapshot { id: got, .. } if got == id) {}
+}
+
+#[test]
+fn unknown_message_is_ignored() {
+    let st = state();
+    ls(&st); // Starts the daemon.
+    let mut c = connect(&st);
+    // A newer client, which may send message types this daemon doesn't know. It is served at this daemon's version.
+    c.send(&ToDaemon::Hello {
+        version: VERSION + 1,
+    });
+    assert!(matches!(c.recv(), Some(FromDaemon::Hello { version, .. }) if version == VERSION));
+    assert!(matches!(c.recv(), Some(FromDaemon::Profiles { .. })));
+    for _ in 0..2 {
+        c.writer
+            .write_all(b"{\"t\":\"FromTheFuture\",\"x\":1}\n")
+            .unwrap();
+        c.send(&ToDaemon::List);
+        assert!(matches!(c.recv(), Some(FromDaemon::Sessions { .. })));
+    }
+    // Logged once per client.
+    let log = fs::read_to_string(st.root.join("logs").join("daemon.log")).unwrap();
+    assert_eq!(
+        log.matches("message type this daemon doesn't know").count(),
+        1,
+        "{log}"
+    );
+}
+
+#[test]
+fn reload_profiles_rebroadcasts() {
+    let st = state();
+    ls(&st); // Starts the daemon.
+    let mut a = client(&st);
+    let mut b = client(&st);
+    let mut old = connect(&st);
+    old.send(&ToDaemon::Hello { version: 3 });
+    assert!(matches!(old.recv(), Some(FromDaemon::Hello { .. })));
+    let config = st.root.join("config.toml");
+    let mut text = fs::read_to_string(&config).unwrap_or_default();
+    text.push_str("\n[profiles.team]\nkind = \"claude\"\n");
+    fs::write(&config, text).unwrap();
+    a.send(&ToDaemon::ReloadProfiles);
+    // Every v4 client gets the new list, the one that asked included.
+    for c in [&mut a, &mut b] {
+        let Some(FromDaemon::Profiles { profiles }) = c.recv() else {
+            panic!("no Profiles after the reload");
+        };
+        assert!(profiles.iter().any(|p| p.id == "team"), "{profiles:?}");
+    }
+    // The v3 client got nothing: its next message is the answer to List.
+    old.send(&ToDaemon::List);
+    assert!(matches!(old.recv(), Some(FromDaemon::Sessions { .. })));
 }
 
 #[test]
@@ -518,7 +662,13 @@ fn hook_poke_from_another_version_updates_state() {
     assert!(matches!(c.recv(), Some(FromDaemon::Sessions { .. })));
     let dir = PathBuf::from(session_dir(&st, "h"));
     let id = dir.file_name().unwrap().to_str().unwrap().to_string();
-    for (version, message) in [(VERSION - 1, "Older?"), (VERSION + 1, "Newer?")] {
+    // Too old to be served (the refused-Hello path), older but served, and newer.
+    let versions = [
+        (MIN_CLIENT_VERSION - 1, "Too old?"),
+        (VERSION - 1, "Older?"),
+        (VERSION + 1, "Newer?"),
+    ];
+    for (version, message) in versions {
         // Record the event without a poke, then poke the way that version's `mine _event` would.
         let payload = serde_json::json!({"hook_event_name": "Notification", "message": message});
         let ev = mine_core::hooks::parse_hook(&payload, mine_core::hooks::now_ms()).unwrap();

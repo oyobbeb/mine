@@ -9,10 +9,16 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
+use crate::profiles::ProfileInfo;
 use crate::session::{NewSession, SessionInfo};
 
-/// Protocol version between client and daemon. `Colors` was added in 2 and `Focus` in 3 (an older daemon drops the connection on a message it doesn't know).
-pub const VERSION: u32 = 3;
+/// Protocol version between client and daemon. `Colors` was added in 2, `Focus` in 3, and in 4 the hello reply's `features` and
+/// `daemon`, `Profiles` and `ReloadProfiles`. Up to 3 a side dropped the connection on a message type it didn't know; from 4 it
+/// ignores it ([`ToDaemon::Unknown`], [`FromDaemon::Unknown`]). New behavior is gated on a feature name in the hello reply.
+pub const VERSION: u32 = 4;
+/// The oldest client version the daemon serves. The app bundle and the CLI are updated separately, so a daemon serves older clients
+/// and sends each only what its version knows.
+pub const MIN_CLIENT_VERSION: u32 = 3;
 /// Protocol version between daemon and holder process.
 pub const HOLD_VERSION: u32 = 1;
 
@@ -105,14 +111,39 @@ pub enum ToDaemon {
     Focus {
         focused: bool,
     },
+    /// Reread the profiles in `config.toml` and send the new list to every client.
+    ReloadProfiles,
+    /// A message type from a newer client. Ignored.
+    #[serde(other)]
+    Unknown,
+}
+
+/// Who the daemon is, in its hello reply.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct DaemonInfo {
+    pub pid: u32,
+    /// The `mine` package version the daemon was built from.
+    pub version: String,
+    /// When the daemon started (Unix milliseconds).
+    pub started_ms: u64,
 }
 
 /// Messages the daemon sends to a client.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(tag = "t")]
 pub enum FromDaemon {
+    /// `version` is the one both sides speak: the client's, or the daemon's if the client is newer. A daemon older than 4 sends
+    /// neither `features` nor `daemon`.
     Hello {
         version: u32,
+        #[serde(default)]
+        features: Vec<String>,
+        #[serde(default)]
+        daemon: Option<DaemonInfo>,
+    },
+    /// Every profile, in launcher order. Sent to a v4+ client right after `Hello` and again after a reload.
+    Profiles {
+        profiles: Vec<ProfileInfo>,
     },
     Sessions {
         sessions: Vec<SessionInfo>,
@@ -130,6 +161,9 @@ pub enum FromDaemon {
     Error {
         message: String,
     },
+    /// A message type from a newer daemon. Ignored.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Turns a message into one line of JSON (including the trailing `\n`). Returned as a single buffer so it is written in one go.
@@ -259,6 +293,32 @@ mod tests {
         let mut buf = Vec::new();
         write_msg(&mut buf, &m).unwrap();
         assert_eq!(read_msg::<_, ToDaemon>(&mut &buf[..]).unwrap(), Some(m));
+    }
+
+    #[test]
+    fn unknown_message_types_parse_as_unknown() {
+        let line = b"{\"t\":\"FromTheFuture\",\"x\":1}\n";
+        assert_eq!(
+            read_msg::<_, ToDaemon>(&mut &line[..]).unwrap(),
+            Some(ToDaemon::Unknown)
+        );
+        assert_eq!(
+            read_msg::<_, FromDaemon>(&mut &line[..]).unwrap(),
+            Some(FromDaemon::Unknown)
+        );
+    }
+
+    #[test]
+    fn hello_from_a_v3_daemon_parses() {
+        let line = b"{\"t\":\"Hello\",\"version\":3}\n";
+        assert_eq!(
+            read_msg::<_, FromDaemon>(&mut &line[..]).unwrap(),
+            Some(FromDaemon::Hello {
+                version: 3,
+                features: Vec::new(),
+                daemon: None
+            })
+        );
     }
 
     #[tokio::test]

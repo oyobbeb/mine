@@ -239,8 +239,13 @@ impl Model {
                 Vec::new()
             }
             // The connection checked the version. A screen for another session was sent before the attached session changed, so drop it.
+            // Labels are still read locally (`Labels::load`), so the profile list is unused. The connection already skips unknown messages.
             LinkEvent::Msg(
-                FromDaemon::Hello { .. } | FromDaemon::Snapshot { .. } | FromDaemon::Output { .. },
+                FromDaemon::Hello { .. }
+                | FromDaemon::Snapshot { .. }
+                | FromDaemon::Output { .. }
+                | FromDaemon::Profiles { .. }
+                | FromDaemon::Unknown,
             ) => Vec::new(),
         }
     }

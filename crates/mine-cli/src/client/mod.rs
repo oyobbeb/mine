@@ -313,8 +313,13 @@ impl App {
                 self.pending = None;
                 self.say(&message);
             }
-            // The version was checked at connect time, and the other sessions' screens are no longer viewed.
-            FromDaemon::Hello { .. } | FromDaemon::Snapshot { .. } | FromDaemon::Output { .. } => {}
+            // The version was checked at connect time, and the other sessions' screens are no longer viewed. Labels are still read
+            // locally (`Labels::load`), so the profile list is unused. The connection already skips unknown messages.
+            FromDaemon::Hello { .. }
+            | FromDaemon::Snapshot { .. }
+            | FromDaemon::Output { .. }
+            | FromDaemon::Profiles { .. }
+            | FromDaemon::Unknown => {}
         }
     }
 
