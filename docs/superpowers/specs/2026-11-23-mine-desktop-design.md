@@ -1,343 +1,343 @@
-# mine 데스크톱 앱 설계: Paseo식 GPUI 창
+# mine desktop app design: a Paseo-style GPUI window
 
-- 작성일: 2026-11-23
-- 상태: 사용자 승인 (2026-11-23)
-- 바탕 문서: [2026-11-20-mine-multiplexer-design.md](2026-11-20-mine-multiplexer-design.md). 이 문서에 적지 않은 것은 바탕 문서를 따른다.
-- 참고: [Paseo](https://paseo.sh/). 사용자가 화면 구성을 보고 "이런 UI 괜찮다"고 했다.
+- Written: 2026-11-23
+- Status: approved by the user (2026-11-23)
+- Base document: [2026-11-20-mine-multiplexer-design.md](2026-11-20-mine-multiplexer-design.md). Anything not written in this document follows the base document.
+- Reference: [Paseo](https://paseo.sh/). After seeing its screen layout, the user said "this kind of UI is fine".
 
-## 1. 의도
+## 1. Intent
 
-1단계 코어(데몬, 보관 프로세스, TUI)를 Ghostty에서 써 본 사용자의 반응은 이랬다. 첫 화면이 비어 있었고, "⌃a"가 어떤 키인지 몰랐고, 사용성이 처음부터 별로였다. 그 뒤 Paseo 화면을 보고 이렇게 고르고 정했다.
+After trying the phase 1 core (daemon, holder process, TUI) in Ghostty, the user's reaction was this: the first screen was empty, they didn't know which key "⌃a" was, and the usability was poor from the start. After then seeing Paseo's screen, they chose and decided the following.
 
-- Paseo 같은 **데스크톱 앱**으로 간다. 창 하나에 작업 목록, 세션 탭, 대화, 변경 사항이 함께 있는 형식이다.
-- **GPUI**로 만든다. Rust이고 Zed가 쓰는 UI 프레임워크다.
-- 가운데 화면은 Paseo처럼 정한다. Claude와 Codex 세션은 **채팅 화면**이고, 셸과 dev 서버는 **터미널**이다.
-- 만드는 순서는 이렇게 승인했다. (1) 창 뼈대와 터미널 칸, (2) 채팅 화면, (3) 오른쪽 Changes 칸, (4) 그 뒤로 바탕 문서의 2–8단계.
-- 기존 TUI는 SSH로 붙을 때 쓰는 보조 화면으로 남긴다. TUI에서 채팅 세션은 글자 대화로 보고 답한다. 한 줄 메시지 보내기, 승인 y/n, 멈춤까지 된다(사용자 결정, 5.10).
+- Go with a Paseo-like **desktop app**: one window holding the task list, session tabs, conversation, and changes.
+- Build it with **GPUI**. It is Rust and is the UI framework Zed uses.
+- The center screen is decided the way Paseo does it. Claude and Codex sessions get a **chat view**, and shells and dev servers get a **terminal**.
+- The build order was approved like this: (1) the window skeleton and terminal pane, (2) the chat view, (3) the Changes panel on the right, (4) after that, phases 2–8 of the base document.
+- The existing TUI stays as a secondary screen for attaching over SSH. In the TUI, a chat session is viewed and answered as a text conversation. Sending a one-line message, approving with y/n, and stopping all work (user decision, 5.10).
 
-장기 방향은 바탕 문서와 같다. mine은 "지금 이 작업을 어느 에이전트·계정에 맡길까"에 답하는 도구다. 바뀌는 것은 주 화면이 터미널 안의 TUI에서 데스크톱 창으로 옮겨 간다는 점이다.
+The long-term direction is the same as in the base document. mine is a tool that answers "which agent or account should I give this task to right now?". What changes is that the main screen moves from a TUI inside a terminal to a desktop window.
 
-### 바탕 문서에서 뒤집는 결정
+### Decisions reversed from the base document
 
-- 바탕 문서 2절 비목표 "자체 GUI 창"을 뒤집는다. 데스크톱 창이 주 화면이 된다.
-- 바탕 문서 2절 비목표 "순정 CLI 기능의 재구현. 세션 화면은 순정 Claude Code와 Codex를 그대로 쓴다"를 바꾼다.
-  - Claude와 Codex 세션은 기본으로 mine이 그리는 채팅 화면이다.
-  - 순정 화면이 필요할 때를 위해 **터미널로 열기**를 남긴다. 에이전트 팀, `/login` 같은 터미널 전용 명령이 그런 경우다(5.3).
-- 바탕 문서의 실패 조건 중 "Claude Code나 Codex 화면이 mine 안에서 깨진다"는 터미널 모드 세션에만 그대로 적용한다. 채팅 세션에는 아래 7절의 실패 조건이 대신 적용된다.
+- The base document's section 2 non-goal "a GUI window of its own" is reversed. The desktop window becomes the main screen.
+- The base document's section 2 non-goal "Reimplementing stock CLI features. Session screens use stock Claude Code and Codex as they are" is changed.
+  - Claude and Codex sessions are by default a chat view that mine draws.
+  - **Open in terminal** remains for when the stock screen is needed. Terminal-only things such as agent teams and `/login` are such cases (5.3).
+- Of the base document's failure conditions, "the Claude Code or Codex screen breaks inside mine" now applies only to terminal-mode sessions. For chat sessions, the failure conditions in section 7 below apply instead.
 
-## 2. 목표 · 비목표 · 실패 조건
+## 2. Goals · non-goals · failure conditions
 
-**목표 (이 문서가 다루는 D1–D3)**
+**Goals (D1–D3, covered by this document)**
 
-1. **D1 창 뼈대.** `mine-app`을 실행하면 창이 뜬다. 왼쪽에 상태별 작업 목록, 위에 세션 탭, 가운데에 세션 화면이 있다. 지금 있는 claude·codex·shell 세션을 터미널 칸으로 띄워 쓸 수 있다. 이 단계만으로 TUI와 tmux를 대신해 하루를 쓸 수 있어야 한다.
-2. **D2 채팅 화면.** 다음을 할 수 있다.
-   - Claude와 Codex 세션을 채팅 화면으로 만들고 이어서 쓴다.
-   - 입력창에서 메시지를 보내고, 일하는 중에 더 보내 쌓아 둔다.
-   - 모델과 effort를 바꾸고, 하던 일을 멈춘다.
-   - 승인 요청에 버튼으로 답하고, 서브에이전트 활동을 묶어서 본다.
-3. **D3 Changes 칸.** 선택한 프로젝트의 미커밋 변경을 파일 트리와 +/− 줄 수로 보고, 파일을 누르면 diff를 본다. 최근 커밋 목록도 본다.
-4. 앱을 닫아도 세션은 계속 돈다. 다시 열면 같은 대화와 화면이 그대로 있다. 바탕 문서 목표 1이 데스크톱에서도 지켜진다.
+1. **D1 Window skeleton.** Running `mine-app` opens a window. On the left is a task list grouped by status, at the top are session tabs, and in the center is the session screen. The existing claude·codex·shell sessions can be opened and used as terminal panes. This phase alone must be enough to use for a whole day in place of the TUI and tmux.
+2. **D2 Chat view.** The user can do the following.
+   - Create Claude and Codex sessions as chat views and continue them.
+   - Send messages from the input box, and send more while the agent is working so they queue up.
+   - Change the model and effort, and stop what the agent is doing.
+   - Answer approval requests with buttons, and view subagent activity grouped together.
+3. **D3 Changes panel.** See the selected project's uncommitted changes as a file tree with +/− line counts, and click a file to see its diff. Also see the recent commit list.
+4. Sessions keep running when the app is closed. Reopening it brings back the same conversation and screen. Base document goal 1 is kept on the desktop too.
 
-**비목표**
+**Non-goals**
 
-- Paseo의 다른 기능: 스케줄, 음성, 플러그인, 모바일 앱, Hub, PR 화면, 코드 편집기 칸.
-- 웹 클라이언트, 창 여러 개, Windows 지원.
-- 채팅 화면에서 Claude Code의 모든 기능 재현. 안 되는 것은 터미널로 열기로 해결한다.
-- 바탕 문서 2–8단계: 계정 넘기기, 재부팅 복원, git graph, 원격, 마스터, 브라우저, 배포. 이것들은 이 문서 다음에 단계별로 따로 계획한다. git graph는 D3의 커밋 목록에서 출발한다.
+- Paseo's other features: schedules, voice, plugins, mobile app, Hub, PR view, code editor pane.
+- A web client, multiple windows, Windows support.
+- Reproducing every Claude Code feature in the chat view. What doesn't work is solved with Open in terminal.
+- Base document phases 2–8: account handoff, restore after reboot, git graph, remote, master, browser, distribution. These are planned separately, phase by phase, after this document. The git graph starts from D3's commit list.
 
-## 3. 제약
+## 3. Constraints
 
-- **언어:** Rust만 쓰고 Python은 쓰지 않는다. 테스트용 가짜 에이전트는 셸 스크립트나 Rust로 만든다.
-- **GPUI:** 아직 1.0 전이라 버전이 오를 때 API가 깨질 수 있다. 판을 고정한다. `gpui`, `gpui-component`, 또는 둘을 묶은 `gpui-kit` 중 하나를 git rev나 정확한 버전으로 고정한다(빌더가 정함, 6절). GPUI 관련 의존성은 앱 패키지에만 들어가고, 데몬과 CLI 바이너리는 GPUI를 끌어오지 않는다.
-- **플랫폼:** macOS(Apple Silicon)가 기준이다. Linux는 빌드만 깨지지 않게 한다.
-- **에이전트 연결 규약은 판마다 바뀐다.**
-  - Claude Code의 stream-json 제어 메시지는 공식 Agent SDK 패키지에만 정의돼 있다.
-  - Codex app-server의 스키마는 판마다 `codex app-server generate-json-schema`로 뽑는다.
-  - 그래서 확인한 판을 문서에 적고 기능 감지(Claude `system/init.capabilities`)로 갈라 처리한다.
-  - 모르는 메시지가 와도 죽지 않고 원문을 "알 수 없는 항목"으로 보여 준다.
-- **인증:** 바탕 문서와 같다. claude-a는 `~/.claude`를 쓰고, claude-b는 `CLAUDE_CONFIG_DIR=<state>/profiles/claude-b`, Codex는 기존 로그인을 쓴다. mine은 자격 증명을 다루지 않는다. `--bare`는 쓰지 않는다. `--bare`는 구독 로그인을 읽지 않기 때문이다.
+- **Language:** Rust only, no Python. Fake agents for tests are built with shell scripts or Rust.
+- **GPUI:** It is still pre-1.0, so the API can break when versions go up. Pin the version. Pin one of `gpui`, `gpui-component`, or `gpui-kit` (which bundles the two) to a git rev or an exact version (the builder decides, section 6). GPUI-related dependencies go only into the app package; the daemon and CLI binaries don't pull in GPUI.
+- **Platform:** macOS (Apple Silicon) is the baseline. For Linux, only keep the build from breaking.
+- **The agent connection protocols change from version to version.**
+  - Claude Code's stream-json control messages are defined only in the official Agent SDK package.
+  - The Codex app-server schema is extracted per version with `codex app-server generate-json-schema`.
+  - So write the confirmed versions in the document, and branch handling on feature detection (Claude `system/init.capabilities`).
+  - Even if an unknown message arrives, don't die; show its raw text as an "unknown item".
+- **Authentication:** Same as the base document. claude-a uses `~/.claude`, claude-b uses `CLAUDE_CONFIG_DIR=<state>/profiles/claude-b`, and Codex uses its existing login. mine doesn't handle credentials. `--bare` is not used, because `--bare` doesn't read the subscription login.
 
-## 4. 검토한 접근
+## 4. Approaches considered
 
-| 접근 | 장점 | 단점 | 결정 |
+| Approach | Pros | Cons | Decision |
 |---|---|---|---|
-| **A. mine 데몬 위에 GPUI 앱** | 1단계 코어(보관 프로세스, 재시작 뒤 복구, 상태)를 그대로 쓴다. 셸·dev 서버 탭은 지금 PTY 세션으로 해결된다. 처음부터 끝까지 Rust다. | 만들 것이 가장 많다. GPUI가 1.0 전이다. | **채택**. 사용자 승인 |
-| B. Paseo 포크 | 화면이 이미 다 있어서 가장 빠르다. Apache-2.0이다. | TypeScript·Electron이다. 사용자가 고른 GPUI·Rust와 반대다. | 제외 |
-| C. 채팅 전용으로 새로 | 구조가 단순하다. | PTY 코어를 버린다. 그러면 셸 탭과 재시작 뒤 복구를 다시 만들어야 한다. | 제외 |
+| **A. A GPUI app on top of the mine daemon** | Reuses the phase 1 core as is (holder processes, recovery after restart, status). Shell and dev server tabs are already solved by PTY sessions. Rust from start to finish. | The most to build. GPUI is pre-1.0. | **Chosen**. Approved by the user |
+| B. Fork Paseo | The screens already exist, so it is the fastest. Apache-2.0. | TypeScript and Electron. The opposite of the user's chosen GPUI and Rust. | Rejected |
+| C. New, chat-only | Simple structure. | Throws away the PTY core. Shell tabs and recovery after restart would have to be rebuilt. | Rejected |
 
-## 5. 설계
+## 5. Design
 
-### 5.1 구조
+### 5.1 Structure
 
 ```
-mine-app (GPUI 창) ──┐
-mine (TUI, SSH용) ───┼── 유닉스 소켓, JSON 줄 ── mine daemon ── mine hold (세션마다)
-mine ls/new/kill ────┘                                         ├─ PTY 모드: 셸, dev 서버, 터미널로 연 claude·codex
-                                                               └─ 파이프 모드: 채팅 세션의 claude -p / codex app-server
+mine-app (GPUI window) ──┐
+mine (TUI, for SSH) ─────┼── Unix socket, JSON lines ── mine daemon ── mine hold (one per session)
+mine ls/new/kill ────────┘                                             ├─ PTY mode: shell, dev server, claude·codex opened as terminal
+                                                                       └─ pipe mode: claude -p / codex app-server of chat sessions
 ```
 
-- **저장소는 Cargo 워크스페이스 모노레포가 된다(사용자 제안).** 패키지는 `crates/` 아래에 `mine-<역할>` 이름으로 둔다. Helix(`helix-core`, `helix-term`)나 Zed(`crates/*`)와 같은 방식이다.
-  - `crates/mine-core` (lib): 여러 바이너리가 함께 쓰는 것. `paths`, `project`, `session`, `proto`, `screen`, `hooks`, `conn`, 그리고 5.4의 대화 항목 모델과 어댑터.
-  - `crates/mine-cli` (bin, 실행 이름은 `mine`): 헤드리스 명령, `mine daemon`, `mine hold`, TUI. 사용자는 지금처럼 `mine`을 친다. 데몬과 보관 프로세스는 이 바이너리의 하위 명령으로 남는다.
-  - `crates/mine-app` (bin, 실행 이름 `mine-app`, 묶음 이름 `mine.app`): GPUI 창.
-  - 코드 안에서는 밑줄 이름(`mine_core`)을 쓴다. GPUI 의존성은 `mine-app`에만 들어가고, `mine-core`와 `mine-cli`는 GPUI를 끌어오지 않는다.
-  - 데몬을 따로 `mine-daemon` 크레이트로 빼는 것은 필요해질 때 한다. 지금은 데몬을 쓰는 바이너리가 `mine-cli` 하나뿐이다.
-- **앱은 데몬의 클라이언트일 뿐이다(내 결정).**
-  - 데몬이 없으면 지금처럼 띄운다(`connect_or_spawn`).
-  - 앱을 닫아도 데몬과 세션은 그대로다.
-  - 앱 안에 데몬을 넣지 않는다.
-- **채팅 세션도 보관 프로세스가 쥔다(내 결정).**
-  - 보관 프로세스에 **파이프 모드**를 더한다. 자식의 stdin과 stdout을 파이프로 연결하고, stderr는 세션 로그로 보낸다.
-  - `HoldIn`/`HoldOut` 메시지와 2 MiB 링은 그대로 쓴다. `Input`은 자식 stdin으로 가는 바이트이고, `Output`은 stdout 바이트다.
-  - 모드는 `mine hold`의 명령줄 플래그로 고른다. 메시지 형식이 그대로라서 `HOLD_VERSION`은 1로 둔다.
-  - 이렇게 하면 데몬이 다시 떠도 채팅 세션이 산다. 바탕 문서의 실패 조건을 그대로 지키는 방법이다.
-- **데몬은 채팅 세션마다 대화 기록(transcript)을 가진다.**
-  - 자식 stdout의 JSON 줄을 받아 아래 5.4의 공통 항목으로 바꾼다.
-  - 메모리에 두고, `sessions/<id>/transcript.jsonl`에 덧붙여 저장한다. 원문 JSON 줄도 `sessions/<id>/raw.jsonl`에 남겨 디버깅과 재해석에 쓴다.
-  - 데몬이 다시 떠서 보관 프로세스의 링을 다시 받을 때, 이미 기록한 줄을 **두 번 넣거나 빠뜨리면 안 된다**. 방법은 빌더가 정한다. 예를 들어 링에 누적 바이트 위치를 붙이고, 마지막으로 처리한 위치를 메타에 저장할 수 있다.
+- **The repository becomes a Cargo workspace monorepo (user's suggestion).** Packages go under `crates/` and are named `mine-<role>`. This is the same approach as Helix (`helix-core`, `helix-term`) and Zed (`crates/*`).
+  - `crates/mine-core` (lib): what several binaries share. `paths`, `project`, `session`, `proto`, `screen`, `hooks`, `conn`, plus the conversation item model and adapters in 5.4.
+  - `crates/mine-cli` (bin, executable name `mine`): headless commands, `mine daemon`, `mine hold`, the TUI. The user types `mine` as now. The daemon and holder process stay as subcommands of this binary.
+  - `crates/mine-app` (bin, executable name `mine-app`, bundle name `mine.app`): the GPUI window.
+  - In code, underscore names (`mine_core`) are used. The GPUI dependency goes only into `mine-app`; `mine-core` and `mine-cli` don't pull in GPUI.
+  - Splitting the daemon out into its own `mine-daemon` crate is done when it becomes necessary. For now, `mine-cli` is the only binary that uses the daemon.
+- **The app is only a client of the daemon (my decision).**
+  - If there is no daemon, start it as now (`connect_or_spawn`).
+  - Closing the app leaves the daemon and sessions untouched.
+  - The daemon is not embedded in the app.
+- **Chat sessions are also held by a holder process (my decision).**
+  - Add a **pipe mode** to the holder process. It connects the child's stdin and stdout through pipes and sends stderr to the session log.
+  - The `HoldIn`/`HoldOut` messages and the 2 MiB ring stay as they are. `Input` is the bytes going to the child's stdin, and `Output` is the stdout bytes.
+  - The mode is chosen with a command-line flag of `mine hold`. The message format is unchanged, so `HOLD_VERSION` stays at 1.
+  - This way chat sessions survive even when the daemon comes back up. It is how the base document's failure condition is kept as is.
+- **The daemon keeps a conversation record (transcript) for each chat session.**
+  - It takes the JSON lines from the child's stdout and converts them into the common items of 5.4 below.
+  - It holds them in memory and appends them to `sessions/<id>/transcript.jsonl`. The raw JSON lines are also kept in `sessions/<id>/raw.jsonl` for debugging and reinterpretation.
+  - When the daemon comes back up and receives the holder process's ring again, it **must not insert already-recorded lines twice or miss any**. The builder decides how. For example, the ring could carry a cumulative byte offset, and the last processed offset could be saved in the metadata.
 
-### 5.2 프로토콜 (클라이언트↔데몬 `VERSION = 3`)
+### 5.2 Protocol (client↔daemon `VERSION = 3`)
 
-이미 있는 메시지는 그대로 둔다. 새로 더하는 메시지:
+Existing messages stay as they are. New messages:
 
 - **`FromDaemon`**
-  - `Transcript { id, items }`: 채팅 세션에 붙으면 `Snapshot` 대신 보낸다. 전체 대화 기록이다. 만들고 있는 항목은 그때까지 쌓인 글을 담는다.
-  - `Item { id, item }`: 새 항목이 생기거나 기존 항목이 바뀔 때 보낸다. 항목에는 고유 id가 있고, 같은 id면 갱신이다.
-  - `ItemDelta { id, item_id, text }`: 만들고 있는 `Assistant`·`Thinking` 항목에 글을 덧붙인다. 글자 단위 표시용이다. 델타는 파일에 저장하지 않고, 항목이 끝나면 완성된 `Item`을 저장한다.
+  - `Transcript { id, items }`: sent in place of `Snapshot` when attaching to a chat session. It is the full conversation record. An in-progress item carries the text accumulated so far.
+  - `Item { id, item }`: sent when a new item appears or an existing one changes. An item has a unique id, and the same id means an update.
+  - `ItemDelta { id, item_id, text }`: appends text to an in-progress `Assistant` or `Thinking` item. It is for character-by-character display. Deltas aren't saved to the file; when an item finishes, the completed `Item` is saved.
 - **`ToDaemon`**
-  - `Send { id, content, priority }`. `content`는 글과 첨부(이미지, 파일 경로)다. `priority`는 Claude의 `now`·`next`·`later`에 대응한다.
-  - `Answer { id, request_id, decision }`: 승인 요청, 계획 승인(ExitPlanMode), 질문(AskUserQuestion)에 답한다.
+  - `Send { id, content, priority }`. `content` is text and attachments (images, file paths). `priority` corresponds to Claude's `now`·`next`·`later`.
+  - `Answer { id, request_id, decision }`: answers an approval request, a plan approval (ExitPlanMode), or a question (AskUserQuestion).
   - `Interrupt { id }`
   - `SetModel { id, model }`
   - `SetEffort { id, effort }`
-  - `SetPermissionMode { id, mode }`: 권한 모드를 바꾼다(5.3).
-  - `Focus { focused }`: 앱 창이 앞에 있는지 알린다. 알림을 겹쳐 띄우지 않으려고 쓴다(5.9).
-- **`NewSession`에 `view` 필드를 더한다:** `Chat` 또는 `Terminal`. claude·codex의 기본값은 `Chat`이고, shell은 늘 `Terminal`이다. 메타에도 저장한다.
+  - `SetPermissionMode { id, mode }`: changes the permission mode (5.3).
+  - `Focus { focused }`: tells the daemon whether the app window is in front. Used to avoid stacking notifications (5.9).
+- **Add a `view` field to `NewSession`:** `Chat` or `Terminal`. The default for claude·codex is `Chat`, and shell is always `Terminal`. It is also saved in the metadata.
 
-### 5.3 세션과 상태
+### 5.3 Sessions and status
 
-- **종류**
-  - claude·codex 세션은 만들 때 채팅으로 열지 터미널로 열지 고른다. 실행 중에는 바꾸지 않는다. 서로 다른 프로세스이기 때문이다.
-  - 터미널로 연 세션은 지금 1단계와 똑같이 순정 CLI다.
-  - 채팅 세션의 대화는 `--resume`으로 이어지므로, 같은 대화를 터미널로 다시 여는 것은 가능하다(D2의 "터미널로 열기" 명령).
-- **채팅과 터미널 사이 이동은 채팅 → 터미널 한 방향이다(내 결정).**
-  - "터미널로 열기"는 같은 대화를 `--resume`으로 이어 터미널 세션을 새로 연다. 같은 대화를 두 프로세스가 동시에 잡지 않도록, 원래 채팅 세션은 닫는다(실행 전에 묻는다). 대화를 갈라 두 개로 만들지(`--fork-session`)는 않는다.
-  - 터미널 세션을 채팅으로 여는 것은 "같은 대화를 이어 가는 새 채팅"으로만 한다. `-p`의 `--resume`은 지난 턴을 다시 내보내지 않으므로, 채팅 화면에는 "이전 대화는 표시하지 않음"이라는 `Note`만 남는다. 지난 대화를 가져와 보여 주는 기능은 이 문서의 범위가 아니다.
-- **권한 모드(내 결정).**
-  - Claude 채팅 세션은 `--permission-mode`로 시작한다. 기본값은 그 계정 설정의 `defaultMode`다. 사용자는 지금 auto를 쓴다. 입력창에서 default·acceptEdits·plan·auto·bypassPermissions 중에 바꾸며, 실행 중 변경은 제어 메시지로 보낸다.
-  - plan 모드의 `ExitPlanMode`는 "계획 승인" 카드로 따로 보여 준다(5.7).
-  - Codex 채팅 세션은 승인 정책과 샌드박스를 `thread/start`에 넘긴다. 기본값은 Codex 설정을 따르고, 입력창에서 바꾼다.
-- **채팅 세션에서 안 되는 것**은 터미널로 열기로 해결한다. 실행 화면에서 그렇게 안내한다.
-  - Claude Code 에이전트 팀. `-p` 모드에서는 팀원을 만들지 않는다(Claude Code 문서).
-  - `/login`, `/theme` 같은 터미널 전용 명령.
-- **채팅 세션의 상태.** 훅 대신 스트림에서 직접 정한다.
-  - ◆ 승인 대기: 답하지 않은 승인 요청이나 질문이 있다.
-  - ◐ 작업 중: 턴이 돌고 있다.
-  - ✓ 끝남: 턴이 끝났고 사용자가 아직 보지 않았다.
-  - ○ 대기: 그 밖의 경우.
-  - 종료됨: 프로세스가 끝났다. 고르면 `--resume`으로 다시 띄운다. 바탕 문서와 같다.
-- **터미널 세션의 상태**는 1단계 그대로다. 훅으로 정하고, shell은 출력에 따라 정한다.
+- **Kinds**
+  - For claude·codex sessions, whether to open as chat or terminal is chosen at creation. It isn't changed while running, because they are different processes.
+  - A session opened as terminal is the stock CLI, exactly like phase 1 today.
+  - A chat session's conversation continues through `--resume`, so reopening the same conversation as a terminal is possible (D2's "Open in terminal" command).
+- **Moving between chat and terminal is one-way, chat → terminal (my decision).**
+  - "Open in terminal" continues the same conversation with `--resume` and opens a new terminal session. So that two processes don't hold the same conversation at once, the original chat session is closed (after asking before it runs). The conversation isn't forked into two (`--fork-session`).
+  - Opening a terminal session as chat is done only as "a new chat that continues the same conversation". `--resume` in `-p` mode doesn't re-emit past turns, so the chat view is left with only a `Note` saying "Earlier conversation not shown". Importing and showing the past conversation is outside this document's scope.
+- **Permission mode (my decision).**
+  - Claude chat sessions start with `--permission-mode`. The default is that account's `defaultMode` setting. The user uses auto now. The input box switches among default·acceptEdits·plan·auto·bypassPermissions, and a change while running is sent as a control message.
+  - plan mode's `ExitPlanMode` is shown separately as a "plan approval" card (5.7).
+  - Codex chat sessions pass the approval policy and sandbox to `thread/start`. The defaults follow the Codex settings and can be changed in the input box.
+- **What doesn't work in a chat session** is solved with Open in terminal. The launcher says so.
+  - Claude Code agent teams. In `-p` mode it doesn't create teammates (Claude Code docs).
+  - Terminal-only commands such as `/login` and `/theme`.
+- **A chat session's status.** Decided directly from the stream, not hooks.
+  - ◆ Needs approval: there is an approval request or question that hasn't been answered.
+  - ◐ Working: a turn is running.
+  - ✓ Done: the turn has ended and the user hasn't seen it yet.
+  - ○ Idle: anything else.
+  - Exited: the process has ended. Choosing it relaunches with `--resume`. Same as the base document.
+- **A terminal session's status** is the same as phase 1. Decided by hooks, and for shell by its output.
 
-### 5.4 대화 항목 (공통 모델)
+### 5.4 Conversation items (common model)
 
-Claude와 Codex의 출력을 아래 항목들로 바꾼다. 화면은 이 항목만 안다.
+Claude's and Codex's output is converted into the items below. The screen knows only these items.
 
-| 항목 | 내용 | Claude에서 | Codex에서 |
+| Item | Content | From Claude | From Codex |
 |---|---|---|---|
-| `User` | 보낸 메시지, 쌓인(아직 안 보낸) 상태 표시 | stdin에 보낸 `user` (+ `--replay-user-messages` 확인) | `turn/start` 입력 |
-| `Assistant` | 마크다운 글 | `assistant`의 text 블록 | 메시지 item |
-| `Thinking` | 접힌 생각 | thinking 블록 | reasoning item |
-| `Tool` | 이름, 한 줄 요약, 입력, 상태(실행 중/성공/실패), 출력 | `tool_use` + 이어지는 `tool_result` | commandExecution·fileChange 등 item |
-| `Approval` | 요청 id, 도구, 요약, 선택지(허용/거부/항상 허용) | `control_request` `can_use_tool` (`--permission-prompt-tool=stdio`) | `item/commandExecution/requestApproval`, `item/fileChange/requestApproval` |
-| `Question` | AskUserQuestion의 질문과 선택지 | `can_use_tool`, `tool_name: "AskUserQuestion"` | 해당 없음 |
-| `Subagent` | 서브에이전트 하나의 묶음(제목, 상태, 안의 항목들) | `agent_id`가 같은 메시지들, `task_*` 시스템 메시지 | 해당 없음 |
-| `TurnEnd` | 결과, 비용, 사용량, 오류 | `result` | `turn/completed` |
-| `Note` | 압축, API 재시도, 알 수 없는 메시지 원문 | `system/*`, 그 밖 | 그 밖 |
+| `User` | The sent message; a queued (not yet sent) indicator | The `user` message sent to stdin (+ confirmation via `--replay-user-messages`) | `turn/start` input |
+| `Assistant` | Markdown text | The text block of `assistant` | message item |
+| `Thinking` | Collapsed thinking | thinking block | reasoning item |
+| `Tool` | Name, one-line summary, input, status (running/succeeded/failed), output | `tool_use` + the following `tool_result` | commandExecution·fileChange and other items |
+| `Approval` | Request id, tool, summary, choices (Allow/Deny/Always allow) | `control_request` `can_use_tool` (`--permission-prompt-tool=stdio`) | `item/commandExecution/requestApproval`, `item/fileChange/requestApproval` |
+| `Question` | AskUserQuestion's question and choices | `can_use_tool`, `tool_name: "AskUserQuestion"` | N/A |
+| `Subagent` | One subagent's group (title, status, items inside) | Messages with the same `agent_id`, `task_*` system messages | N/A |
+| `TurnEnd` | Result, cost, usage, error | `result` | `turn/completed` |
+| `Note` | Compaction, API retries, raw text of unknown messages | `system/*`, anything else | anything else |
 
-**Claude 실행 방법 (확인한 판: Claude Code 2.1.3xx)**
+**How Claude is run (confirmed version: Claude Code 2.1.3xx)**
 
-- **실행:** `claude -p --input-format stream-json --output-format stream-json --verbose --include-partial-messages --permission-prompt-tool=stdio --forward-subagent-text --replay-user-messages`에 `--permission-mode`, `--resume <id>`(이어갈 때), `--model`, `--effort`를 붙인다.
-- **글자 단위 표시:** `--include-partial-messages`의 `stream_event`(`content_block_delta`)를 `ItemDelta`로 바꾼다. 서브에이전트 글은 델타가 오지 않으므로 블록이 끝날 때 한 번에 보인다.
-- **입력:** 한 줄에 JSON 하나다. 형식은 `{"type":"user","message":{"role":"user","content":...},"parent_tool_use_id":null,"uuid":...,"priority":...}`이다. 사용자가 친 글을 그대로 보낼 때 `client_composed: true`를 쓸지는 빌더가 정한다. `/`로 시작하는 명령은 확장되게 둔다.
-- **제어:** `control_request` / `control_response`로 한다.
-  - `interrupt`, `set_model`, `apply_flag_settings`(effort), `can_use_tool` 응답이 여기에 속한다.
-  - `control_cancel_request`는 대기 중인 승인을 철회한다.
-  - 기능 감지는 `system/init.capabilities`로 한다.
-  - 형식은 공식 Agent SDK 패키지(`@anthropic-ai/claude-agent-sdk`)의 `sdk.d.ts`를 기준으로 삼는다.
-- **환경:** 사용자가 `CLAUDE_CODE_EFFORT_LEVEL`을 설정해 두면 실행 중 effort 변경이 먹지 않는다(Claude Code 문서). 이 경우 입력창에서 effort 선택을 잠그고 그 이유를 보여 준다.
-- **세션 id:** `system/init`과 `result`에서 받아 메타의 `resume_id`에 저장한다.
+- **Launch:** `claude -p --input-format stream-json --output-format stream-json --verbose --include-partial-messages --permission-prompt-tool=stdio --forward-subagent-text --replay-user-messages`, with `--permission-mode`, `--resume <id>` (when continuing), `--model`, and `--effort` added.
+- **Character-by-character display:** `stream_event` (`content_block_delta`) from `--include-partial-messages` is converted to `ItemDelta`. Subagent text doesn't arrive as deltas, so it appears all at once when the block ends.
+- **Input:** one JSON object per line. The format is `{"type":"user","message":{"role":"user","content":...},"parent_tool_use_id":null,"uuid":...,"priority":...}`. Whether to use `client_composed: true` when sending the user's typed text as is is up to the builder. Commands starting with `/` are left to be expanded.
+- **Control:** done with `control_request` / `control_response`.
+  - `interrupt`, `set_model`, `apply_flag_settings` (effort), and the `can_use_tool` response belong here.
+  - `control_cancel_request` withdraws a pending approval.
+  - Feature detection uses `system/init.capabilities`.
+  - The format is based on `sdk.d.ts` in the official Agent SDK package (`@anthropic-ai/claude-agent-sdk`).
+- **Environment:** if the user has set `CLAUDE_CODE_EFFORT_LEVEL`, changing effort while running has no effect (Claude Code docs). In that case, lock the effort choice in the input box and show why.
+- **Session id:** taken from `system/init` and `result` and saved as `resume_id` in the metadata.
 
-**Codex 실행 방법**
+**How Codex is run**
 
-- `codex app-server`(stdio, JSON-RPC, `"jsonrpc"` 헤더 없음)를 쓴다.
-- 흐름은 `initialize` → `thread/start`(또는 이어가기) → `turn/start` → item 알림 → `turn/completed`다.
-- 승인은 서버가 거는 요청에 답한다.
-- 쓰는 판의 스키마를 `codex app-server generate-json-schema`로 뽑아 저장소에 넣고, 타입은 그 판에 맞춘다. 판을 올리면 다시 뽑는다.
+- Uses `codex app-server` (stdio, JSON-RPC, no `"jsonrpc"` header).
+- The flow is `initialize` → `thread/start` (or continue) → `turn/start` → item notifications → `turn/completed`.
+- Approvals are answered as replies to requests the server sends.
+- Extract the schema of the version in use with `codex app-server generate-json-schema`, put it in the repository, and match the types to that version. Extract it again when the version goes up.
 
-### 5.5 창 배치 (D1)
+### 5.5 Window layout (D1)
 
 ```
-┌───────────────────────┬──────────────────────────────────────────────┬─────────────────┐
-│ ＋ 새 작업      ⌘N    │ mine · t1   [A] claude-a           ⏹ 멈춤 ⋯ │ Changes  Files  │
-│ ┌ 전체 ▾ ──────────┐ │ [◐ t1  A] [✓ review  C] [dev  sh]  ＋         │ main            │
-│ │ 프로젝트 고르기     │ ├──────────────────────────────────────────────┤ 미커밋 +120 −31  │
-│ └──────────────────┘ │                                              │ ▾ src/client     │
-│ ◆ 승인 대기        1  │   (채팅 화면 또는 터미널 칸)                  │   ui.rs  +56 −18 │
-│  refund-flow   [B]   │                                              │   mod.rs +12 −3  │
-│  photo · 배포 승인? 1m│                                              │ ▸ 커밋           │
-│ ◐ 작업 중          2  │                                              │                 │
-│  t1            [A]   │ ┌──────────────────────────────────────────┐ │                 │
-│  mine · 3m           │ │ 메시지…            Opus ▾  Medium ▾  ⏎ │ │                 │
-│ ✓ 끝남             1  │ └──────────────────────────────────────────┘ │                 │
-│ ○ 대기 ▸           3  │                                              │                 │
-│ ＋ 프로젝트 추가      │                                              │                 │
-└───────────────────────┴──────────────────────────────────────────────┴─────────────────┘
+┌────────────────────────────┬──────────────────────────────────────────────┬──────────────────────┐
+│ ＋ New task            ⌘N  │ mine · t1   [A] claude-a            ⏹ Stop ⋯ │ Changes  Files       │
+│ ┌ All projects ▾ ────────┐ │ [◐ t1  A] [✓ review  C] [dev  sh]  ＋        │ main                 │
+│ │ Pick project           │ ├──────────────────────────────────────────────┤ Uncommitted +120 −31 │
+│ └────────────────────────┘ │                                              │ ▾ src/client         │
+│ ◆ Needs approval        1  │   (chat view or terminal pane)               │   ui.rs  +56 −18     │
+│  refund-flow          [B]  │                                              │   mod.rs +12 −3      │
+│  photo · approve deploy? 1m│                                              │ ▸ Commits            │
+│ ◐ Working               2  │                                              │                      │
+│  t1                   [A]  │ ┌──────────────────────────────────────────┐ │                      │
+│  mine · 3m                 │ │ Message…             Opus ▾  Medium ▾  ⏎ │ │                      │
+│ ✓ Done                  1  │ └──────────────────────────────────────────┘ │                      │
+│ ○ Idle ▸                3  │                                              │                      │
+│ ＋ Add project             │                                              │                      │
+└────────────────────────────┴──────────────────────────────────────────────┴──────────────────────┘
 ```
 
-- **왼쪽 목록**
-  - 맨 위에 "새 작업"이 있고, 누르면 실행 화면을 연다.
-  - 그 아래 프로젝트 고르기가 있다. "전체"나 프로젝트 하나를 고르고, 승인 대기가 있는 프로젝트에는 ◆ 표시가 붙는다. TUI의 아이콘 줄을 대신한다.
-  - 그 아래는 상태별 그룹이다. 순서와 기호는 바탕 문서와 같다(◆ → ◐ → ✓ → ○).
-  - 줄은 두 줄이다. 첫 줄은 이름과 계정 칩(A/B/C)이다. 둘째 줄은 프로젝트, 대기 문구나 마지막 활동, 몇 분 전인지를 보여 준다.
-  - 대기 그룹은 처음에 접혀 있고 머리를 누르면 펼친다.
-- **가운데 위:** 선택한 프로젝트의 세션들이 탭으로 놓인다. 탭에는 상태 기호와 칩이 붙는다. "＋"를 누르면 실행 화면이 뜬다.
-- **실행 화면**
-  - TUI에서 사용자가 고른 형식을 그대로 옮긴다. 키 하나와 클릭으로 고른다: ↵ claude-a, b claude-b, x codex, s shell.
-  - "터미널로 열기" 선택지와 "이름·모델 직접 입력"을 더한다.
-  - 이름은 자동으로 `t<N>`이 붙는다.
-- **오른쪽 Changes 칸:** D3에서 만든다. D1에서는 접힌 자리만 둔다.
-- **색:** 사용자가 승인한 목업 색을 쓴다. 바탕 `#1e2128`, 목록 `#23252b`, 선택 줄 `#2f323a`, 경계 `#2c2f36`, 칩 A `#e5c07b` / B `#c678dd` / C `#56b6c2`. 글꼴은 UI에 시스템 글꼴, 터미널과 코드에 고정폭 글꼴을 쓴다(빌더가 정함).
-- **단축키:** 앱에서는 접두 키가 필요 없다.
+- **Left list**
+  - At the top is "New task", which opens the launcher when clicked.
+  - Below it is the project picker. Choose "All projects" or a single project; a project with a session that Needs approval gets a ◆ mark. It replaces the TUI's project rail.
+  - Below that are the status groups. The order and symbols are the same as the base document (◆ → ◐ → ✓ → ○).
+  - Each entry is two lines. The first line is the name and account chip (A/B/C). The second line shows the project, the waiting text or last activity, and how many minutes ago.
+  - The Idle group starts collapsed, and clicking its header expands it.
+- **Center top:** the selected project's sessions are laid out as tabs. A tab carries a status symbol and a chip. Clicking "＋" brings up the launcher.
+- **Launcher**
+  - It carries over the format the user chose in the TUI. Pick with one key or a click: ↵ claude-a, b claude-b, x codex, s shell.
+  - It adds an "Open in terminal" choice and "Custom name and model".
+  - The name is assigned automatically as `t<N>`.
+- **Right Changes panel:** built in D3. In D1 only a collapsed slot is kept.
+- **Colors:** use the mockup colors the user approved. Background `#1e2128`, list `#23252b`, selected row `#2f323a`, border `#2c2f36`, chips A `#e5c07b` / B `#c678dd` / C `#56b6c2`. Fonts are the system font for the UI and a monospace font for terminals and code (the builder decides).
+- **Shortcuts:** the app needs no prefix key.
 
-  | 단축키 | 동작 |
+  | Shortcut | Action |
   |---|---|
-  | ⌘N | 새 작업 |
-  | ⌘W | 세션 닫기(확인을 거친다) |
-  | ⌘1–9 | 탭 고르기 |
-  | ⌘[ / ⌘] | 이전 / 다음 세션 |
-  | ⌘⇧[ / ⌘⇧] | 이전 / 다음 프로젝트 |
-  | ⌘B | 왼쪽 목록 접기 |
-  | ⌘⇧C | Changes 칸 |
-  | Esc | 채팅에서 멈춤 |
+  | ⌘N | New task |
+  | ⌘W | Close session (with confirmation) |
+  | ⌘1–9 | Select tab |
+  | ⌘[ / ⌘] | Previous / next session |
+  | ⌘⇧[ / ⌘⇧] | Previous / next project |
+  | ⌘B | Collapse the left list |
+  | ⌘⇧C | Changes panel |
+  | Esc | Stop in chat |
 
-  터미널 칸이 포커스를 가지면 ⌘ 없는 키는 모두 세션으로 간다.
+  When a terminal pane has focus, every key without ⌘ goes to the session.
 
-### 5.6 터미널 칸 (D1)
+### 5.6 Terminal pane (D1)
 
-- **화면:** 클라이언트 쪽 `Screen`(alacritty)을 GPUI 글자 묶음(text run)으로 그린다. Zed의 터미널이 같은 조합을 쓴다. 다음을 1단계 TUI와 같은 결과로 그린다.
-  - 셀 색과 속성
-  - 넓은 문자
-  - 커서
-  - OSC 8 링크. 클릭하면 연다.
-- **키 입력:** 앱이 직접 바이트로 바꾼다. 세션이 켠 모드(DECCKM, 키패드, kitty 키보드, modifyOtherKeys)에 맞게 인코딩하고, QA1에서 만든 모드 추적을 그대로 쓴다. 그래서 Shift+Enter가 세션이 바라는 형식으로 간다.
-- **한글 입력:** GPUI의 입력기 처리(InputHandler)로 조합 중인 글자를 커서 자리에 직접 그린다. 바깥 터미널에 기대지 않는다.
-- **마우스:** 휠은 스크롤백이다. 드래그로 고르고 ⌘C로 시스템 클립보드에 복사한다. 붙여넣기는 ⌘V이고, 세션이 bracketed paste를 켰으면 감싸 보낸다. 세션이 마우스 보고를 켰으면 SGR로 넘긴다. 1단계 Task 10의 규칙과 같다.
-- **크기:** 칸 크기가 바뀌면 `Resize`를 보낸다.
-- **복사 모드:** 따로 두지 않는다. GUI의 스크롤과 드래그로 대신한다. 검색(⌘F)은 D1에서 스크롤백 텍스트 검색으로 한다.
+- **Screen:** the client-side `Screen` (alacritty) is drawn as GPUI text runs. Zed's terminal uses the same combination. The following are drawn with the same results as the phase 1 TUI.
+  - Cell colors and attributes
+  - Wide characters
+  - The cursor
+  - OSC 8 links. Clicking opens them.
+- **Key input:** the app converts keys to bytes itself. It encodes according to the modes the session turned on (DECCKM, keypad, kitty keyboard, modifyOtherKeys), reusing the mode tracking built in QA1. So Shift+Enter goes in the form the session wants.
+- **Korean input:** GPUI's input method handling (InputHandler) draws the composing characters directly at the cursor position. It doesn't rely on the outer terminal.
+- **Mouse:** the wheel scrolls the scrollback. Dragging selects, and ⌘C copies to the system clipboard. Paste is ⌘V, and if the session turned on bracketed paste, it is wrapped when sent. If the session turned on mouse reporting, it is passed through as SGR. Same as the rules in phase 1 Task 10.
+- **Size:** when the pane size changes, send `Resize`.
+- **Copy mode:** not provided. GUI scrolling and dragging take its place. Search (⌘F) is a scrollback text search in D1.
 
-### 5.7 채팅 화면 (D2)
+### 5.7 Chat view (D2)
 
-- **목록:** 항목을 위에서 아래로 그린다. 긴 대화도 버벅이지 않게 보이는 부분만 그린다.
-  - `User`는 오른쪽 말풍선이다. 아직 보내지 않고 쌓인 메시지는 흐리게 표시한다.
-  - `Assistant`는 마크다운이다. 문단, 목록, 코드 블록, 인라인 코드, 링크, 표를 그린다.
-  - `Tool`은 한 줄로 접힌다. 예: `Shell  cargo test   ✓ 3.2s`. 펼치면 입력과 출력이 보인다. Edit·Write는 diff로 보여 준다.
-  - `Subagent`는 카드로 그리고, 펼치면 안의 항목이 보인다. Paseo의 "3 subagents" 카드와 같다.
-  - `Approval`은 강조된 카드다. 버튼은 허용, 거부, 그리고 제안이 있으면 "항상 허용"이다. 키보드로는 y와 n이다.
-  - plan 모드의 계획 승인은 계획 본문(마크다운)과 "승인 · 계속 계획" 버튼이 있는 카드다.
-  - 답이 만들어지는 동안 글이 글자 단위로 나타난다(`ItemDelta`).
-  - `Question`은 선택지 버튼 카드다.
-  - `TurnEnd`는 얇은 줄로 결과와 비용을 보여 준다.
-- **입력창**
-  - 여러 줄로 쓴다. Enter는 보내기, Shift+Enter는 줄바꿈이다.
-  - 일하는 중에 보내면 쌓인다. 기본 `priority`는 Claude 기본값을 따른다.
-  - 모델 선택, effort 선택, 권한 모드 선택, 계정 칩(바꿀 수 없음, 표시만)이 있다.
-  - 이미지를 붙여넣거나(⌘V) 파일을 끌어다 놓으면 첨부로 보낸다. Claude에는 이미지 블록과 파일 경로로, Codex에는 그 판이 받는 입력 형식으로 보낸다. 사용자는 스크린샷을 자주 붙여 보낸다.
-  - 멈춤 버튼은 Esc와 같다.
-  - `/`를 치면 `system/init.slash_commands` 목록으로 자동완성한다.
-- **알림:** 5.9를 따른다.
-- **터미널로 열기:** 같은 대화를 `--resume`으로 이어 터미널 세션으로 새로 연다. 원래 채팅 세션은 닫을지 묻는다.
+- **List:** draws the items from top to bottom. To keep long conversations from stuttering, only the visible part is drawn.
+  - `User` is a right-aligned bubble. A message that hasn't been sent yet and is queued is shown dimmed.
+  - `Assistant` is Markdown. It draws paragraphs, lists, code blocks, inline code, links, and tables.
+  - `Tool` collapses to one line. Example: `Shell  cargo test   ✓ 3.2s`. Expanding shows the input and output. Edit and Write are shown as diffs.
+  - `Subagent` is drawn as a card, and expanding shows the items inside. Same as Paseo's "3 subagents" card.
+  - `Approval` is a highlighted card. The buttons are Allow, Deny, and, if there is a suggestion, "Always allow". On the keyboard, y and n.
+  - A plan approval in plan mode is a card with the plan body (Markdown) and "Approve · Keep planning" buttons.
+  - While an answer is being produced, text appears character by character (`ItemDelta`).
+  - `Question` is a card of choice buttons.
+  - `TurnEnd` shows the result and cost on a thin line.
+- **Input box**
+  - Multi-line. Enter sends, Shift+Enter inserts a newline.
+  - Sending while the agent is working queues the message. The default `priority` follows Claude's default.
+  - It has a model picker, an effort picker, a permission mode picker, and an account chip (display only, can't be changed).
+  - Pasting an image (⌘V) or dropping a file sends it as an attachment. To Claude it goes as an image block and a file path; to Codex in the input format that version accepts. The user often pastes screenshots to send.
+  - The stop button is the same as Esc.
+  - Typing `/` autocompletes from the `system/init.slash_commands` list.
+- **Notifications:** follow 5.9.
+- **Open in terminal:** continues the same conversation with `--resume` and opens a new terminal session. It asks whether to close the original chat session.
 
-### 5.8 Changes 칸 (D3)
+### 5.8 Changes panel (D3)
 
-- **대상:** 선택한 프로젝트의 루트다. 채팅 세션은 그 세션의 작업 폴더를 쓴다.
-- **데이터:** `git status --porcelain=v2`, `git diff --numstat`, `git log -n 30 --format=...`를 읽는다. 쓰기 명령은 하나도 실행하지 않는다.
-- **갱신:** 다음 세 경우에 다시 읽는다.
-  - 칸을 열 때
-  - 그 프로젝트 세션의 턴이 끝날 때
-  - 사용자가 새로고침을 누를 때
-- **화면:** 폴더 트리, 파일별 +/−와 상태 표시(수정/추가/삭제)를 보여 준다. 파일을 누르면 가운데에 diff 보기가 탭으로 열린다. 아래에 커밋 목록이 있다.
-- 바탕 문서 4단계의 git graph는 이 커밋 목록 자리에서 나중에 키운다.
+- **Target:** the selected project's root. A chat session uses that session's working folder.
+- **Data:** reads `git status --porcelain=v2`, `git diff --numstat`, and `git log -n 30 --format=...`. It runs no write commands at all.
+- **Refresh:** re-reads in these three cases.
+  - When the panel is opened
+  - When a turn of that project's session ends
+  - When the user presses refresh
+- **Screen:** shows a folder tree, per-file +/− and a status mark (modified/added/deleted). Clicking a file opens a diff view as a tab in the center. The commit list is below.
+- The git graph of base document phase 4 will later grow out of this commit list's place.
 
-### 5.9 실행과 알림 (D1)
+### 5.9 Launch and notifications (D1)
 
-- **실행 방법(내 결정):** 두 가지를 다 둔다.
-  - D1에서 `mine-app`을 `.app` 묶음으로 만든다(Dock, Spotlight). 저장소의 셸 스크립트가 `cargo build --release -p mine-app` 결과로 묶음을 만들고, `~/Applications`에 설치한다. 서명과 Homebrew 배포는 바탕 문서 8단계에서 한다.
-  - 터미널의 `mine app`은 묶음을 연다(`open`). 묶음이 없으면 `mine-app` 바이너리를 바로 실행한다. `mine` 바이너리는 GPUI에 의존하지 않는다.
-  - 창을 닫아도 앱은 macOS 관례대로 Dock에 남는다. ⌘Q로 앱을 끝내도 데몬과 세션은 남는다.
-- **환경:** Dock에서 띄운 앱은 PATH가 짧아서 `claude`·`codex`를 찾지 못한다. 그래서 앱이 데몬을 띄울 때 로그인 셸 환경(`$SHELL -l -c env`)을 한 번 읽어 넘긴다. 이미 떠 있는 데몬은 자기 환경을 그대로 쓴다.
-- **알림의 주인은 데몬이다(내 결정).**
-  - 승인 요청이 새로 생기면 데몬이 macOS 알림을 띄운다. 앱이 꺼져 있어도 알림이 와야 하기 때문이다(7절).
-  - 앱 창이 앞에 있으면(`Focus { focused: true }`) 데몬은 알림을 띄우지 않는다.
-  - 알림을 띄우는 방법은 빌더가 정한다(`osascript`의 `display notification` 등).
+- **How to launch (my decision):** both are provided.
+  - In D1, `mine-app` is built as an `.app` bundle (Dock, Spotlight). A shell script in the repository builds the bundle from the `cargo build --release -p mine-app` output and installs it to `~/Applications`. Signing and Homebrew distribution are done in base document phase 8.
+  - `mine app` in a terminal opens the bundle (`open`). If there is no bundle, it runs the `mine-app` binary directly. The `mine` binary doesn't depend on GPUI.
+  - Closing the window leaves the app in the Dock, per macOS convention. Quitting the app with ⌘Q leaves the daemon and sessions running.
+- **Environment:** an app launched from the Dock has a short PATH and can't find `claude`·`codex`. So when the app starts the daemon, it reads the login shell environment once (`$SHELL -l -c env`) and passes it along. A daemon that is already running uses its own environment as is.
+- **The daemon owns notifications (my decision).**
+  - When a new approval request appears, the daemon posts a macOS notification. This is because the notification must arrive even when the app is closed (section 7).
+  - When the app window is in front (`Focus { focused: true }`), the daemon doesn't post notifications.
+  - How to post the notification is up to the builder (`display notification` via `osascript`, and so on).
 
-### 5.10 TUI에서 채팅 세션 (D2, 사용자 결정)
+### 5.10 Chat sessions in the TUI (D2, user decision)
 
-- TUI가 채팅 세션에 붙으면 `Transcript`와 `Item`·`ItemDelta`를 받아 글자 대화로 보여 준다. 표시 형식은 다음과 같다.
-  - `User`는 `> ` 접두로 보여 준다.
-  - `Assistant`는 마크다운을 꾸미지 않은 원문 그대로 보여 준다.
-  - `Tool`은 한 줄 요약이다.
-  - `Subagent`는 한 줄 요약이다.
-  - `Approval`·`Question`은 강조한 줄과 선택지 번호로 보여 준다.
-- 입력은 다음과 같다.
-  - 아래 한 줄 입력에서 Enter로 보낸다.
-  - 승인 요청이 떠 있으면 `y`/`n`으로 답한다. 질문은 번호로 답한다.
-  - Esc는 멈춤이다.
-- 마크다운 꾸미기, 펼치기, 첨부, 모델·effort·권한 모드 바꾸기는 하지 않는다. 그런 일은 앱에서 한다.
+- When the TUI attaches to a chat session, it receives `Transcript` and `Item`·`ItemDelta` and shows them as a text conversation. The display format is as follows.
+  - `User` is shown with a `> ` prefix.
+  - `Assistant` is shown as the raw text, without Markdown styling.
+  - `Tool` is a one-line summary.
+  - `Subagent` is a one-line summary.
+  - `Approval`·`Question` are shown as a highlighted line with numbered choices.
+- Input works as follows.
+  - Send with Enter on the one-line input at the bottom.
+  - When an approval request is up, answer with `y`/`n`. Answer a question by number.
+  - Esc stops.
+- Markdown styling, expanding, attachments, and changing the model·effort·permission mode are not done. Those are done in the app.
 
-## 6. 빌더에게 맡기는 것
+## 6. Left to the builder
 
-- GPUI를 끌어오는 방식(`gpui-kit` 하나로, 또는 `gpui` + `gpui-component` 따로)과 고정할 판.
-- 마크다운 렌더러. 직접 만들지 `pulldown-cmark` 위에 만들지.
-- 대화 기록 중복 방지 방식(5.1). 단, "두 번 넣거나 빠뜨리지 않는다"는 지켜야 한다.
-- 픽셀 크기, 간격, 글꼴 크기.
-- Claude 입력에 `client_composed`를 쓸지.
-- Codex 스키마 파일을 저장소의 어디에 둘지.
+- How to pull in GPUI (a single `gpui-kit`, or `gpui` + `gpui-component` separately) and which version to pin.
+- The Markdown renderer: build it directly, or on top of `pulldown-cmark`.
+- How to prevent duplicate transcript entries (5.1). But "never insert twice or miss any" must be kept.
+- Pixel sizes, spacing, font sizes.
+- Whether to use `client_composed` in Claude input.
+- Where in the repository to put the Codex schema file.
 
-## 7. 실패 조건
+## 7. Failure conditions
 
-기술적으로 동작해도 다음 중 하나라도 해당하면 실패로 본다.
+Even if it works technically, it counts as a failure if any of the following applies.
 
-- 앱을 닫거나 앱이 죽었을 때 세션이 죽는다. 데몬이 다시 떴을 때 채팅 세션이 죽는다.
-- 앱이나 데몬을 다시 띄웠을 때 채팅 기록이 빠지거나 두 번 보인다.
-- 승인 요청이 왔는데 사용자가 모르고 지나칠 수 있다. 목록의 ◆, 탭 표시, 알림 중 어느 것도 없는 경우다.
-- 채팅 세션으로는 안 되는 일이 있는데, 터미널로 여는 길이 없거나 그 길을 알 수 없다.
-- 터미널 칸의 입력 지연, 한글 조합, Shift+Enter, 복사·붙여넣기가 Ghostty에서 직접 쓸 때보다 눈에 띄게 나쁘다.
-- 긴 대화(수천 항목)에서 스크롤이나 입력이 버벅인다.
+- A session dies when the app is closed or the app crashes. A chat session dies when the daemon comes back up.
+- Chat history is missing or shown twice when the app or daemon is restarted.
+- An approval request arrives and the user can miss it without knowing: none of the ◆ in the list, the tab marker, or the notification is present.
+- There is something a chat session can't do, and there is no way to open it as a terminal, or that way can't be found.
+- The terminal pane's input latency, Korean composition, Shift+Enter, or copy and paste is noticeably worse than using Ghostty directly.
+- Scrolling or input stutters in a long conversation (thousands of items).
 
-## 8. 검증
+## 8. Verification
 
-- **어댑터 단위 테스트.** 녹화한 실제 출력을 픽스처로 저장소에 넣는다. Claude는 stream-json 줄, Codex는 JSON-RPC 메시지다. 이 픽스처를 공통 항목으로 바꿨을 때 기대한 결과가 나오는지 확인한다. 모르는 메시지가 `Note`로 가는 것도 확인한다.
-- **데몬 통합 테스트.** 가짜 `claude`·`codex` 스크립트를 PATH에 둔다. 픽스처를 내보내고 stdin을 기록하는 스크립트다. 이것으로 다음을 확인한다.
-  - 메시지 보내기, 쌓기, 멈춤, 승인 응답이 올바른 제어 메시지로 나가는지
-  - 데몬 재시작 뒤 기록이 중복 없이 이어지는지
-  - 상태가 ◆ ◐ ✓ ○로 바뀌는지
-- **화면 로직 테스트.** GPUI의 테스트 컨텍스트로 목록 그룹, 탭, 실행 화면 키, 키 인코딩을 확인한다.
-- **화면 확인.** 컨트롤러가 앱을 띄워 창을 캡처(`screencapture -l <창 id>`)해 배치와 색을 확인한다.
-- **사용자 QA.** 실제 Claude와 Codex로 하루 쓰기. D1 합격 기준은 TUI와 tmux 대신 하루 쓰기다.
+- **Adapter unit tests.** Put recorded real output into the repository as fixtures: stream-json lines for Claude, JSON-RPC messages for Codex. Check that converting these fixtures into the common items gives the expected results. Also check that unknown messages go to `Note`.
+- **Daemon integration tests.** Put fake `claude`·`codex` scripts on PATH: scripts that emit the fixtures and record stdin. Use them to check the following.
+  - That sending a message, queueing, stopping, and answering an approval go out as the right control messages
+  - That the record continues without duplicates after a daemon restart
+  - That the status changes among ◆ ◐ ✓ ○
+- **UI logic tests.** Use GPUI's test context to check list groups, tabs, launcher keys, and key encoding.
+- **Visual check.** The controller launches the app and captures the window (`screencapture -l <window id>`) to check layout and colors.
+- **User QA.** Use it for a day with real Claude and Codex. D1's acceptance criterion is a day of use in place of the TUI and tmux.
 
-## 9. 내가 정한 것 (사용자 확인 필요)
+## 9. My decisions (need user confirmation)
 
-- `mine-app`은 데몬 클라이언트로만 만들고, 앱 안에 데몬을 넣지 않는다(5.1).
-- 채팅 세션도 보관 프로세스가 쥐게 해서 데몬 재시작을 버티게 한다(5.1).
-- claude·codex 세션마다 채팅과 터미널 중에 고르고, 기본은 채팅이다(5.3). 에이전트 팀이 필요하면 터미널로 연다.
-- 앱 단축키는 ⌘ 기반이고 접두 키는 없다(5.5).
-- 터미널 칸에는 복사 모드를 두지 않는다. GUI 스크롤, 드래그, ⌘F로 대신한다(5.6).
-- Changes 칸은 git 읽기 명령만 쓴다(5.8).
-- 승인 요청 알림은 데몬이 macOS 알림으로 띄운다. 앱이 꺼져 있어도 온다. 기본은 켜짐이다(5.9).
-- 채팅 → 터미널 한 방향만 둔다. 터미널로 열면 원래 채팅 세션은 닫는다. 지난 대화 가져오기는 하지 않는다(5.3).
-- 권한 모드를 처음부터 넣는다. 기본값은 계정 설정의 `defaultMode`다(5.3).
-- 답을 글자 단위로 보여 준다(`--include-partial-messages`, `ItemDelta`)(5.2, 5.4).
-- 입력창에서 이미지 붙여넣기와 파일 끌어놓기를 지원한다(5.7).
-- D1에서 `.app` 묶음과 `mine app` 명령을 둘 다 만든다. 로그인 셸 환경을 넘긴다(5.9).
+- `mine-app` is built only as a daemon client, and the daemon is not embedded in the app (5.1).
+- Chat sessions are also held by a holder process so they survive daemon restarts (5.1).
+- For each claude·codex session, chat or terminal is chosen, and the default is chat (5.3). If agent teams are needed, open as terminal.
+- App shortcuts are ⌘-based, and there is no prefix key (5.5).
+- The terminal pane has no copy mode. GUI scrolling, dragging, and ⌘F take its place (5.6).
+- The Changes panel uses only git read commands (5.8).
+- The daemon posts approval request notifications as macOS notifications. They arrive even when the app is closed. The default is on (5.9).
+- Only chat → terminal is provided. Opening as terminal closes the original chat session. Importing past conversation is not done (5.3).
+- Permission modes are included from the start. The default is the account setting's `defaultMode` (5.3).
+- Answers are shown character by character (`--include-partial-messages`, `ItemDelta`) (5.2, 5.4).
+- Pasting images and dropping files into the input box are supported (5.7).
+- In D1, both the `.app` bundle and the `mine app` command are built. The login shell environment is passed along (5.9).
 
-사용자가 정한 것: Paseo식 데스크톱 앱, GPUI, 모노레포와 `mine-core`·`mine-cli`·`mine-app` 이름(5.1), 채팅·터미널 가운데 화면, D1→D2→D3 순서, TUI는 SSH용 보조, TUI에서 채팅 세션은 글자 대화로 보고 답하기(5.10).
+Decided by the user: a Paseo-style desktop app, GPUI, the monorepo and the `mine-core`·`mine-cli`·`mine-app` names (5.1), the chat·terminal center screen, the D1→D2→D3 order, the TUI as a secondary screen for SSH, and viewing and answering chat sessions as a text conversation in the TUI (5.10).

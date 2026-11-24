@@ -1,380 +1,380 @@
-# mine 설계: 에이전트 세션을 위한 나만의 터미널 멀티플렉서
+# mine design: a personal terminal multiplexer for agent sessions
 
-- 작성일: 2026-11-20
-- 상태: 사용자 검토 대기
-- 목업: [layout.html](2026-11-20-mine-mockups/layout.html)(전체 배치, 펼침/접힘, 브라우저 칸), [project-rail.html](2026-11-20-mine-mockups/project-rail.html)(프로젝트 선택. **1번 아이콘 줄이 채택안**이고 2·3번은 비교용으로 남겼다)
+- Written: 2026-11-20
+- Status: awaiting user review
+- Mockups: [layout.html](2026-11-20-mine-mockups/layout.html) (overall layout, expand/collapse, browser pane), [project-rail.html](2026-11-20-mine-mockups/project-rail.html) (project picker. **Option 1, the project rail, is the chosen design**; options 2 and 3 are kept for comparison)
 
-## 1. 의도
+## 1. Intent
 
-사용자는 지금 Ghostty에서 tmux를 열어 Claude Code 계정 두 개(claude-a, claude-b)와 Codex 세션 여러 개를 관리한다. 이 방식에는 네 가지 불편이 있다.
+Today the user opens tmux in Ghostty and manages two Claude Code accounts (claude-a, claude-b) and several Codex sessions. This setup has four pain points.
 
-- 세션이 프로젝트별로 흩어져 있어 어디서 무엇이 돌고 있는지 한눈에 보이지 않는다.
-- 한 계정의 한도가 바닥나면 다른 계정으로 옮길 때 맥락을 손으로 다시 설명해야 한다.
-- 원격 머신의 세션을 오가는 일이 번거롭다.
-- git 상태를 보려면 따로 확인해야 한다.
+- Sessions are scattered across projects, so it isn't clear at a glance what is running where.
+- When one account's usage limit runs out, moving to another account means re-explaining the context by hand.
+- Moving between sessions on remote machines is a hassle.
+- Checking git state takes a separate step.
 
-mine은 **Ghostty 안에서 tmux를 대신하는 사용자 전용 터미널 멀티플렉서**다. 계속 지켜야 할 장기 방향은 "어느 터미널에 접속할까"가 아니라 "지금 이 작업을 어느 에이전트·계정에 맡길까"에 답하는 도구라는 점이다.
+mine is **a single-user terminal multiplexer that replaces tmux inside Ghostty**. The long-term direction to hold onto is that the tool answers "which agent or account should I give this task to right now?", not "which terminal should I connect to?".
 
-사용자는 한 명이다. 이 도구는 다른 사람에게 제공하는 서비스가 아니다.
+There is one user. This tool is not a service offered to other people.
 
-## 2. 목표 · 비목표 · 실패 조건
+## 2. Goals · non-goals · failure conditions
 
-**목표**
+**Goals**
 
-1. 프로젝트 단위로 세션을 만들고, 전환하고, 끝낼 수 있다. 화면을 닫거나 SSH가 끊겨도 세션은 계속 돈다.
-2. 아이콘 줄과 상태별 목록으로 모든 프로젝트의 세션 상태(승인 대기, 작업 중, 끝남, 대기)를 한눈에 본다.
-3. 계정 한도가 가까워지면 알려 준다. 키 한 번으로 같은 작업을 다른 계정에 맥락과 함께 넘긴다.
-4. 원격 머신의 세션도 같은 목록에 보인다. 밖에서 SSH로 들어와 `mine`을 실행하면 같은 화면이 나온다.
-5. 선택한 프로젝트의 git graph가 늘 옆에 떠 있다. VS Code Git Graph에 가까운 그림이다.
-6. 에이전트가 헤드리스로 돌리는 브라우저 화면을 가끔 확인할 수 있다.
-7. 선택적으로 마스터 세션 하나를 지정해, 그 세션하고만 대화해도 일이 돌아가게 한다.
-8. 설치 후 어느 폴더에서든 `mine`을 입력하면 실행된다.
+1. Create, switch, and end sessions per project. Sessions keep running when the screen is closed or SSH drops.
+2. See the status of every project's sessions (Needs approval, Working, Done, Idle) at a glance through the project rail and the status list.
+3. Get a warning when an account is close to its usage limit. Hand the same task, with its context, to another account with one keypress.
+4. Sessions on remote machines appear in the same list. SSH in from outside and run `mine` to get the same screen.
+5. The selected project's git graph is always shown beside the session, close to VS Code's Git Graph.
+6. Occasionally check the screen of the browser an agent runs headlessly.
+7. Optionally designate one master session, so work keeps moving even if the user talks only to that session.
+8. After installation, typing `mine` in any folder runs it.
 
-**비목표 (지금은 하지 않음)**
+**Non-goals (not doing for now)**
 
-- 자체 GUI 창. 나중에 필요해지면 같은 코어 위에 GPUI로 붙인다. → 2026-11-23에 뒤집었다. 주 화면은 GPUI 데스크톱 앱이다([2026-11-23-mine-desktop-design.md](2026-11-23-mine-desktop-design.md)).
-- 순정 CLI 기능의 재구현. → 같은 날 바꿨다. claude·codex 세션은 기본으로 채팅 화면이고, 순정 화면은 "터미널로 열기"로 남는다(데스크톱 설계 5.3).
-- 창 안에서 클릭할 수 있는 브라우저. 브라우저는 헤드리스로만 돌리고 화면은 그림으로 확인한다.
-- 모바일 앱, QR 페어링, 릴레이 서버.
-- 세션 안의 일 나누기 재구현. 서브에이전트, 에이전트 팀, 워크플로는 Claude Code 기능을 그대로 쓴다.
-- 사용자 확인 없는 자동 계정 전환. 약관 확인 전까지는 키 한 번의 확인을 거친다.
-- Windows 지원.
-- 한 세션 안에서 화면 나누기(tmux pane). 세션 하나는 터미널 하나다.
+- A GUI window of its own. Attach one later on the same core with GPUI if needed. → Reversed on 2026-11-23. The main screen is the GPUI desktop app ([2026-11-23-mine-desktop-design.md](2026-11-23-mine-desktop-design.md)).
+- Reimplementing stock CLI features. → Changed the same day. claude and codex sessions default to the chat view, and the stock screen remains as "Open in terminal" (desktop design 5.3).
+- A browser you can click inside the window. The browser runs headless only, and its screen is checked as an image.
+- A mobile app, QR pairing, a relay server.
+- Reimplementing work splitting inside a session. Subagents, agent teams, and workflows use Claude Code's own features as they are.
+- Automatic account switching without user confirmation. Until the terms of service are checked, a one-keypress confirmation stays.
+- Windows support.
+- Splitting the screen within one session (tmux pane). One session is one terminal.
 
-**실패 조건 (기술적으로 동작해도 실패로 본다)**
+**Failure conditions (counted as failure even if it works technically)**
 
-- Claude Code나 Codex 화면이 mine 안에서 깨지거나, 색·단축키·붙여넣기·한글 입력이 순정과 다르게 동작한다. 또는 스크롤·선택·복사가 지금 쓰는 Ghostty + tmux보다 불편하다. 그러면 사용자는 Ghostty + tmux로 돌아간다.
-- 입력 지연이 Ghostty에서 직접 쓸 때보다 눈에 띄게 크다.
-- 계정을 넘길 때 사용자가 배경을 다시 설명해야 한다.
-- 마스터가 배포, 푸시, 삭제처럼 되돌리기 어려운 일을 묻지 않고 실행한다.
-- 화면 종료, SSH 끊김, 클라이언트 오류, mine 업그레이드, 데몬 오류 때문에 세션이 죽는다.
+- The Claude Code or Codex screen breaks inside mine, or colors, shortcuts, pasting, or Korean input behave differently from the stock CLI. Or scrolling, selecting, and copying are less comfortable than in the current Ghostty + tmux. In that case the user goes back to Ghostty + tmux.
+- Input latency is noticeably higher than using Ghostty directly.
+- The user has to re-explain the background when an account is handed off.
+- The master runs hard-to-reverse actions such as deploying, pushing, or deleting without asking.
+- A session dies because of screen exit, SSH drop, client error, mine upgrade, or daemon error.
 
-## 3. 제약
+## 3. Constraints
 
-- **플랫폼:** macOS(Apple Silicon)가 기준이다. 원격 호스트는 macOS 또는 Linux다.
-- **터미널:** Ghostty를 전제로 한다. 이미지 출력(kitty 그래픽 프로토콜)을 쓸 수 없는 터미널에서는 git graph를 글자 그래프로 대신 그린다.
-- **인증은 공식 CLI에 맡긴다:**
-  - Claude 계정은 `CLAUDE_CONFIG_DIR`을 계정별로 나눠 로그인한다.
-  - Codex는 사용자의 기존 로그인을 쓴다.
-  - mine은 자격 증명을 저장하거나 중계하지 않는다.
-- **사용량 출처:**
-  - Claude: 순정 세션의 statusLine 명령으로 들어오는 JSON의 `rate_limits.five_hour` / `seven_day`. 첫 모델 응답 뒤에야 값이 생긴다.
-  - Codex: `codex app-server`의 `account/rateLimits/read`.
-  - 모든 값에는 관측 시각을 붙인다. "미확인" 상태도 정상 상태로 다룬다.
-- **언어:** Rust. 데몬과 화면 모두 `mine` 바이너리 하나에 들어간다. 지금 저장소의 Python 프로토타입은 대체 대상이고, 동작을 참고하는 용도로만 쓴다.
-- **개발 규칙:** README의 규칙을 따른다. `main`/`dev` 선형 브랜치, 원자적 커밋, `type(scope): 한글 명령형 요약`, 커밋마다 테스트 통과.
+- **Platform:** macOS (Apple Silicon) is the baseline. Remote hosts are macOS or Linux.
+- **Terminal:** Ghostty is assumed. In a terminal that can't show images (kitty graphics protocol), the git graph is drawn as a text graph instead.
+- **Authentication is left to the official CLIs:**
+  - Claude accounts log in with a separate `CLAUDE_CONFIG_DIR` per account.
+  - Codex uses the user's existing login.
+  - mine neither stores nor relays credentials.
+- **Usage sources:**
+  - Claude: `rate_limits.five_hour` / `seven_day` in the JSON that arrives through the stock session's statusLine command. The values exist only after the first model response.
+  - Codex: `account/rateLimits/read` on `codex app-server`.
+  - Every value carries its observation time. The "unknown" state is treated as a normal state.
+- **Language:** Rust. The daemon and the UI both live in the single `mine` binary. The Python prototype in the current repository is to be replaced and is used only as a behavior reference.
+- **Development rules:** follow the README. Linear `main`/`dev` branches, atomic commits, `type(scope): imperative English summary`, tests pass on every commit.
 
-## 4. 검토한 접근 방식
+## 4. Approaches considered
 
-| 결정 | 검토한 안 | 채택 | 이유 |
+| Decision | Options considered | Chosen | Reason |
 |---|---|---|---|
-| 화면 매체 | ① Ghostty 안의 TUI ② 별도 데스크톱 앱(Tauri 또는 Electron) | ① TUI | 사용자가 Ghostty를 좋아한다. SSH로 어디서나 같은 화면을 쓸 수 있다. 만들 양이 적다. ②는 창 안에서 클릭하는 브라우저가 필요할 때만 의미가 있었는데, 브라우저를 헤드리스로 정하면서 이유가 사라졌다. |
-| 나중의 GUI | Tauri / Electron / GPUI | GPUI(나중에) | 웹뷰가 필요 없으면 Tauri의 장점이 거의 없다. GPUI는 코어부터 화면까지 Rust 하나로 간다. 1.0 전이라 지금은 쓰지 않는다. |
-| 세션 엔진 | ① tmux 위에 얹기 ② mine이 직접 멀티플렉서(zellij 방식) ③ tmux 제어 모드(`-CC`)로 받아 그리기 | ② | ①은 tmux 안에서 이미지가 깨져 git graph를 그림으로 못 그리고, 배치도 tmux에 묶인다. ③은 두 쪽의 상태를 맞추는 일이 까다롭다. ②는 zellij가 Rust로 같은 구조를 증명했고, 터미널 그리기는 Zed가 검증한 `alacritty_terminal`로 할 수 있다. |
-| 언어 | Rust / Go / Go 데몬 + Rust 화면 | Rust | 화면(Ratatui)과 데몬이 같은 타입과 로직을 쓴다. 바이너리 하나로 배포한다. 두 언어로 나누면 첫 버전부터 프로세스 간 호환성을 관리해야 한다. |
-| 브라우저 | ① 창 안에서 클릭하는 브라우저 ② 헤드리스 + 화면 그림 | ② | 사용자가 "에이전트가 헤드리스로 돌리고 가끔 확인만 하면 된다"고 정했다. |
-| 세션 목록 | 펼친 트리 / 탭 그룹 / 프로젝트별 접기 / 상태별 | 상태별 목록 | 사용자 선택. 여기에 프로젝트 선택과 "전체" 보기를 더했다. |
-| 프로젝트 선택 | ① 왼쪽 아이콘 줄 ② 목록 위 탭 ③ 맨 위 선택기 | ① | 사용자 선택. 프로젝트가 많아도 버티고, ◆ 배지로 나를 기다리는 프로젝트가 바로 보인다. 크롬의 접은 세로 탭과 같은 모양이다. |
-| 마스터 자율도 | a 제안만 / b 일 배분은 알아서 / c 전부 알아서 | b, 선택 사항 | 사용자 선택. 마스터는 지정해도 되고 안 해도 된다. |
-| 세션 안의 일 나누기 | ① mine 마스터가 직접 ② Claude Code의 서브에이전트·에이전트 팀·워크플로 | ② | 사용자 제안. 한 세션 안의 위임은 Claude Code가 이미 한다. 다만 Claude Code는 다른 계정, Codex, 다른 프로젝트로는 일을 나누지 못한다(공식 문서에 방법 없음). 그 부분만 mine 마스터가 맡는다. |
+| Display medium | ① TUI inside Ghostty ② a separate desktop app (Tauri or Electron) | ① TUI | The user likes Ghostty. The same screen is available anywhere over SSH. Less to build. ② only made sense if a clickable browser inside the window was needed, and that reason disappeared once the browser became headless. |
+| Later GUI | Tauri / Electron / GPUI | GPUI (later) | Without a webview, Tauri has almost no advantage. GPUI keeps everything from core to screen in Rust. It's pre-1.0, so it isn't used now. |
+| Session engine | ① build on top of tmux ② mine as its own multiplexer (the zellij way) ③ drive tmux control mode (`-CC`) and render | ② | ① breaks images inside tmux, so the git graph can't be drawn as an image, and the layout is tied to tmux. ③ makes keeping the two sides' state in sync tricky. ② has been proven by zellij as the same structure in Rust, and terminal rendering can use `alacritty_terminal`, which Zed has validated. |
+| Language | Rust / Go / Go daemon + Rust UI | Rust | The UI (Ratatui) and the daemon share the same types and logic. Ships as one binary. Splitting into two languages means managing cross-process compatibility from the first version. |
+| Browser | ① a browser you click inside the window ② headless + screen image | ② | The user decided "the agent runs it headless and I only check occasionally". |
+| Session list | expanded tree / tab groups / collapse per project / by status | status list | The user's choice. A project picker and an "All projects" view were added on top. |
+| Project picker | ① left project rail ② tabs above the list ③ selector at the very top | ① | The user's choice. It holds up with many projects, and the ◆ badge shows at once which projects are waiting on me. It has the same shape as Chrome's collapsed vertical tabs. |
+| Master autonomy | a suggest only / b distribute work on its own / c do everything on its own | b, optional | The user's choice. A master may or may not be designated. |
+| Work splitting inside a session | ① mine's master does it directly ② Claude Code's subagents, agent teams, workflows | ② | The user's suggestion. Delegation inside one session is already done by Claude Code. But Claude Code can't split work across other accounts, Codex, or other projects (the official docs give no way). Only that part is left to the mine master. |
 
-## 5. 설계
+## 5. Design
 
-### 5.1 구조
+### 5.1 Structure
 
 ```
 Ghostty
- └─ mine (클라이언트, Ratatui TUI)
-      └─ 유닉스 소켓 ── mine daemon (로컬)
-                         └─ ssh office-mac mine daemon --stdio ── mine daemon (원격)
+ └─ mine (client, Ratatui TUI)
+      └─ Unix socket ── mine daemon (local)
+                         └─ ssh office-mac mine daemon --stdio ── mine daemon (remote)
 
 mine daemon:
-  세션 PTY (claude / codex / shell)
-  세션·프로젝트 목록, 상태
-  사용량 수집, 인계 기록
-  git 감시
-  헤드리스 브라우저
-  마스터용 MCP 도구
+  session PTYs (claude / codex / shell)
+  session and project lists, status
+  usage collection, handoff records
+  git watching
+  headless browser
+  MCP tools for the master
 ```
 
-- `mine` 바이너리 하나에 다음이 모두 들어간다.
-  - `mine`: 클라이언트. 데몬이 없으면 띄운다.
-  - `mine daemon`: 데몬.
-  - `mine mcp`: 마스터 세션이 붙는 stdio MCP 다리.
-  - 헤드리스 하위 명령: `mine ls`, `mine new` 등.
-- **PTY는 세션마다 따로 있는 작은 보관 프로세스(`mine hold`)가 쥔다.** 데몬은 보관 프로세스들에 유닉스 소켓으로 붙어 세션을 관리한다. 데몬이 업그레이드나 오류로 재시작되면 살아 있는 보관 프로세스를 찾아 다시 붙는다. 그 사이에도 세션 프로세스(claude, codex, shell)는 계속 돈다.
-  - 보관 프로세스는 PTY 입출력 중계와 최근 출력 버퍼만 맡고, 기능을 넣지 않는다. 그래야 업그레이드할 일이 거의 없다.
-  - 보관 프로세스와 데몬 사이 프로토콜에도 버전을 붙인다. 새 데몬은 옛 보관 프로세스와도 붙을 수 있어야 한다.
-- 클라이언트는 데몬에 붙었다 떨어질 수 있다. 데몬은 세션마다 터미널 화면 상태(`alacritty_terminal`의 grid)를 유지하고, 클라이언트가 다시 붙으면 현재 화면을 보내 복구한다. 데몬이 재시작된 경우에는 보관 프로세스의 출력 버퍼로 화면을 다시 만든다.
-- **원격 연결은 로컬 데몬이 갖는다.** 로컬 데몬이 원격 데몬마다 SSH 연결을 유지하고 중계한다. 클라이언트는 로컬 데몬 하나만 본다. 그래서 클라이언트가 붙어 있지 않아도 마스터가 원격 세션을 보고, 만들고, 알림을 받을 수 있다. 로컬과 원격 데몬은 같은 프로토콜을 쓰고 전송로만 SSH 표준입출력으로 바뀐다. 프로토콜에는 버전을 붙인다. 원격 머신에도 `mine`이 설치되어 있어야 한다.
-- 한 데몬에 클라이언트 여럿이 동시에 붙을 수 있다. 예를 들어 맥에서 쓰다가 밖에서 SSH로 붙는 경우다. 어느 클라이언트에서든 입력할 수 있다. 세션 크기는 마지막으로 입력한 클라이언트를 따른다.
+- The single `mine` binary contains all of the following.
+  - `mine`: the client. Starts the daemon if there isn't one.
+  - `mine daemon`: the daemon.
+  - `mine mcp`: the stdio MCP bridge the master session attaches to.
+  - Headless subcommands: `mine ls`, `mine new`, and so on.
+- **Each session's PTY is held by its own small holder process (`mine hold`).** The daemon connects to the holder processes over Unix sockets and manages the sessions. If the daemon restarts after an upgrade or an error, it finds the live holder processes and reattaches. Meanwhile the session processes (claude, codex, shell) keep running.
+  - A holder process only relays PTY input/output and keeps a recent-output buffer; no features go into it. That way it almost never needs upgrading.
+  - The protocol between holder processes and the daemon is versioned too. A new daemon must be able to attach to an old holder process.
+- A client can attach to and detach from the daemon. The daemon keeps each session's terminal screen state (the `alacritty_terminal` grid) and, when a client reattaches, restores it by sending the current screen. If the daemon itself restarted, the screen is rebuilt from the holder process's output buffer.
+- **The local daemon owns the remote connections.** The local daemon keeps one SSH connection per remote daemon and relays through it. The client sees only the one local daemon. So even with no client attached, the master can see remote sessions, create them, and receive notifications. Local and remote daemons speak the same protocol; only the transport changes to SSH stdio. The protocol is versioned. `mine` must also be installed on the remote machine.
+- Several clients can attach to one daemon at once, for example using it on the Mac and then SSHing in from outside. Input is accepted from any client. The session size follows the client that typed last.
 
-### 5.2 개념
+### 5.2 Concepts
 
-- **호스트 → 프로젝트 → 세션.** 프로젝트 규칙은 프로토타입을 그대로 쓴다.
-  - 현재 위치에서 위로 올라가며 가장 가까운 Git 작업 트리 루트를 찾고, 없으면 등록된 폴더를 쓴다.
-  - 별도 worktree와 중첩 저장소는 각각 독립 프로젝트다.
-  - 프로젝트는 실제 경로로 식별한다.
-- **세션**은 PTY 하나와 프로세스 하나로 이루어지고, 종류는 세 가지다.
-  - `claude`: 계정 claude-a 또는 claude-b, 모델 선택.
-  - `codex`: 모델 선택.
-  - `shell`: 계정 없음. tmux를 대신하려면 개발 서버나 git 같은 일반 셸 세션이 필요해서 넣었다.
-  - 세션에는 프로젝트 안에서 고유한 이름(예: `rust-core`)이 붙는다.
-- **세션 상태:** `◆ 승인 대기`, `◐ 작업 중`, `✓ 끝남(안 읽음)`, `○ 대기`.
-  - claude 세션의 상태는 데몬이 주입하는 순정 CLI 훅으로 정한다.
-    - `UserPromptSubmit` → 작업 중
-    - `Stop` → 끝남
-    - `Notification`(`permission_prompt`) 또는 `PermissionRequest` → 승인 대기
-  - codex 세션은 `UserPromptSubmit`과 `Stop` 훅을 쓴다. Codex의 승인 대기를 감지하는 방법(훅, app-server 이벤트, 출력 패턴)은 빌더가 확인한다.
-  - 사용자가 세션을 열어 보면 끝남이 대기로 바뀐다.
-  - shell 세션은 출력이 있으면 작업 중, 없으면 대기로 둔다.
-- **프로세스가 끝난 세션:**
-  - claude와 codex 세션은 목록에서 지우지 않고 끝남 그룹에 `종료됨` 표시로 남긴다. 고르면 `--resume` / `codex resume`으로 같은 대화를 다시 띄운다.
-  - shell 세션은 셸이 끝나면 tmux처럼 목록에서 사라진다.
-  - 사용자가 직접 닫은 세션(`⌃a x`)은 목록에서 지우고, 기록 파일만 남긴다.
-- **대화 기록:** 훅으로 받은 사용자 입력과 최종 응답을 세션마다 JSONL로 쌓는다. 인계와 마스터가 이 기록을 쓴다.
-- **재부팅 뒤 복원:** 프로세스는 재부팅을 넘길 수 없다. 대신 로그인할 때 launchd(Linux는 systemd 사용자 서비스)가 데몬을 띄우고, 데몬이 세션마다 정한 규칙대로 세션을 다시 살린다.
-  - 규칙은 세 가지이고, 세션 설정 메뉴나 `mine set <세션> restore=…`로 세션마다 바꿀 수 있다.
+- **Host → project → session.** Project rules are carried over from the prototype unchanged.
+  - Walk up from the current location to the nearest Git working tree root; if none, use the registered folder.
+  - A separate worktree and a nested repository are each independent projects.
+  - A project is identified by its real path.
+- A **session** consists of one PTY and one process, in three kinds.
+  - `claude`: account claude-a or claude-b, with a model choice.
+  - `codex`: with a model choice.
+  - `shell`: no account. Added because replacing tmux needs ordinary shell sessions for dev servers, git, and the like.
+  - A session gets a name unique within its project (for example `rust-core`).
+- **Session status:** `◆ Needs approval`, `◐ Working`, `✓ Done (unread)`, `○ Idle`.
+  - A claude session's status is decided by stock CLI hooks that the daemon injects.
+    - `UserPromptSubmit` → Working
+    - `Stop` → Done
+    - `Notification` (`permission_prompt`) or `PermissionRequest` → Needs approval
+  - codex sessions use the `UserPromptSubmit` and `Stop` hooks. How to detect Codex's Needs approval (hook, app-server event, output pattern) is for the builder to confirm.
+  - When the user opens a session, Done becomes Idle.
+  - A shell session is Working while there is output and Idle otherwise.
+- **Sessions whose process has ended:**
+  - claude and codex sessions are not removed from the list; they stay in the Done group with an `Exited` marker. Choosing one relaunches the same conversation with `--resume` / `codex resume`.
+  - A shell session disappears from the list when the shell exits, like tmux.
+  - A session the user closed directly (`⌃a x`) is removed from the list, leaving only its record files.
+- **Conversation record:** the user input and final responses received through hooks are appended to a per-session JSONL. Handoff and the master use this record.
+- **Restore after reboot:** a process can't survive a reboot. Instead, at login launchd (a systemd user service on Linux) starts the daemon, and the daemon revives each session by its rule.
+  - There are three rules, changeable per session in the session settings menu or with `mine set <session> restore=…`.
 
-    | 규칙 | 재부팅 뒤 동작 | 기본값 |
+    | Rule | Behavior after reboot | Default for |
     |---|---|---|
-    | `resume` | 같은 계정·모델로 `--resume` / `codex resume`해서 대화를 이어 감. 끊긴 지점에 "재부팅으로 중단됨"을 기록 | claude, codex |
-    | `rerun` | 같은 폴더에서 새 셸을 열고 지정한 명령(예: `npm run dev`)을 다시 실행 | — |
-    | `none` | 되살리지 않고 목록에서 뺌. 기록 파일은 남음 | shell |
+    | `resume` | `--resume` / `codex resume` with the same account and model to continue the conversation. Records "interrupted by reboot" at the point it was cut | claude, codex |
+    | `rerun` | Opens a new shell in the same folder and reruns the given command (for example `npm run dev`) | — |
+    | `none` | Not revived; removed from the list. Record files remain | shell |
 
-  - 진행 중이던 턴은 재부팅 때 끊긴다. `resume`은 대화를 잇고 마지막 사용자 요청을 보여 줄 뿐, 그 요청을 자동으로 다시 보내지 않는다.
-  - 재부팅 뒤 되살린 세션은 목록에서 `↻` 표시로 구분하고, 한 번 열어 보면 표시가 사라진다.
+  - A turn in progress is cut off by the reboot. `resume` continues the conversation and shows the last user request, but does not automatically resend it.
+  - A session revived after a reboot is marked with `↻` in the list, and the marker disappears once it has been opened.
 
-### 5.3 화면
+### 5.3 Screen
 
-배치는 [layout.html](2026-11-20-mine-mockups/layout.html)을 따른다. 단, 왼쪽 목록은 [project-rail.html](2026-11-20-mine-mockups/project-rail.html)의 1번(아이콘 줄 + 상태별 목록)으로 바꾼다.
+The layout follows [layout.html](2026-11-20-mine-mockups/layout.html). The left list, however, is replaced by option 1 of [project-rail.html](2026-11-20-mine-mockups/project-rail.html) (project rail + status list).
 
 ```
-┌──┬──────────────┬──────────────────────────┬────────────────┐
-│∗ │shop-front   │                          │graph browser   │
-│m │▾◆ 승인 대기 1│   선택한 세션의 터미널   │ files          │
-│p◆│ refund-flow B│   (순정 CLI 그대로)      │                │
-│k │▾◐ 작업 중  1 │                          │  git graph     │
-│3⇄│ web-ui   C │                          │  (이미지)      │
-│  │▸○ 대기     0 │                          │                │
-│＋│ 한도 A▮▮ 98% │                          │                │
-└──┴──────────────┴──────────────────────────┴────────────────┘
- 상태줄: 위치 · 계정 · 한도(목록을 접으면) · 키 안내
+┌──┬────────────────────┬──────────────────────────┬────────────────┐
+│∗ │shop-front          │                          │graph browser   │
+│m │▾◆ Needs approval  1│   Terminal of the        │ files          │
+│p◆│  refund-flow      B│   selected session       │                │
+│k │▾◐ Working         1│   (stock CLI as is)      │  git graph     │
+│3⇄│  web-ui           C│                          │  (image)       │
+│  │▸○ Idle            0│                          │                │
+│＋│ Limit A▮▮ 98%      │                          │                │
+└──┴────────────────────┴──────────────────────────┴────────────────┘
+ Status line: location · account · limit (when the list is collapsed) · key hints
 ```
 
-- **아이콘 줄:**
-  - 맨 위 `∗`는 "전체"다. 마스터를 지정하면 마스터 자리가 된다.
-  - 그 아래에 프로젝트마다 색 아이콘이 있다. 프로젝트 이름의 첫 글자를 쓰고, 색은 자동으로 배정한다.
-  - 배지: `◆`는 그 프로젝트에 승인 대기가 있다는 뜻이고, `⇄`는 원격 호스트라는 뜻이다.
-  - 맨 아래 `＋`로 프로젝트를 연다.
-  - 마우스를 올리면 프로젝트 이름과 호스트가 뜬다.
-- **상태별 목록:**
-  - 선택한 프로젝트의 세션을 `◆ 승인 대기 → ◐ 작업 중 → ✓ 끝남 → ○ 대기` 순서로 묶어 보여 준다.
-  - 줄 끝에는 계정 칩을 단다. A는 노랑, B는 보라, C(codex)는 청록이다. shell 세션은 칩이 없다.
-  - 승인 대기 세션은 무엇을 기다리는지 한 줄 더 보여 준다.
-  - 그룹은 접을 수 있고, 대기 그룹은 처음에 접혀 있다.
-  - 그룹 사이 빈 줄은 없다. Linear처럼 촘촘하게 붙인다.
-  - `⌃k`로 세션과 프로젝트를 찾는다.
-  - `∗ 전체`를 고르면 모든 프로젝트의 세션이 상태별로 모이고, 각 줄 앞에 프로젝트 색 네모가 붙는다.
-  - 목록 아래에 계정별 5시간 한도 막대가 있다.
-- **목록 접기:** `⌃a b`로 아이콘 줄만 남긴다. 이때 한도는 상태줄로 내려간다.
-- **가운데:** 선택한 세션의 터미널이다. mine이 `alacritty_terminal`로 그린다.
-  - 전체 화면 TUI라서 Ghostty 자체의 스크롤백·선택·⌘F는 쓸 수 없다. 기준선은 지금 쓰는 Ghostty + tmux 수준이다.
-  - 스크롤백은 세션마다 mine이 보관하고, 트랙패드 스크롤로 움직인다. 세션 프로그램이 마우스를 직접 받는 경우에는 그 프로그램에 넘긴다.
-  - 드래그로 선택하고, 손을 떼면 OSC 52로 클립보드에 복사한다. ⌘C는 Ghostty가 가로채기 때문에 이 방식을 쓴다.
-  - `⌃a [`로 tmux식 복사 모드에 들어가고, 복사 모드 안에서 스크롤백을 검색할 수 있다.
-- **오른쪽 칸:** `graph`(기본), `browser`, `files` 중 하나를 띄운다. `⌃a g` / `⌃a w` / `⌃a f`로 바꾸고, 같은 키를 한 번 더 누르면 칸을 숨긴다.
-  - `files`는 선택한 프로젝트의 아직 커밋하지 않은 변경이다. git status 목록을 보여 주고, 파일을 고르면 diff가 열린다. diff 보기는 git graph 칸과 같은 것을 쓴다. 파일 트리나 미리 보기는 하지 않는다.
-- **색과 글꼴:** 터미널(Ghostty)의 색표와 글꼴을 그대로 쓴다. 강조색만 정한다.
-- **조작:** 접두 키는 `⌃a`다. `⌃a ⌃a`를 누르면 `⌃a` 자체가 세션으로 전달된다. 아이콘 줄과 목록은 마우스 클릭도 받는다. 나머지 키 배치는 빌더가 정하되 tmux 사용자에게 익숙하게 맞춘다.
+- **Project rail:**
+  - The top `∗` is "All projects". If a master is designated, it becomes the master's slot.
+  - Below it, each project has a colored icon. It uses the first letter of the project name, and the color is assigned automatically.
+  - Badges: `◆` means the project has a session that Needs approval, and `⇄` means a remote host.
+  - The `＋` at the bottom opens a project.
+  - Hovering shows the project name and host.
+- **Status list:**
+  - Shows the selected project's sessions grouped in the order `◆ Needs approval → ◐ Working → ✓ Done → ○ Idle`.
+  - Each row ends with an account chip. A is yellow, B is purple, and C (codex) is teal. Shell sessions have no chip.
+  - A session that Needs approval gets one more line showing what it is waiting for.
+  - Groups can be collapsed, and the Idle group starts collapsed.
+  - There is no blank line between groups; rows are packed tightly, like Linear.
+  - `⌃k` searches sessions and projects.
+  - Selecting `∗ All projects` gathers every project's sessions by status, with a project-colored square in front of each row.
+  - Below the list are per-account 5-hour limit bars.
+- **Collapsing the list:** `⌃a b` leaves only the project rail. The limits then move down to the status line.
+- **Center:** the selected session's terminal. mine draws it with `alacritty_terminal`.
+  - Because it is a full-screen TUI, Ghostty's own scrollback, selection, and ⌘F are unavailable. The baseline is the current Ghostty + tmux level.
+  - mine keeps the scrollback per session, and trackpad scrolling moves it. If the session's program takes the mouse directly, mouse input is passed to that program.
+  - Dragging selects, and on release the selection is copied to the clipboard with OSC 52. This approach is used because Ghostty intercepts ⌘C.
+  - `⌃a [` enters a tmux-style copy mode, in which the scrollback can be searched.
+- **Right pane:** shows one of `graph` (default), `browser`, or `files`. `⌃a g` / `⌃a w` / `⌃a f` switch between them, and pressing the same key again hides the pane.
+  - `files` shows the selected project's changes not yet committed. It lists git status, and choosing a file opens its diff. The diff view is the same one the git graph pane uses. No file tree or preview.
+- **Colors and fonts:** the terminal's (Ghostty's) palette and font are used as they are. Only accent colors are defined.
+- **Controls:** the prefix key is `⌃a`. Pressing `⌃a ⌃a` sends `⌃a` itself to the session. The project rail and list also accept mouse clicks. The rest of the key layout is up to the builder, kept familiar to tmux users.
 
-### 5.4 계정과 한도 넘기기
+### 5.4 Accounts and handing off at the limit
 
-- 계정 목록과 원격 호스트 목록은 `~/.mine/config.toml`에 둔다. 처음에는 claude-a, claude-b, codex 세 개다.
-- **Claude 계정 두 개는 로그인만 다르고 나머지는 같게 동작해야 한다.** 사용자의 `~/.claude`에는 플러그인, rules, skills, 권한 허용 목록, statusLine이 있다. `~/.claude.json`에는 사용자 범위 MCP가 있다. mine 안의 Claude가 이걸 못 읽으면 순정과 달라지고 승인 대기가 쏟아진다.
-  - claude-a는 지금 로그인된 `~/.claude`를 그대로 쓴다. `CLAUDE_CONFIG_DIR`을 바꾸지 않는다.
-  - claude-b는 `~/.mine/profiles/claude-b`를 쓴다. 로그인 정보와 `.claude.json`만 따로 두고, `settings.json`, `CLAUDE.md`, rules, skills, plugins, agents, commands는 `~/.claude`를 가리키는 링크로 공유한다.
-  - 사용자 범위 MCP 목록(`.claude.json`의 `mcpServers`)은 `mine login claude-b` 때 복사한다. `~/.claude.json`이 바뀌면 다시 맞춘다. 맞추는 방식은 빌더가 정한다.
-- **statusLine은 덮어쓰지 않고 감싼다.** mine이 넣는 statusLine 명령은 같은 입력으로 사용자의 기존 statusLine 명령을 실행해서 그 출력을 그대로 보여 준다. 한도 값은 같은 입력에서 따로 기록한다.
-- **계정 식별:** 같은 구독을 원격 호스트에서도 쓸 수 있으므로, 계정은 CLI가 알려 주는 로그인 신원(이메일이나 조직)으로 식별한다. 신원이 같으면 어느 호스트에서 관측했든 가장 최근 값을 그 계정의 한도로 쓴다.
-- **한도 수집:**
-  - Claude: 데몬이 세션을 띄울 때 statusLine 명령을 주입해서 값을 받는다. 프로토타입이 `--settings`로 하던 방식이다.
-  - Codex: 세션이 하나라도 살아 있으면 app-server로 주기적으로 조회한다.
-- **경고:**
-  - 5시간 또는 7일 한도가 90% 이상이면 해당 계정 칩과 상태줄에 경고를 띄운다.
-  - 경고에는 추천 계정을 같이 보여 준다. 추천 기준은 최근에 관측된 한도, 그 작업을 이미 아는 세션이 있는지, 리뷰 요청인지 여부다. 프로토타입의 `recommendation` 규칙을 이어받는다.
-- **넘기기 (`⌃a s`):**
-  1. 계정을 고른다. 추천 계정이 기본값이다.
-  2. 원래 세션이 작업 중이면 둘 중 하나를 고른다.
-     - "턴 끝나면 넘기기"(기본): 예약해 두고 `Stop` 훅이 오면 넘긴다.
-     - "지금 중단하고 넘기기"
-  3. 같은 프로젝트에 새 세션을 띄운다. 이름은 `rust-core~b`처럼 붙인다.
-  4. 인계 내용을 첫 입력으로 넣는다.
-  5. 원래 세션은 닫지 않는다. 끝남 상태로 남겨서 언제든 다시 볼 수 있다.
-- **인계 내용:**
-  - 원래 목표(그 세션의 첫 사용자 요청)
-  - 최근 대화 기록(최근 16,000자)
-  - `git status`와 diff 요약
-  - 전체 기록 파일 경로
-  - 파일은 같은 작업 트리에 있으니 따로 옮기지 않는다.
-- **원래 계정으로 돌아갈 때:** 그 계정의 기존 세션을 재개한다(`--resume` / `codex resume`). 그 사이에 쌓인 기록만 추가로 넣는다. 프로토타입의 `ask` 규칙이다.
-- **자동화 수준:** 마스터가 있으면 마스터가 넘기기를 제안한다. 실제로 넘기는 건 언제나 사용자의 키 한 번이다. 약관을 확인하면 이 확인 단계는 빼도 된다.
+- The account list and the remote host list live in `~/.mine/config.toml`. Initially there are three: claude-a, claude-b, codex.
+- **The two Claude accounts must behave identically except for the login.** The user's `~/.claude` holds plugins, rules, skills, a permission allowlist, and a statusLine. `~/.claude.json` holds user-scope MCP servers. If the Claude inside mine can't read these, it diverges from stock and approval prompts flood in.
+  - claude-a uses the currently logged-in `~/.claude` as is. `CLAUDE_CONFIG_DIR` is not changed.
+  - claude-b uses `~/.mine/profiles/claude-b`. Only the login info and `.claude.json` are kept separately; `settings.json`, `CLAUDE.md`, rules, skills, plugins, agents, and commands are shared through links pointing to `~/.claude`.
+  - The user-scope MCP list (`mcpServers` in `.claude.json`) is copied during `mine login claude-b`. If `~/.claude.json` changes, it is synced again. How to sync is for the builder to decide.
+- **The statusLine is wrapped, not overwritten.** The statusLine command mine inserts runs the user's existing statusLine command with the same input and shows its output unchanged. The usage values are recorded separately from the same input.
+- **Account identification:** since the same subscription can also be used on remote hosts, an account is identified by the login identity the CLI reports (email or organization). If the identity is the same, the most recent value observed on any host is used as that account's limit.
+- **Usage collection:**
+  - Claude: when the daemon starts a session it injects a statusLine command and receives the values. This is how the prototype did it with `--settings`.
+  - Codex: while at least one session is alive, the app-server is queried periodically.
+- **Warnings:**
+  - When the 5-hour or 7-day limit reaches 90% or more, a warning appears on that account's chip and on the status line.
+  - The warning also shows a recommended account. The recommendation is based on recently observed limits, whether a session already knows that task, and whether it is a review request. It carries over the prototype's `recommendation` rule.
+- **Handoff (`⌃a s`):**
+  1. Choose an account. The recommended account is the default.
+  2. If the original session is working, choose one of two options.
+     - "Hand off when the turn ends" (default): schedule it, and hand off when the `Stop` hook arrives.
+     - "Stop now and hand off"
+  3. Start a new session in the same project. The name is formed like `rust-core~b`.
+  4. Put the handoff content in as the first input.
+  5. The original session is not closed. It stays in the Done state so it can be viewed again at any time.
+- **Handoff content:**
+  - The original goal (that session's first user request)
+  - Recent conversation record (the last 16,000 characters)
+  - A summary of `git status` and the diff
+  - The path to the full record file
+  - The files are in the same working tree, so nothing is moved separately.
+- **Returning to the original account:** resume that account's existing session (`--resume` / `codex resume`). Only the record accumulated in between is added. This is the prototype's `ask` rule.
+- **Level of automation:** if there is a master, the master suggests the handoff. Actually handing off is always the user's one keypress. Once the terms of service are checked, this confirmation step may be dropped.
 
-### 5.5 원격
+### 5.5 Remote
 
-- `config.toml`의 호스트 항목은 SSH 대상 이름 하나다. SSH 키 인증이 되어 있다고 가정한다.
-- 로컬 데몬이 원격 호스트마다 `ssh <host> mine daemon --stdio`로 붙어 중계한다(5.1). 원격 프로젝트는 아이콘 줄에 `⇄`가 붙는 것 말고는 로컬과 똑같이 동작한다. 마스터의 도구와 알림도 원격 세션을 포함한다.
-- 연결이 끊겨도 원격 세션은 원격 데몬에서 계속 돈다. 다시 연결하면 화면을 복구한다. 끊긴 동안 해당 아이콘은 흐리게 표시한다.
-- 밖에서 쓸 때는 아무 기기에서 SSH로 맥에 들어와 `mine`을 실행한다. 같은 데몬에 붙어서 같은 화면이 나온다(5.1의 동시 접속).
+- A host entry in `config.toml` is a single SSH target name. SSH key authentication is assumed to be set up.
+- The local daemon connects to each remote host with `ssh <host> mine daemon --stdio` and relays (5.1). Apart from a `⇄` on the project rail, remote projects behave exactly like local ones. The master's tools and notifications include remote sessions too.
+- If the connection drops, remote sessions keep running on the remote daemon. On reconnect the screen is restored. While disconnected, the corresponding icon is dimmed.
+- When working remotely, SSH into the Mac from any device and run `mine`. It attaches to the same daemon and shows the same screen (simultaneous connections in 5.1).
 
-### 5.6 git graph
+### 5.6 Git graph
 
-- 선택한 프로젝트의 모든 브랜치를 그래프로 그린다. `.git`이 바뀌면 다시 그린다.
-- Ghostty에서는 kitty 그래픽 이미지로 곡선과 색을 살려 그린다(`serie`와 같은 방식). 그 밖의 터미널에서는 글자 그래프로 그린다.
-- 조작:
-  - 커밋을 고르면 변경 파일이 보이고, `d`를 누르면 diff가 열린다.
-  - 브랜치 이름은 색 태그로 붙인다.
-  - 커밋 작성자와 함께, 그 커밋을 만든 세션의 계정 칩도 보여 준다. 세션 기록과 커밋 시각으로 연결할 수 있을 때만 보여 준다.
-- GitButler 가상 브랜치는 Git ref로 보이는 만큼만 그린다. GitButler 전용 표시는 하지 않는다.
+- Draws all branches of the selected project as a graph. Redraws when `.git` changes.
+- In Ghostty it draws kitty graphics images with curves and colors (the same approach as `serie`). In other terminals it draws a text graph.
+- Controls:
+  - Choosing a commit shows its changed files, and pressing `d` opens the diff.
+  - Branch names are attached as color tags.
+  - Along with the commit author, the account chip of the session that made the commit is also shown. It is shown only when it can be linked through the session record and the commit time.
+- GitButler virtual branches are drawn only as far as they appear as Git refs. No GitButler-specific display.
 
-### 5.7 브라우저 칸
+### 5.7 Browser pane
 
-- 데몬은 세션이 요청할 때 그 세션 전용 헤드리스 Chromium을 띄운다. CDP 포트는 데몬이 관리한다.
-- 에이전트는 그 브라우저의 CDP 주소를 받아 쓴다. 예를 들어 chrome-devtools MCP에 `--browserUrl`로 넘긴다. 주입 방식은 빌더가 정한다.
-- 오른쪽 칸이 `browser`이고 해당 세션이 선택돼 있으면, 데몬이 CDP로 2초마다 스크린숏을 찍어 이미지로 보낸다. 콘솔 오류도 같이 보낸다.
-- `o`를 누르면 현재 URL을 사용자의 크롬에서 연다. 로그인 같은 브라우저 상태는 옮겨지지 않는다는 점을 표시한다.
-- 화면 안에서 클릭하는 기능은 비목표다.
+- When a session asks, the daemon launches a headless Chromium dedicated to that session. The daemon manages the CDP port.
+- The agent receives that browser's CDP address and uses it, for example passing it to the chrome-devtools MCP with `--browserUrl`. How to inject it is for the builder to decide.
+- If the right pane is `browser` and that session is selected, the daemon takes a screenshot over CDP every 2 seconds and sends it as an image. Console errors are sent along with it.
+- Pressing `o` opens the current URL in the user's Chrome. It notes that browser state such as logins is not carried over.
+- Clicking inside the screen is a non-goal.
 
-### 5.8 마스터 세션 (선택)
+### 5.8 Master session (optional)
 
-- **역할의 경계:** 한 세션 안에서 일을 나누는 건 Claude Code의 서브에이전트, 에이전트 팀(`CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`), 워크플로가 맡는다. mine 마스터는 세션 사이의 일만 한다. 즉 어느 계정, 어느 프로젝트, Codex 중 어디에 맡길지 정한다.
-- **에이전트 팀 표시:** Claude Code의 팀원 화면 분할은 tmux나 iTerm2 안에서만 되고, 그 밖에서는 리더 프롬프트 아래 패널(in-process)로 보인다. mine 안에서는 이 패널 방식으로 쓴다.
-  - Claude Code가 tmux 칸을 만드는 방법은 문서에 없고, 다른 화면을 끼워 넣을 방법도 없다. 그래서 tmux 흉내(가짜 `tmux` 명령과 `TMUX` 변수)를 기반으로 삼지 않는다.
-  - 스파이크에서 Claude Code가 부르는 tmux 명령을 기록해 보고, 흉내가 안정적으로 가능해 보이면 6단계에서 실험 기능으로 다시 검토한다.
-  - 나중에 mine 목록에서 세션 아래에 팀원을 하위 줄로 보여 줄 수 있다. 문서에 나온 `~/.claude/teams/{팀}/config.json`과 `~/.claude/tasks/{팀}/`를 읽기만 한다.
+- **Boundary of roles:** splitting work inside one session is handled by Claude Code's subagents, agent teams (`CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`), and workflows. The mine master only works between sessions: it decides which account, which project, or Codex to give work to.
+- **Agent team display:** Claude Code's split-screen for teammates works only inside tmux or iTerm2; elsewhere teammates appear as panels (in-process) under the leader prompt. Inside mine this panel mode is used.
+  - How Claude Code creates tmux panes is undocumented, and there is no way to slot in a different screen. So a tmux imitation (a fake `tmux` command and `TMUX` variable) is not used as a foundation.
+  - In the spike, record the tmux commands Claude Code calls; if an imitation looks reliably possible, revisit it as an experimental feature in phase 6.
+  - Later, mine's list could show teammates as sub-rows under a session. It would only read `~/.claude/teams/{team}/config.json` and `~/.claude/tasks/{team}/` as given in the docs.
 
-- **지정:** claude 또는 codex 세션에서 `⌃a m`을 누르면 그 세션이 마스터가 된다. 마스터는 한 번에 하나만 있고, 다시 누르면 해제된다.
-  - 실행 중인 프로세스에는 MCP 서버나 지시문을 나중에 더할 수 없다. 그래서 대기 상태의 세션만 지정할 수 있다. 지정하면 mine이 그 세션을 `--resume` / `codex resume`으로 다시 띄우면서 `mine mcp`와 마스터 지시문을 붙인다. 해제할 때도 같은 방식으로 떼어 낸다.
-  - 마스터가 아닌 세션에는 `mine mcp`를 붙이지 않는다. 순정 상태를 유지하기 위해서다.
-  - 마스터 전용으로 새로 만들 때는 작업 폴더를 `~/.mine/master`로 한다. 프로젝트에 묶이지 않는다.
-  - 마스터 계정이 한도에 가까우면 5.4와 같은 넘기기로 마스터 역할을 다른 계정의 세션에 옮긴다.
-- **화면:** 마스터가 있으면 `∗`를 골랐을 때 가운데에 마스터 세션이 뜨고, 목록에는 전체 세션이 상태별로 보인다. 마스터가 없으면 `∗`는 전체 목록만 보여 준다.
-- **도구:** 데몬이 `mine mcp`를 통해 MCP 도구를 연다. 마스터 세션을 띄울 때 이 MCP 서버를 연결한다.
+- **Designation:** pressing `⌃a m` in a claude or codex session makes that session the master. There is only one master at a time, and pressing again releases it.
+  - An MCP server or instructions can't be added to a running process later. So only an Idle session can be designated. On designation, mine relaunches that session with `--resume` / `codex resume`, attaching `mine mcp` and the master instructions. Releasing detaches them the same way.
+  - `mine mcp` is not attached to non-master sessions, to keep them stock.
+  - When creating a new session just for the master, the working folder is `~/.mine/master`. It isn't tied to a project.
+  - If the master's account is near its limit, the master role is moved to a session on another account with the same handoff as in 5.4.
+- **Screen:** with a master, choosing `∗` shows the master session in the center, and the list shows all sessions by status. Without a master, `∗` shows only the full list.
+- **Tools:** the daemon exposes MCP tools through `mine mcp`. This MCP server is connected when the master session is launched.
 
-  | 도구 | 하는 일 |
+  | Tool | What it does |
   |---|---|
-  | `list_projects`, `list_sessions` | 프로젝트와 세션 목록, 상태, 계정, 한도 |
-  | `new_session(project, kind, account, model, name, prompt)` | 작업 세션을 만들고 첫 지시를 넣음 |
-  | `send(session, text)` | 대기 중인 작업 세션에 지시를 보냄 |
-  | `read(session, since)` | 작업 세션의 대화 기록을 읽음 |
-  | `propose_handoff(session, account)` | 계정 넘기기를 제안. 실행은 사용자 확인 후 |
-  | `usage()` | 계정별 한도와 관측 시각 |
+  | `list_projects`, `list_sessions` | Project and session lists, status, account, limits |
+  | `new_session(project, kind, account, model, name, prompt)` | Creates a work session and gives it its first instruction |
+  | `send(session, text)` | Sends an instruction to an idle work session |
+  | `read(session, since)` | Reads a work session's conversation record |
+  | `propose_handoff(session, account)` | Proposes an account handoff. Execution happens after user confirmation |
+  | `usage()` | Per-account limits and observation times |
 
-- **자율도 b:**
-  - 마스터는 세션 만들기, 일 나누기, 지시 보내기, 결과 읽기를 혼자 한다.
-  - 작업 세션의 승인 프롬프트는 대신 누르지 않는다. 일상적인 명령은 각 CLI의 기존 허용 목록이 처리하고, 남는 승인은 사람이 할 일로 둔다.
-  - 배포, 푸시, 삭제처럼 되돌리기 어려운 일을 직접 시키기 전에는 사용자에게 묻는다. 이 규칙은 마스터에게 주는 지시문에 넣는다.
-- **알림:** 작업 세션이 끝나거나 승인 대기가 되면, 데몬은 마스터가 대기 중일 때 이벤트 요약을 마스터의 입력으로 넣는다. 예: `[mine] shop-front/web-ui 끝남: …`. 사용자가 아무것도 치지 않아도 마스터가 상황을 알게 하려는 장치다.
+- **Autonomy b:**
+  - The master alone creates sessions, splits work, sends instructions, and reads results.
+  - It does not press approval prompts on a work session's behalf. Routine commands are handled by each CLI's existing allowlist, and the remaining approvals are left as the human's job.
+  - Before directly ordering hard-to-reverse actions such as deploying, pushing, or deleting, it asks the user. This rule goes into the instructions given to the master.
+- **Notifications:** when a work session finishes or Needs approval, the daemon feeds an event summary into the master's input if the master is idle. Example: `[mine] shop-front/web-ui Done: …`. This is so the master knows the situation even when the user types nothing.
 
-### 5.9 저장 위치
+### 5.9 Storage locations
 
 ```
 ~/.mine/
-  config.toml           계정, 원격 호스트
+  config.toml           accounts, remote hosts
   daemon.sock
-  projects/             프로젝트 등록 (실제 경로)
-  sessions/<id>/        메타데이터, conversation.jsonl, 인계 기록
-  usage/<account>.json  관측한 한도와 관측 시각
+  projects/             project registrations (real paths)
+  sessions/<id>/        metadata, conversation.jsonl, handoff records
+  usage/<account>.json  observed limits and observation times
   profiles/claude-a|b/  CLAUDE_CONFIG_DIR
-  master/               마스터 작업 폴더
+  master/               master working folder
   logs/
 ```
 
-`MINE_STATE_DIR`로 위치를 바꿀 수 있다. 테스트에서도 이 변수를 쓴다. Python 프로토타입의 `~/.mine/rooms` 기록은 옮기지 않는다(5.11).
+The location can be changed with `MINE_STATE_DIR`. Tests use this variable too. The Python prototype's `~/.mine/rooms` records are not migrated (5.11).
 
-### 5.10 단계
+### 5.10 Phases
 
-각 단계가 끝날 때마다 실제로 쓸 수 있어야 한다. 위험이 큰 것부터 처리한다.
+Each phase must be actually usable when it ends. Higher-risk items are handled first.
 
-0. **스파이크:** Ratatui 칸 안에서 `alacritty_terminal`로 순정 Claude Code와 Codex를 돌려 본다. 확인할 것:
-   - 색, 커서, 붙여넣기, 한글 입력, 마우스, 크기 변경
-   - 입력 지연
-   - Ghostty 안에서 kitty 이미지가 나란히 그려지는지
+0. **Spike:** run stock Claude Code and Codex inside a Ratatui pane with `alacritty_terminal`. To check:
+   - Colors, cursor, pasting, Korean input, mouse, resizing
+   - Input latency
+   - Whether kitty images are drawn side by side inside Ghostty
 
-   여기서 실패 조건(2절)에 걸리면 설계를 다시 연다.
-1. **데몬과 세션:** 데몬, 세션별 보관 프로세스, 클라이언트, claude·codex·shell 세션, 아이콘 줄과 상태별 목록, 훅으로 상태 감지, 다시 붙기. 합격 기준은 두 가지다. Ghostty + tmux 대신 하루 동안 쓸 수 있어야 하고, 작업 중에 `mine`을 새로 설치해도 세션이 살아 있어야 한다.
-2. **계정과 한도:** 한도 수집, 경고, `⌃a s` 넘기기와 인계, 원래 계정 재개.
-3. **재부팅 뒤 복원:** 로그인할 때 데몬 자동 시작, 세션별 `resume` / `rerun` / `none` 규칙.
-4. **git graph와 files 칸.**
-5. **원격 호스트.**
-6. **마스터:** 세션 사이 배분만 맡는다. 팀원 하위 줄 표시도 여기서 한다.
-7. **브라우저 칸.**
-8. **배포:** 설치 한 줄로 `mine`이 PATH에 들어가게 한다(5.11).
+   If this hits a failure condition (section 2), reopen the design.
+1. **Daemon and sessions:** daemon, per-session holder processes, client, claude·codex·shell sessions, project rail and status list, status detection by hooks, reattaching. There are two acceptance criteria. It must be usable for a whole day in place of Ghostty + tmux, and sessions must stay alive even if `mine` is newly installed mid-work.
+2. **Accounts and limits:** limit collection, warnings, `⌃a s` handoff and its content, resuming the original account.
+3. **Restore after reboot:** daemon auto-start at login, per-session `resume` / `rerun` / `none` rules.
+4. **Git graph and files pane.**
+5. **Remote hosts.**
+6. **Master:** handles only distribution between sessions. Showing teammate sub-rows is also done here.
+7. **Browser pane.**
+8. **Distribution:** make `mine` land on PATH with a one-line install (5.11).
 
-### 5.11 내가 정한 것 (사용자 확인 필요)
+### 5.11 My decisions (need user confirmation)
 
-- shell 세션을 넣었다(5.2). tmux를 대신하려면 일반 셸이 필요하다고 봤다.
-- Python 프로토타입의 공통 대화 화면(`/use`, `mine ask`)은 이어가지 않는다. 그 역할은 순정 세션, 인계, 마스터가 나눠 맡는다.
-- 프로토타입의 기존 기록은 옮기지 않는다. 하루 된 시험 데이터다.
-- 접두 키는 `⌃a`, 경고 임계값은 90%, 브라우저 화면 갱신은 2초다.
-- 배포: 저장소가 비공개라 Homebrew tap에는 토큰 설정이 필요하다. 그 전까지는 `cargo install --path .`로 설치한다.
-- 스크롤·선택·복사의 기준선을 지금 쓰는 Ghostty + tmux 수준으로 잡았다(2절, 5.3). 순정 Ghostty와 똑같이 하는 건 전체 화면 TUI에서는 불가능하다.
-- 프로세스가 끝난 claude·codex 세션은 `종료됨`으로 남겨 재개할 수 있게 했다(5.2).
-- Claude 두 계정은 로그인만 나누고 설정·플러그인·허용 목록·MCP를 공유한다. claude-a는 지금의 `~/.claude`다. 기존 statusLine은 감싸서 그대로 보인다(5.4).
-- 원격 연결은 로컬 데몬이 갖는다. 그래서 마스터와 한도 집계에 원격 세션도 들어간다(5.1, 5.5).
-- 마스터 지정은 대기 중인 세션에서만 되고, 그 세션을 resume으로 다시 띄운다(5.8).
-- `files` 칸은 미커밋 변경과 diff만 보여 준다(5.3).
-- 재부팅 복원 기본값은 claude·codex가 `resume`, shell이 `none`이다. `resume`은 끊긴 요청을 자동으로 다시 보내지 않는다(5.2).
+- I added shell sessions (5.2). I figured replacing tmux needs an ordinary shell.
+- The Python prototype's shared conversation screen (`/use`, `mine ask`) is not carried on. Its role is split among stock sessions, handoff, and the master.
+- The prototype's existing records are not migrated. They are one day's worth of test data.
+- The prefix key is `⌃a`, the warning threshold is 90%, and the browser screen refresh is 2 seconds.
+- Distribution: the repository is private, so a Homebrew tap needs token setup. Until then, install with `cargo install --path .`.
+- I set the baseline for scrolling, selecting, and copying at the current Ghostty + tmux level (section 2, 5.3). Matching stock Ghostty exactly is impossible in a full-screen TUI.
+- claude and codex sessions whose process has ended stay as `Exited` so they can be resumed (5.2).
+- The two Claude accounts split only the login and share settings, plugins, allowlist, and MCP. claude-a is the current `~/.claude`. The existing statusLine is wrapped and still shown as is (5.4).
+- The local daemon owns remote connections. So remote sessions are included in the master and the limit tally (5.1, 5.5).
+- Master designation works only on an idle session, which is relaunched with resume (5.8).
+- The `files` pane shows only uncommitted changes and diffs (5.3).
+- The restore-after-reboot defaults are `resume` for claude·codex and `none` for shell. `resume` does not automatically resend an interrupted request (5.2).
 
-### 5.12 스파이크 결과
+### 5.12 Spike results
 
-Task 0에서 순정 실행과 스파이크(`~/dev/mine-spike`)를 같은 tmux 안에서 화면 칸 단위로 비교했다. 대상은 Claude Code 2.1.329와 Codex 0.171.0이다.
+In Task 0, the stock run and the spike (`~/dev/mine-spike`) were compared pane cell by cell inside the same tmux. The subjects were Claude Code 2.1.329 and Codex 0.171.0.
 
-**같았던 것.** Claude는 다음 항목에서 글자·색·키 동작이 같았다.
+**What matched.** For Claude, text, colors, and key behavior were the same in these items:
 
-- 시작 화면, 한글과 이모지 입력, 붙여넣기 세 줄
-- Shift+Enter. 스파이크가 `CSI > 4;2 m`(modifyOtherKeys)을 바깥 터미널로 넘겼기 때문이다.
-- `/` 메뉴, 대기열 메시지, 승인 창, 창 크기 변경, Ctrl-C
+- Start screen, Korean and emoji input, a three-line paste
+- Shift+Enter. This is because the spike passed `CSI > 4;2 m` (modifyOtherKeys) to the outer terminal.
+- The `/` menu, queued messages, the approval dialog, window resizing, Ctrl-C
 
-Codex는 글자가 모두 같았고 색만 달랐다(아래 B).
+For Codex, all text matched and only the colors differed (B below).
 
-**달랐던 것과 코어 계획의 처리.**
+**What differed, and how the core plan handles it.**
 
-| | 차이 | 원인 | 처리 |
+| | Difference | Cause | Handling |
 |---|---|---|---|
-| A | 시작 직후 첫 입력이 사라지고 2초 동안 빈 화면 | 이미지 라이브러리가 stdin으로 질의하고 시간이 지나도 읽기 스레드를 남김 | 질의는 stdin 읽기 전에 같은 스레드에서 끝낸다. 남은 바이트는 입력 해석기로 넘긴다. 이미지는 4단계에서 다룬다(Task 9) |
-| B | Codex 색이 달라짐 | 색 질의(OSC 10/11)에 고정값으로 답함 | 클라이언트가 바깥 터미널 색을 한 번 묻고 `Colors`로 데몬에 알린다. 이 메시지 때문에 클라이언트↔데몬 프로토콜 버전이 2가 됐다(Task 9) |
-| C | OSC 8 링크가 사라짐 | ratatui 칸에 링크가 없음 | 스냅숏이 링크를 지키고(Task 4) 클라이언트가 그린 뒤 다시 써 넣는다(Task 9) |
-| D | 종료 직후 마지막 출력(`--resume <id>` 안내)이 사라짐 | 스파이크가 대체 화면에서만 그림 | 데몬이 세션 화면을 계속 쥐고 있어 다시 붙으면 보인다 |
-| E | DA1 답이 바깥 터미널과 다름(`?6c`) | alacritty가 직접 답함 | 지금은 그대로 둔다 |
+| A | The first input right after launch is lost, and the screen is blank for 2 seconds | The image library queries over stdin and leaves its read thread behind after the timeout | Finish the query on the same thread before reading stdin. Hand leftover bytes to the input parser. Images are handled in phase 4 (Task 9) |
+| B | Codex colors differ | Color queries (OSC 10/11) were answered with fixed values | The client asks the outer terminal for its colors once and tells the daemon with `Colors`. This message made the client↔daemon protocol version 2 (Task 9) |
+| C | OSC 8 links disappear | The ratatui pane has no links | The snapshot preserves links (Task 4) and the client writes them back in after drawing (Task 9) |
+| D | The last output right after exit (the `--resume <id>` hint) disappears | The spike draws only on the alternate screen | The daemon keeps holding the session screen, so it shows up on reattach |
+| E | The DA1 reply differs from the outer terminal (`?6c`) | alacritty answers it itself | Left as is for now |
 
-**아직 확인하지 못한 것(Ghostty에서 함께 확인).**
+**Not yet confirmed (to check together in Ghostty).**
 
-- kitty 이미지 깜박임
-- 입력 지연 체감
-- Ghostty에서 본 Codex 색
-- 키보드 모드 전달: 코어 클라이언트가 붙은 세션의 modifyOtherKeys·kitty 키보드·DECCKM·키패드 모드를 바깥 터미널로 넘기고, 그 모드에서 CSI로 들어오는 `⌃a`도 접두 키로 읽는다. kitty의 키 뗌·반복 보고(플래그 2)는 접두 키 처리가 복잡해져서 넘기지 않는다. mine이 직접 키를 읽는 동안(복사 모드, 입력 줄, 붙은 세션 없음)에는 바깥 모드를 기본값으로 되돌린다. tmux에서 Shift+Enter가 `CSI 13;2 u`로 전달되는 것을 확인했고, Ghostty 확인이 남았다.
-- IME 조합 위치: 세션이 커서를 숨겨도 바깥 커서를 세션 커서 자리로 옮겨 둔다(숨긴 채로). Ghostty에서 한글 조합이 그 자리에 뜨는지 확인이 남았다.
+- kitty image flicker
+- How input latency feels
+- Codex colors as seen in Ghostty
+- Keyboard mode forwarding: the core client passes the attached session's modifyOtherKeys, kitty keyboard, DECCKM, and keypad modes to the outer terminal, and also reads `⌃a` arriving as CSI in those modes as the prefix key. kitty's key-release and repeat reporting (flag 2) is not forwarded, because it complicates prefix-key handling. While mine reads keys itself (copy mode, the input line, no attached session), the outer modes are reset to defaults. Shift+Enter was confirmed to arrive as `CSI 13;2 u` in tmux; confirming in Ghostty remains.
+- IME composition position: even when the session hides the cursor, the outer cursor is moved to the session's cursor position (kept hidden). Whether Korean composition shows up at that spot in Ghostty remains to be confirmed.
 
-## 6. 빌더에게 맡기는 것
+## 6. Left to the builder
 
-- 크레이트 선택: 비동기 런타임, PTY, Git 라이브러리, 이미지 출력, MCP 구현
-- 데몬과 클라이언트 사이의 메시지 형식
-- `config.toml`의 세부 필드
-- 키 배치 세부
-- 프로젝트 색 배정
-- 한도 조회 주기
-- Codex 승인 대기 감지 방법
-- 화면 복구 방식
-- 작업 세션에 브라우저 CDP 주소를 주입하는 방식
+- Crate choices: async runtime, PTY, Git library, image output, MCP implementation
+- Message format between daemon and client
+- Detailed fields of `config.toml`
+- Key layout details
+- Project color assignment
+- Usage-limit polling interval
+- How to detect Codex's Needs approval
+- Screen restoration method
+- How to inject the browser's CDP address into work sessions
 
-## 7. 검증
+## 7. Verification
 
-- **단위·통합 테스트:** 프로토타입처럼 가짜 `claude`/`codex` 실행 파일로 확인한다.
-  - 훅 → 상태 전이
-  - 인계 내용
-  - 원래 계정 재개
-  - 프로젝트 판별
-  - 데몬 재접속
-- **PTY 테스트:** 알려진 출력을 내는 프로그램으로 화면 grid를 비교한다.
-- **수동 검증 (단계마다):** 실제 Claude Code와 Codex를 mine 안에서 쓰면서 실패 조건(2절)을 하나씩 확인한다. 유료 응답이 드는 검증은 사용자와 함께 한다.
+- **Unit and integration tests:** verify with fake `claude`/`codex` executables, as the prototype does.
+  - Hook → status transitions
+  - Handoff content
+  - Resuming the original account
+  - Project detection
+  - Daemon reconnection
+- **PTY tests:** compare the screen grid using a program that emits known output.
+- **Manual verification (every phase):** use real Claude Code and Codex inside mine and check the failure conditions (section 2) one by one. Verification that costs paid responses is done together with the user.

@@ -40,14 +40,14 @@
   .others { margin:0 8px 8px; font-size:11.5px; color:#8a8f99; padding:0 2px; }
 </style>
 
-<h2>상태별 목록 + 프로젝트 고르기</h2>
-<p class="subtitle">셋 다 프로젝트를 하나 고르면 그 프로젝트의 세션이 상태별로 보여. 지금 고른 건 shop-front야. 다른 점은 프로젝트를 고르는 방식이고, 맨 위의 <b>전체</b>를 고르면 모든 프로젝트 세션이 상태별로 모여.</p>
+<h2>Status list + project picker</h2>
+<p class="subtitle">In all three, picking a project shows that project's sessions grouped by status. The one picked now is shop-front. The only difference is how you pick the project; picking <b>All projects</b> at the top gathers every project's sessions by status.</p>
 
 <div class="three">
 
   <!-- A: rail -->
   <div>
-    <div class="label">1 · 왼쪽 아이콘 줄 (크롬 접은 탭 / 디스코드 서버 목록)</div>
+    <div class="label">1 · Left project rail (Chrome's collapsed tabs / Discord server list)</div>
     <div class="win">
       <div class="bar"><i class="dot dr"></i><i class="dot dy"></i><i class="dot dg"></i></div>
       <div class="side">
@@ -61,84 +61,84 @@
         </div>
         <div class="list">
           <div class="title">shop-front <span class="m">main</span></div>
-          <div class="r h">▾ <span class="y">◆</span> 승인 대기<span class="gap"></span><span class="n">1</span></div>
+          <div class="r h">▾ <span class="y">◆</span> Needs approval<span class="gap"></span><span class="n">1</span></div>
           <div class="r i on"><span class="w">refund-flow</span><span class="gap"></span><span class="chip cB">B</span></div>
-          <div class="r sub i">npm run deploy 승인?</div>
-          <div class="r h">▾ <span class="y">◐</span> 작업 중<span class="gap"></span><span class="n">1</span></div>
+          <div class="r sub i">Approve npm run deploy?</div>
+          <div class="r h">▾ <span class="y">◐</span> Working<span class="gap"></span><span class="n">1</span></div>
           <div class="r i">web-ui<span class="gap"></span><span class="chip cC">C</span></div>
-          <div class="r h">▾ <span class="gr">✓</span> 끝남<span class="gap"></span><span class="n">2</span></div>
+          <div class="r h">▾ <span class="gr">✓</span> Done<span class="gap"></span><span class="n">2</span></div>
           <div class="r i">receipt-fix<span class="gap"></span><span class="chip cA">A</span></div>
           <div class="r i m">printer-retry<span class="gap"></span><span class="chip cC">C</span></div>
-          <div class="r h">▸ <span class="m">○</span> 대기<span class="gap"></span><span class="n">0</span></div>
-          <div class="r m" style="margin-top:4px">＋ 새 세션  ⌃a c</div>
+          <div class="r h">▸ <span class="m">○</span> Idle<span class="gap"></span><span class="n">0</span></div>
+          <div class="r m" style="margin-top:4px">＋ New session  ⌃a c</div>
         </div>
       </div>
     </div>
-    <p class="cap"><b>장점:</b> 프로젝트가 20개로 늘어도 아이콘이 세로로 쌓일 뿐이야. 어느 프로젝트가 나를 기다리는지 ◆ 배지로 바로 보여. 네가 보여 준 크롬 접은 세로 탭이랑 같은 모양이야.
-    <b>단점:</b> 아이콘이 글자 하나라 프로젝트가 많아지면 헷갈릴 수 있어. 마우스를 올리면 이름이 뜨게 해서 보완해.</p>
+    <p class="cap"><b>Pros:</b> Even with 20 projects, the icons just stack vertically. The ◆ badge shows at once which project is waiting on me. It has the same shape as the collapsed Chrome vertical tabs you showed me.
+    <b>Cons:</b> Each icon is a single letter, so with many projects they can get confusing. Showing the name on hover makes up for it.</p>
   </div>
 
   <!-- B: top tabs -->
   <div>
-    <div class="label">2 · 목록 위 프로젝트 탭 (Linear 보기 탭)</div>
+    <div class="label">2 · Project tabs above the list (Linear view tabs)</div>
     <div class="win">
       <div class="bar"><i class="dot dr"></i><i class="dot dy"></i><i class="dot dg"></i></div>
       <div class="side">
         <div class="list">
           <div class="tabs">
-            <span class="tb">전체</span>
+            <span class="tb">All</span>
             <span class="tb"><i class="sq pb"></i>mine</span>
             <span class="tb sel"><i class="sq pg"></i>photo<span class="y">◆</span></span>
             <span class="tb"><i class="sq pr"></i>kit</span>
             <span class="tb m">…</span>
           </div>
-          <div class="r h">▾ <span class="y">◆</span> 승인 대기<span class="gap"></span><span class="n">1</span></div>
+          <div class="r h">▾ <span class="y">◆</span> Needs approval<span class="gap"></span><span class="n">1</span></div>
           <div class="r i on"><span class="w">refund-flow</span><span class="gap"></span><span class="chip cB">B</span></div>
-          <div class="r sub i">npm run deploy 승인?</div>
-          <div class="r h">▾ <span class="y">◐</span> 작업 중<span class="gap"></span><span class="n">1</span></div>
+          <div class="r sub i">Approve npm run deploy?</div>
+          <div class="r h">▾ <span class="y">◐</span> Working<span class="gap"></span><span class="n">1</span></div>
           <div class="r i">web-ui<span class="gap"></span><span class="chip cC">C</span></div>
-          <div class="r h">▾ <span class="gr">✓</span> 끝남<span class="gap"></span><span class="n">2</span></div>
+          <div class="r h">▾ <span class="gr">✓</span> Done<span class="gap"></span><span class="n">2</span></div>
           <div class="r i">receipt-fix<span class="gap"></span><span class="chip cA">A</span></div>
           <div class="r i m">printer-retry<span class="gap"></span><span class="chip cC">C</span></div>
-          <div class="r h">▸ <span class="m">○</span> 대기<span class="gap"></span><span class="n">0</span></div>
-          <div class="r m" style="margin-top:4px">＋ 새 세션  ⌃a c</div>
+          <div class="r h">▸ <span class="m">○</span> Idle<span class="gap"></span><span class="n">0</span></div>
+          <div class="r m" style="margin-top:4px">＋ New session  ⌃a c</div>
         </div>
       </div>
     </div>
-    <p class="cap"><b>장점:</b> 프로젝트 이름이 글자로 보여서 바로 알아볼 수 있어. Linear에서 보기를 바꾸는 탭이랑 같은 느낌이야.
-    <b>단점:</b> 사이드바 폭이 좁아서 탭이 4~5개만 들어가. render-server는 벌써 <code>…</code> 뒤로 숨었어. 이름도 줄여야 해.</p>
+    <p class="cap"><b>Pros:</b> Project names show as text, so you recognize them right away. It feels like the tabs in Linear that switch views.
+    <b>Cons:</b> The sidebar is narrow, so only 4–5 tabs fit. render-server is already hidden behind <code>…</code>. Names would have to be shortened too.</p>
   </div>
 
   <!-- C: switcher -->
   <div>
-    <div class="label">3 · 맨 위 프로젝트 선택기 (Linear 팀 전환)</div>
+    <div class="label">3 · Project selector at the top (Linear team switcher)</div>
     <div class="win">
       <div class="bar"><i class="dot dr"></i><i class="dot dy"></i><i class="dot dg"></i></div>
       <div class="side">
         <div class="list">
           <div class="sw"><i class="sq pg"></i>shop-front <span class="m">main</span><span class="gap"></span><span class="m">▾ ⌃p</span></div>
-          <div class="others">다른 프로젝트 · <span class="y">◐</span> 3  <span class="m">○</span> 2</div>
-          <div class="r h">▾ <span class="y">◆</span> 승인 대기<span class="gap"></span><span class="n">1</span></div>
+          <div class="others">Other projects · <span class="y">◐</span> 3  <span class="m">○</span> 2</div>
+          <div class="r h">▾ <span class="y">◆</span> Needs approval<span class="gap"></span><span class="n">1</span></div>
           <div class="r i on"><span class="w">refund-flow</span><span class="gap"></span><span class="chip cB">B</span></div>
-          <div class="r sub i">npm run deploy 승인?</div>
-          <div class="r h">▾ <span class="y">◐</span> 작업 중<span class="gap"></span><span class="n">1</span></div>
+          <div class="r sub i">Approve npm run deploy?</div>
+          <div class="r h">▾ <span class="y">◐</span> Working<span class="gap"></span><span class="n">1</span></div>
           <div class="r i">web-ui<span class="gap"></span><span class="chip cC">C</span></div>
-          <div class="r h">▾ <span class="gr">✓</span> 끝남<span class="gap"></span><span class="n">2</span></div>
+          <div class="r h">▾ <span class="gr">✓</span> Done<span class="gap"></span><span class="n">2</span></div>
           <div class="r i">receipt-fix<span class="gap"></span><span class="chip cA">A</span></div>
           <div class="r i m">printer-retry<span class="gap"></span><span class="chip cC">C</span></div>
-          <div class="r h">▸ <span class="m">○</span> 대기<span class="gap"></span><span class="n">0</span></div>
-          <div class="r m" style="margin-top:4px">＋ 새 세션  ⌃a c</div>
+          <div class="r h">▸ <span class="m">○</span> Idle<span class="gap"></span><span class="n">0</span></div>
+          <div class="r m" style="margin-top:4px">＋ New session  ⌃a c</div>
         </div>
       </div>
     </div>
-    <p class="cap"><b>장점:</b> 자리를 가장 적게 차지해. 목록 폭도 전부 쓸 수 있어.
-    <b>단점:</b> 다른 프로젝트는 "◐ 3" 같은 숫자로만 보여. 어디서 무슨 일이 생겼는지 보려면 선택기를 열어야 해.</p>
+    <p class="cap"><b>Pros:</b> Takes the least space. The full list width stays usable too.
+    <b>Cons:</b> Other projects show only as numbers like "◐ 3". To see what happened where, you have to open the selector.</p>
   </div>
 
 </div>
 
 <div class="options" style="margin-top:1.5rem">
-  <div class="option" data-choice="rail" onclick="toggleSelect(this)"><div class="letter">1</div><div class="content"><h3>왼쪽 아이콘 줄</h3><p>프로젝트가 많아도 버팀 · ◆ 배지로 바로 보임</p></div></div>
-  <div class="option" data-choice="tabs" onclick="toggleSelect(this)"><div class="letter">2</div><div class="content"><h3>목록 위 탭</h3><p>이름이 보임 · 4~5개가 한계</p></div></div>
-  <div class="option" data-choice="switcher" onclick="toggleSelect(this)"><div class="letter">3</div><div class="content"><h3>맨 위 선택기</h3><p>가장 좁음 · 다른 프로젝트는 숫자로만</p></div></div>
+  <div class="option" data-choice="rail" onclick="toggleSelect(this)"><div class="letter">1</div><div class="content"><h3>Left project rail</h3><p>Holds up with many projects · ◆ badge visible at a glance</p></div></div>
+  <div class="option" data-choice="tabs" onclick="toggleSelect(this)"><div class="letter">2</div><div class="content"><h3>Tabs above the list</h3><p>Names visible · limit of 4–5</p></div></div>
+  <div class="option" data-choice="switcher" onclick="toggleSelect(this)"><div class="letter">3</div><div class="content"><h3>Top selector</h3><p>Narrowest · other projects only as numbers</p></div></div>
 </div>
