@@ -1,7 +1,7 @@
 //! Integration test for the daemon and headless commands. Starts the daemon and holder processes with the real binary.
 //!
 //! Every `mine` command runs in a temporary project directory with a `.git` folder, with a separate short `/tmp` state directory
-//! (`MINE_STATE_DIR`) and `SHELL=/bin/sh`. The test process's own environment is left untouched.
+//! (`MINE_STATE_DIR`), `SHELL=/bin/sh` and a no-op `MINE_NOTIFY`. The test process's own environment is left untouched.
 
 use std::ffi::OsString;
 use std::fs::{self, File, TryLockError};
@@ -73,7 +73,9 @@ impl St {
         cmd.args(args)
             .current_dir(&self.project)
             .env("MINE_STATE_DIR", &self.root)
-            .env("SHELL", "/bin/sh");
+            .env("SHELL", "/bin/sh")
+            // Never pop real notifications on the user's screen. A test that checks them sets its own fake.
+            .env("MINE_NOTIFY", "/usr/bin/true");
         if let Some(front) = &self.path_front {
             let path = std::env::var_os("PATH").unwrap_or_default();
             let mut joined = front.clone().into_os_string();
@@ -497,6 +499,92 @@ fn subscribed_client_gets_pushed_sessions_after_hook() {
     }
 }
 
+/// Creates in `dir` a fake `MINE_NOTIFY` that appends each call's arguments to the calls file as one line. Returns (script, calls file).
+fn fake_notify(dir: &Path) -> (PathBuf, PathBuf) {
+    let calls = dir.join("calls");
+    let path = dir.join("notify");
+    let script = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n",
+        calls.display()
+    );
+    fs::write(&path, script).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    (path, calls)
+}
+
+fn notify_calls(calls: &Path) -> Vec<String> {
+    fs::read_to_string(calls)
+        .map(|text| text.lines().map(str::to_owned).collect())
+        .unwrap_or_default()
+}
+
+/// Records an approval request for the session the way the claude hook does.
+fn ask_approval(st: &St, name: &str, message: &str) {
+    let payload = serde_json::json!({"hook_event_name": "Notification", "message": message});
+    mine_stdin(
+        st,
+        &["_event", &session_dir(st, name)],
+        &payload.to_string(),
+    );
+}
+
+#[test]
+fn notify_on_approval_when_unfocused() {
+    let bin = tmp();
+    let (notify, calls) = fake_notify(bin.path());
+    let mut st = state();
+    st.env.push(("MINE_NOTIFY", notify.into_os_string()));
+    mine(&st, &["new", "h"]);
+    ask_approval(&st, "h", r#"Run "a\b"?"#);
+    wait_until(|| !notify_calls(&calls).is_empty());
+    // Quotes and backslashes in the text are escaped for AppleScript.
+    let folder = st.project.file_name().unwrap().to_string_lossy();
+    assert_eq!(
+        notify_calls(&calls),
+        [format!(
+            r#"-e display notification "Run \"a\\b\"?" with title "mine" subtitle "{folder}/h""#
+        )]
+    );
+    // Rereading the list, another request while still waiting, or a restarted daemon rereading the log is the same
+    // transition, so nothing pops again.
+    ls(&st);
+    ask_approval(&st, "h", "Again?");
+    kill_daemon(&st);
+    assert_eq!(ls(&st)[0][4], "approval");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(notify_calls(&calls).len(), 1);
+}
+
+#[test]
+fn no_notify_when_a_client_is_focused() {
+    let bin = tmp();
+    let (notify, calls) = fake_notify(bin.path());
+    let mut st = state();
+    st.env.push(("MINE_NOTIFY", notify.into_os_string()));
+    mine(&st, &["new", "a"]);
+    mine(&st, &["new", "b"]);
+    let mut c = client(&st);
+    // Messages on one connection are handled in order: once List is answered, Focus has been handled too.
+    c.send(&ToDaemon::Focus { focused: true });
+    c.send(&ToDaemon::List);
+    assert!(matches!(c.recv(), Some(FromDaemon::Sessions { .. })));
+    ask_approval(&st, "a", "Approve a?");
+    assert!(
+        ls(&st)
+            .iter()
+            .any(|row| row[2] == "a" && row[4] == "approval")
+    );
+    // Once no client is focused, the next request pops, and it is the only call: `a` never did.
+    c.send(&ToDaemon::Focus { focused: false });
+    c.send(&ToDaemon::List);
+    assert!(matches!(c.recv(), Some(FromDaemon::Sessions { .. })));
+    ask_approval(&st, "b", "Approve b?");
+    wait_until(|| !notify_calls(&calls).is_empty());
+    let got = notify_calls(&calls);
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert!(got[0].contains("Approve b?"), "{got:?}");
+}
+
 #[test]
 fn client_colours_answer_inner_colour_queries() {
     // Both a session created earlier (a screen that already exists) and one created after the colors were received (a new screen) answer with the received colors.
@@ -915,6 +1003,50 @@ fn sessions_do_not_inherit_the_daemon_spawners_environment() {
         }
     }
     assert!(env_of("b").contains(&profile));
+}
+
+#[tokio::test]
+async fn spawned_daemon_uses_given_env() {
+    // The desktop app starts the daemon with the login shell's environment instead of its own.
+    // The fake login shell from that environment writes the session's environment to `dump`.
+    let bin = tmp();
+    let dump = bin.path().join("env");
+    let shell = bin.path().join("sh");
+    let script = format!("#!/bin/sh\nenv > '{}'\nexec sleep 60\n", dump.display());
+    fs::write(&shell, script).unwrap();
+    fs::set_permissions(&shell, fs::Permissions::from_mode(0o755)).unwrap();
+    let st = state();
+    let path = format!("{}:/usr/bin:/bin", bin.path().display());
+    let env = [
+        ("PATH", path.as_str()),
+        ("SHELL", shell.to_str().unwrap()),
+        ("MINE_NOTIFY", "/usr/bin/true"),
+    ]
+    .map(|(k, v)| (k.to_string(), v.to_string()));
+    let state = State {
+        root: st.root.clone(),
+    };
+    let exe = Path::new(env!("CARGO_BIN_EXE_mine"));
+    let conn = mine_core::conn::connect_or_spawn_async_with(&state, exe, Some(&env))
+        .await
+        .unwrap();
+    drop(conn);
+    mine(&st, &["new", "s"]);
+    wait_until(|| fs::metadata(&dump).is_ok_and(|m| m.len() > 0));
+    let lines: Vec<String> = fs::read_to_string(&dump)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    // Values may contain tokens, so the failure message gives only the variable names.
+    let names: Vec<&str> = lines
+        .iter()
+        .map(|kv| kv.split_once('=').map_or(kv.as_str(), |(k, _)| k))
+        .collect();
+    assert!(lines.contains(&format!("PATH={path}")), "{names:?}");
+    // Nothing else of this test process's environment came along (cargo sets this variable for it).
+    assert!(std::env::var_os("CARGO_MANIFEST_DIR").is_some());
+    assert!(!names.contains(&"CARGO_MANIFEST_DIR"), "{names:?}");
 }
 
 #[test]

@@ -11,8 +11,8 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::session::{NewSession, SessionInfo};
 
-/// Protocol version between client and daemon. `Colors` was added in 2 (a version 1 daemon drops the connection on a message it doesn't know).
-pub const VERSION: u32 = 2;
+/// Protocol version between client and daemon. `Colors` was added in 2 and `Focus` in 3 (an older daemon drops the connection on a message it doesn't know).
+pub const VERSION: u32 = 3;
 /// Protocol version between daemon and holder process.
 pub const HOLD_VERSION: u32 = 1;
 
@@ -100,6 +100,10 @@ pub enum ToDaemon {
     Colors {
         fg: String,
         bg: String,
+    },
+    /// Whether this client's window is the one the user is looking at. While any client is focused, the daemon shows no approval notifications.
+    Focus {
+        focused: bool,
     },
 }
 

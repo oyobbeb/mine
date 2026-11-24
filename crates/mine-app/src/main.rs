@@ -12,20 +12,26 @@ mod terminal;
 mod theme;
 mod workspace;
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use gpui::{
     AnyView, App, AppContext, Application, Bounds, Global, Menu, MenuItem, WindowBounds,
     WindowOptions, px, size,
 };
 use gpui_component::{Root, TitleBar};
+use mine_core::env::login_env;
 use mine_core::link;
 use mine_core::paths::State;
-use mine_core::project;
+use mine_core::{project, session};
 
 use actions::Quit;
 use model::Model;
 use workspace::{Problem, Workspace};
+
+/// The longest the app waits at startup for the login shell to print its environment.
+const LOGIN_ENV_WAIT: Duration = Duration::from_secs(3);
 
 /// The root view that outlives the window. A window reopened from the Dock icon draws this view too.
 struct MainView(AnyView);
@@ -71,11 +77,21 @@ fn root_view(cx: &mut App) -> AnyView {
         .and_then(|exe| exe.canonicalize())
         .ok()
         .and_then(|exe| exe.parent().map(Path::to_path_buf));
-    let Some(mine) = link::find_mine(
-        std::env::var_os("MINE_BIN"),
-        exe_dir.as_deref(),
-        std::env::var_os("PATH"),
-    ) else {
+    // Launched from the Dock, the app has launchd's bare environment. The daemon (and so every session) gets the login shell's
+    // environment instead, or the app's own if that fails. `mine` is looked up in the login shell's PATH first, then the app's.
+    // ponytail: read on the main thread before the window opens, so a slow profile delays startup by up to LOGIN_ENV_WAIT.
+    let login = login_env(&session::login_shell(), LOGIN_ENV_WAIT);
+    let login_path = login.iter().flatten().find(|(k, _)| k == "PATH");
+    let path = login_path
+        .map(|(_, v)| OsString::from(v))
+        .into_iter()
+        .chain(std::env::var_os("PATH"))
+        .reduce(|mut a, b| {
+            a.push(":");
+            a.push(b);
+            a
+        });
+    let Some(mine) = link::find_mine(std::env::var_os("MINE_BIN"), exe_dir.as_deref(), path) else {
         let message = "Couldn't find the mine executable · install it with cargo install --path crates/mine-cli";
         return cx.new(|_| Problem(message.into())).into();
     };
@@ -84,7 +100,7 @@ fn root_view(cx: &mut App) -> AnyView {
     model.home_fallback = home_fallback;
     model.registered = project::registered(&state).unwrap_or_default();
     model.reload_labels(&state, std::env::home_dir().as_deref());
-    let link = link::start(state.clone(), mine, None);
+    let link = link::start(state.clone(), mine, login);
     cx.new(|cx| Workspace::new(model, state, link, cx)).into()
 }
 

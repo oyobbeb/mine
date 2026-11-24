@@ -54,8 +54,10 @@ pub struct Workspace {
     typed: Option<(Entity<InputState>, Subscription)>,
     /// The timer set on a `New` that is waiting for an answer (its `since`). It is not set twice for the same `New`.
     pending_timer: Option<Instant>,
-    /// The subscription set to re-read account names when the window is activated, and that window. This view outlives the window, so it is set anew for each window.
+    /// The subscription set to follow the window's activation (focus report, account names), and that window. This view outlives the window, so it is set anew for each window.
     activation: Option<(WindowId, Subscription)>,
+    /// Reports the window as unfocused when it closes. A closing window's deactivation doesn't reach the activation subscription.
+    _closed: Subscription,
     /// The task that feeds the link thread's events to the model. It stops with the view when the view is dropped.
     _pump: Task<()>,
 }
@@ -77,6 +79,10 @@ impl Workspace {
                 }
             }
         });
+        let this = cx.weak_entity();
+        let closed = cx.on_window_closed(move |cx| {
+            let _ = this.update(cx, |ws, _| ws.set_focused(false));
+        });
         Workspace {
             model,
             tx,
@@ -87,6 +93,7 @@ impl Workspace {
             typed: None,
             pending_timer: None,
             activation: None,
+            _closed: closed,
             _pump: pump,
         }
     }
@@ -115,8 +122,8 @@ impl Workspace {
         }
     }
 
-    /// Hooks this window to re-read account names when it is activated. Safe to call on every draw: it hooks only once
-    /// per window (a window reopened from the Dock is a new window, so it hooks again).
+    /// Hooks this window to tell the daemon whether it is active, and to re-read account names when it is activated. Safe to call
+    /// on every draw: it hooks only once per window (a window reopened from the Dock is a new window, so it hooks again).
     ///
     /// ponytail: no file watcher. An edited label or a changed account shows up when you return to the window.
     fn watch_activation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -129,11 +136,19 @@ impl Workspace {
             return;
         }
         let subscription = cx.observe_window_activation(window, |ws, window, cx| {
+            ws.set_focused(window.is_window_active());
             if window.is_window_active() {
                 ws.reload_labels(cx);
             }
         });
         self.activation = Some((id, subscription));
+        // The window may have become active before this hook existed.
+        self.set_focused(window.is_window_active());
+    }
+
+    fn set_focused(&mut self, focused: bool) {
+        let effects = self.model.set_focused(focused);
+        self.apply(effects);
     }
 
     /// Re-reads the account names, and redraws if they changed.

@@ -3,6 +3,7 @@
 
 pub mod accounts;
 pub mod conn;
+pub mod env;
 pub mod hooks;
 pub mod keys;
 pub mod launch;

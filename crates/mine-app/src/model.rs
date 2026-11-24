@@ -110,6 +110,8 @@ pub struct Model {
     started: bool,
     /// Names used when showing account ids as text. Read when the app starts, and again when the window is reactivated ([`Model::reload_labels`]).
     pub labels: Labels,
+    /// The app window is the active window ([`Model::set_focused`]).
+    focused: bool,
 }
 
 impl Model {
@@ -136,6 +138,7 @@ impl Model {
             attach_sent: false,
             started: false,
             labels: Labels::default(),
+            focused: false,
         }
     }
 
@@ -147,6 +150,19 @@ impl Model {
         let changed = labels != self.labels;
         self.labels = labels;
         changed
+    }
+
+    /// The app window became active or inactive. The daemon shows approval notifications only while no client is focused,
+    /// so it is told on every change, and on every connect while focused.
+    pub fn set_focused(&mut self, focused: bool) -> Vec<Effect> {
+        if self.focused == focused {
+            return Vec::new();
+        }
+        self.focused = focused;
+        if !self.connected {
+            return Vec::new();
+        }
+        vec![Effect::Send(ToDaemon::Focus { focused })]
     }
 
     /// Takes the daemon link's events.
@@ -167,6 +183,10 @@ impl Model {
                         bg: theme::hex(theme::TERM_BG),
                     }),
                 ];
+                // A new connection starts unfocused in the daemon.
+                if self.focused {
+                    effects.push(Effect::Send(ToDaemon::Focus { focused: true }));
+                }
                 effects.extend(self.send_attach());
                 effects
             }
@@ -986,6 +1006,21 @@ pub(crate) mod tests {
         rows.iter()
             .map(|&i| m.sessions[i].meta.name.clone())
             .collect()
+    }
+
+    #[test]
+    fn window_focus_is_reported_on_change_and_on_every_connect() {
+        let focus = |focused| Effect::Send(ToDaemon::Focus { focused });
+        let mut m = Model::new(PathBuf::from("/p"));
+        // With no connection there is no one to tell. The connect reports it.
+        assert!(m.set_focused(true).is_empty());
+        assert!(m.on_link(LinkEvent::Connected).contains(&focus(true)));
+        assert_eq!(m.set_focused(false), [focus(false)]);
+        assert_eq!(m.set_focused(true), [focus(true)]);
+        assert!(m.set_focused(true).is_empty());
+        // A new connection starts unfocused in the daemon, so a focused window says so again.
+        m.on_link(LinkEvent::Disconnected("disconnected".into()));
+        assert!(m.on_link(LinkEvent::Connected).contains(&focus(true)));
     }
 
     #[test]

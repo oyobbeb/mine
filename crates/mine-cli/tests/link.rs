@@ -94,7 +94,9 @@ fn link_reconnects_after_daemon_restart() {
     let state = State {
         root: st.root.clone(),
     };
-    let mut link = link::start(state, PathBuf::from(env!("CARGO_BIN_EXE_mine")), None);
+    // The daemon gets only a no-op `MINE_NOTIFY` (and `MINE_STATE_DIR`), so it can never pop a real notification.
+    let env = vec![("MINE_NOTIFY".to_string(), "/usr/bin/true".to_string())];
+    let mut link = link::start(state, PathBuf::from(env!("CARGO_BIN_EXE_mine")), Some(env));
     let deadline = Instant::now() + WAIT;
     wait_for(&mut link, deadline, "Connected", |ev| {
         *ev == LinkEvent::Connected

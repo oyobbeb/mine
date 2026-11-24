@@ -9,6 +9,8 @@
 //!   mistaking a notification about another event for the answer to its own request.
 //! - When a client reports the outer terminal's default colors with `Colors`, every session screen (including screens attached later)
 //!   answers the inner app's color queries with those colors.
+//! - A client reports with `Focus` whether its window is the one the user is looking at. When a session newly needs approval and
+//!   no client is focused, the daemon shows a macOS notification (`MINE_NOTIFY`, default `osascript`).
 //! - When the daemon starts again, it scans `sessions/*/meta.json`, reattaches to the holder processes that are alive, and rebuilds
 //!   the 80x24 screen from the holder process's output buffer. The first `Attach` changes it to the client's size.
 //!
@@ -116,6 +118,9 @@ struct Sess {
     active: Option<Instant>,
     /// The holder process is being restarted or reattached.
     busy: bool,
+    /// The hook log said Needs approval at the last refresh. Starts `true` so the first refresh, which rereads old events after a daemon
+    /// restart, announces nothing.
+    asking: bool,
 }
 
 /// A holder process connection. `link` is numbered afresh for each connection, filtering out events sent by a previous connection's tasks.
@@ -142,6 +147,8 @@ struct Client {
     attached: Option<String>,
     /// The size this client last reported (design 5.1: the session size follows the client that typed last).
     size: Option<(u16, u16)>,
+    /// Reported with `Focus`: this client's window is the one the user is looking at. It goes away with the client.
+    focused: bool,
 }
 
 /// A just-attached holder process connection. It has read through `Hello` and the output buffer.
@@ -362,6 +369,11 @@ async fn handle(shared: &Shared, client: u64, msg: ToDaemon) -> bool {
             d.publish();
         }
         ToDaemon::Colors { fg, bg } => shared.lock().await.set_colors(&fg, &bg),
+        ToDaemon::Focus { focused } => {
+            if let Some(c) = shared.lock().await.clients.get_mut(&client) {
+                c.focused = focused;
+            }
+        }
     }
     shared.lock().await.clients.contains_key(&client)
 }
@@ -874,6 +886,50 @@ fn spawn_quiet_timer(shared: Shared, id: String) {
     });
 }
 
+/// Shows a macOS notification for a session that just started waiting for approval. The command is `MINE_NOTIFY` (default `osascript`).
+///
+/// It is called under the global lock, so the command starts on a thread of its own, which also reaps it. Nothing waits for it.
+fn notify(meta: &Meta, waiting: Option<&str>) {
+    let folder = meta
+        .project
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy();
+    let script = format!(
+        "display notification {} with title \"mine\" subtitle {}",
+        applescript_str(
+            waiting
+                .filter(|w| !w.is_empty())
+                .unwrap_or("Needs approval")
+        ),
+        applescript_str(&format!("{folder}/{}", meta.name)),
+    );
+    let cmd = std::env::var_os("MINE_NOTIFY")
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "osascript".into());
+    std::thread::spawn(move || {
+        let spawned = std::process::Command::new(&cmd)
+            .arg("-e")
+            .arg(&script)
+            .stdin(Stdio::null())
+            .spawn();
+        match spawned {
+            Ok(mut child) => {
+                let _ = child.wait();
+            }
+            Err(e) => eprintln!(
+                "Couldn't show the notification: {} ({e})",
+                cmd.to_string_lossy()
+            ),
+        }
+    });
+}
+
+/// An AppleScript string literal. Backslashes and quotes are escaped.
+fn applescript_str(text: &str) -> String {
+    format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
 impl Sess {
     fn new(meta: Meta, viewed_ms: Option<u64>) -> Sess {
         Sess {
@@ -889,6 +945,7 @@ impl Sess {
             active: None,
             unlinked: false,
             busy: false,
+            asking: true,
         }
     }
 
@@ -956,6 +1013,7 @@ impl Daemon {
                 subscribed: false,
                 attached: None,
                 size: None,
+                focused: false,
             },
         );
         id
@@ -1037,6 +1095,7 @@ impl Daemon {
     /// Only events after the creation time are looked at, so a session recreated with the same id doesn't inherit the previous session's events.
     fn refresh(&mut self, id: &str) {
         let viewed = self.viewed_by_someone(id);
+        let focused = self.clients.values().any(|c| c.focused);
         let dir = self.state.session_dir(id);
         let Some(s) = self.sessions.get_mut(id) else {
             return;
@@ -1062,12 +1121,19 @@ impl Daemon {
         if s.active.is_some() && state == SessionState::Idle {
             state = SessionState::Working;
         }
+        // Only the step into Needs approval pops a notification, and only while the user isn't looking at a mine window.
+        let asking = state == SessionState::Approval;
+        let new_request = asking && !s.asking;
+        s.asking = asking;
         s.resume_id = resume_id.or_else(|| s.meta.resume_id.clone());
         (s.state, s.waiting) = if s.hold.is_some() || s.unlinked {
             (state, waiting)
         } else {
             (SessionState::Ended, None)
         };
+        if new_request && !focused && s.state == SessionState::Approval {
+            notify(&s.meta, s.waiting.as_deref());
+        }
     }
 
     /// `List`: recomputes all sessions and replies, and makes this client a subscriber to list changes.
