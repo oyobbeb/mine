@@ -29,7 +29,7 @@ mine treats a session as something that outlives everything around it. A small d
 - **Exited conversations resume.** A Claude or Codex session whose process ended stays in the list as *Exited*. Select it and the same conversation starts again.
 - **Two Claude accounts, one list.** Run sessions on two separately logged-in Claude accounts side by side. Each shows as your login name or a label you choose.
 - **See what needs you.** Sessions from every project are grouped as *Needs approval → Working → Done → Idle*, driven by the stock CLI hooks.
-- **One key to start.** The launcher creates a Claude, second-account Claude, Codex, or shell session with a single key.
+- **One key to start.** The launcher lists every profile and a shell, and starts any of them with a single key.
 - **The real CLIs.** Sessions run stock Claude Code and Codex. Keyboard modes (kitty keyboard, modifyOtherKeys) pass through, so Shift+Enter just works.
 - **Desktop app and terminal UI.** A GPUI desktop app for daily use and a terminal UI for SSH, both attached to the same daemon.
 
@@ -138,11 +138,13 @@ When no session is attached, the terminal pane shows the launcher. `⌃a c` open
 
 | Key | Action |
 |---|---|
-| Enter / `b` / `x` / `s` | Create a Claude (first account) / Claude (second account) / Codex / shell session and attach |
-| `n` | Type `<claude-a\|claude-b\|codex\|shell> <name> [model]` yourself |
+| `1`–`9` | Create a session on the profile in that row and attach |
+| Enter | Create a session on the default Claude profile and attach |
+| `s` | Create a shell session and attach |
+| `n` | Type `<profile\|shell> <name> [model]` yourself |
 | Esc | Close a launcher opened over a session |
 
-New sessions get the smallest unused name in the project: `t1`, `t2`, …. Clicking a menu row does the same. If a Korean input method is active when you press a command key, the status line asks you to switch to English.
+The rows are your profiles in config order, then shell. A profile that isn't logged in shows `Not logged in · mine profile login <id>` and doesn't start. New sessions get the smallest unused name in the project: `t1`, `t2`, …. Clicking a menu row does the same. If a Korean input method is active when you press a command key, the status line asks you to switch to English.
 
 </details>
 

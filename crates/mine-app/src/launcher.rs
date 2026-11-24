@@ -1,5 +1,5 @@
 //! The launcher: the menu, drawn in the center, that starts a session with a single key. It shows when no session is attached or when ⌘N, ＋ or New task is pressed.
-//! Same content as the stage 1 TUI's launcher (`mine-cli` `client::launcher`). `Model` handles the state and sending `New`.
+//! Same content as the TUI's launcher (`mine-cli` `client::launcher`): one row per profile, then shell and the typed form. `Model` handles the state and sending `New`.
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
@@ -8,51 +8,72 @@ use gpui::{
 };
 use gpui_component::input::Input;
 use gpui_component::{h_flex, v_flex};
-use mine_core::accounts::Labels;
-use mine_core::launch::{Choice, tilde};
+use mine_core::launch::{self, Choice, enter_choice, tilde};
+use mine_core::profiles::ProfileInfo;
 use mine_core::view::folder_name;
 
-use crate::sidebar::account_chip;
+use crate::sidebar::chip;
 use crate::theme::*;
 use crate::workspace::Workspace;
 
-/// A menu row: (choice, key label). The row name is [`label`].
-const ROWS: [(Choice, &str); 5] = [
-    (Choice::ClaudeA, "↵"),
-    (Choice::ClaudeB, "b"),
-    (Choice::Codex, "x"),
-    (Choice::Shell, "s"),
-    (Choice::Typed, "n"),
-];
-
-/// Menu width and name-column width. The chip lines up at the same position after the name column.
+/// Minimum menu width, and the name column's minimum width. The chip lines up after the name column, and a longer row widens the menu.
+///
+/// ponytail: the name column isn't measured, so a label wider than `LABEL_W` pushes its own chip right. Measure with the window's
+/// text system if labels that long become common.
 const MENU_W: f32 = 340.;
 const LABEL_W: f32 = 150.;
 
-/// The text of a menu row as drawn on screen: (choice, key label, row name). The row name is [`Choice::label`], so only
-/// the account rows carry the names from `labels`. Drawing and tests use the same text.
-fn row_texts(labels: &Labels) -> Vec<(Choice, &'static str, String)> {
-    ROWS.iter()
-        .map(|&(choice, key)| (choice, key, choice.label(labels).to_string()))
+/// A menu row as drawn: what it picks, its key (blank past the ninth profile), its name, and for a profile its chip (letter, color)
+/// and, if it isn't logged in, the login note. Drawing and tests use the same values.
+struct Row {
+    choice: Choice,
+    key: String,
+    label: String,
+    chip: Option<(String, u32)>,
+    hint: Option<String>,
+}
+
+fn row_texts(profiles: &[ProfileInfo]) -> Vec<Row> {
+    launch::rows(profiles)
+        .into_iter()
+        .map(|(choice, key)| {
+            let info = match &choice {
+                Choice::Profile(id) => launch::profile(profiles, id),
+                _ => None,
+            };
+            Row {
+                key: key.map(String::from).unwrap_or_default(),
+                label: choice.label(profiles).to_string(),
+                chip: info.map(|p| (p.chip.clone(), p.rgb())),
+                hint: info.and_then(launch::login_hint),
+                choice,
+            }
+        })
         .collect()
 }
 
-/// The row that one key picks. Keys with modifiers (including ⇧) and any other key are ignored.
+/// The hint under the menu: what Enter starts, and ⌘W.
+fn footer(profiles: &[ProfileInfo]) -> String {
+    match enter_choice(profiles) {
+        Some(choice) => format!("↵ {} · ⌘W close", choice.label(profiles)),
+        None => "⌘W close".into(),
+    }
+}
+
+/// The row that one key picks: Enter, `1`–`9`, `s` or `n`. Keys with modifiers (including ⇧) and any other key are ignored.
 ///
 /// GPUI reports keys that bypass the input method (when focus isn't in a text input) as the layout's English key. So,
 /// unlike in the TUI, `s` arrives as `s` even when the keyboard is switched to Hangul.
-pub fn choice_of_key(k: &Keystroke) -> Option<Choice> {
+pub fn choice_of_key(k: &Keystroke, profiles: &[ProfileInfo]) -> Option<Choice> {
     if k.modifiers.modified() {
         return None;
     }
-    Some(match k.key.as_str() {
-        "enter" => Choice::ClaudeA,
-        "b" => Choice::ClaudeB,
-        "x" => Choice::Codex,
-        "s" => Choice::Shell,
-        "n" => Choice::Typed,
-        _ => return None,
-    })
+    let mut chars = k.key.chars();
+    match (k.key.as_str(), chars.next(), chars.next()) {
+        ("enter", ..) => enter_choice(profiles),
+        (_, Some(key), None) => launch::choice_of_key(key, profiles),
+        _ => None,
+    }
 }
 
 /// Esc without modifiers.
@@ -77,26 +98,22 @@ pub fn render(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
                 .text_color(rgb(TITLE))
                 .child(folder_name(project)),
         )
+        // Zero width plus grow: a long path fills what the rows leave and truncates, instead of widening the menu.
         .child(
             div()
-                .min_w_0()
+                .w_0()
+                .flex_1()
                 .truncate()
                 .text_size(px(13.))
                 .text_color(rgb(FAINT))
                 .child(tilde(project, home.as_deref())),
         );
-    let rows = row_texts(&m.labels)
+    let rows = row_texts(&m.profiles)
         .into_iter()
         .enumerate()
-        .map(|(k, (choice, key, name))| {
-            row(
-                k,
-                choice,
-                key,
-                name,
-                m.typing && choice == Choice::Typed,
-                cx,
-            )
+        .map(|(k, r)| {
+            let selected = m.typing && r.choice == Choice::Typed;
+            row(k, r, selected, cx)
         })
         .collect::<Vec<_>>();
     let typed = ws.typed_input().filter(|_| m.typing).map(|input| {
@@ -123,7 +140,7 @@ pub fn render(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
         .bg(rgb(WINDOW_BG))
         .child(
             v_flex()
-                .w(px(MENU_W))
+                .min_w(px(MENU_W))
                 .child(head)
                 .child(
                     div()
@@ -141,20 +158,14 @@ pub fn render(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
                         .mt_5()
                         .text_size(px(12.))
                         .text_color(rgb(FAINT))
-                        .child("⌘W close"),
+                        .child(footer(&m.profiles)),
                 ),
         )
 }
 
-/// One menu row: `↵  claude-a   [A]`. Clicking picks that row. The account name goes in the name slot.
-fn row(
-    k: usize,
-    choice: Choice,
-    key: &'static str,
-    name: String,
-    selected: bool,
-    cx: &mut Context<Workspace>,
-) -> impl IntoElement + use<> {
+/// One menu row: `1  personal   [P]`, and the dim login note for a profile that isn't logged in. Clicking picks that row.
+fn row(k: usize, r: Row, selected: bool, cx: &mut Context<Workspace>) -> impl IntoElement + use<> {
+    let choice = r.choice;
     h_flex()
         .id(("launch", k))
         .h(px(30.))
@@ -168,19 +179,38 @@ fn row(
         .child(
             div()
                 .w(px(16.))
+                .flex_shrink_0()
                 .font_weight(FontWeight::BOLD)
                 .text_color(rgb(TITLE))
-                .child(key),
+                .child(r.key),
         )
-        .child(div().w(px(LABEL_W)).text_color(rgb(TEXT)).child(name))
-        .children(account_chip(choice.word()))
-        .on_click(cx.listener(move |ws, _, window, cx| ws.launch(choice, window, cx)))
+        .child(
+            div()
+                .min_w(px(LABEL_W))
+                .flex_shrink_0()
+                .whitespace_nowrap()
+                .text_color(rgb(TEXT))
+                .child(r.label),
+        )
+        .children(r.chip.map(|(letter, color)| chip(letter, color)))
+        .children(r.hint.map(|hint| {
+            div()
+                .flex_shrink_0()
+                .whitespace_nowrap()
+                .text_color(rgb(FAINT))
+                .child(hint)
+        }))
+        .on_click(cx.listener(move |ws, _, window, cx| ws.launch(choice.clone(), window, cx)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::labels_from;
+    use crate::model::{Model, builtin, profile};
+    use mine_core::link::LinkEvent;
+    use mine_core::profiles::ProfileKind;
+    use mine_core::proto::FromDaemon;
+    use std::path::PathBuf;
 
     fn key(source: &str) -> Keystroke {
         Keystroke::parse(source).unwrap()
@@ -188,18 +218,25 @@ mod tests {
 
     #[test]
     fn keys_choose_one_row_and_everything_else_is_ignored() {
-        use Choice::*;
-        let k = |s: &str| choice_of_key(&key(s));
-        assert_eq!(k("enter"), Some(ClaudeA));
-        assert_eq!(k("b"), Some(ClaudeB));
-        assert_eq!(k("x"), Some(Codex));
-        assert_eq!(k("s"), Some(Shell));
-        assert_eq!(k("n"), Some(Typed));
+        let list = builtin();
+        let k = |s: &str| choice_of_key(&key(s), &list);
+        let p = |id: &str| Some(Choice::Profile(id.into()));
+        assert_eq!(k("enter"), p("claude-a"));
+        assert_eq!(k("1"), p("claude-a"));
+        assert_eq!(k("2"), p("claude-b"));
+        assert_eq!(k("3"), p("codex"));
+        assert_eq!(k("s"), Some(Choice::Shell));
+        assert_eq!(k("n"), Some(Choice::Typed));
         for ignored in [
             "a",
-            "shift-b",
+            "b",
+            "x",
+            "0",
+            "4",
+            "shift-2",
             "shift-enter",
             "cmd-n",
+            "cmd-1",
             "cmd-s",
             "ctrl-x",
             "alt-s",
@@ -210,69 +247,76 @@ mod tests {
         ] {
             assert_eq!(k(ignored), None, "{ignored}");
         }
-        // The key shown on each row picks that row (Enter is `↵`).
-        for (choice, shown) in ROWS {
-            let source = if shown == "↵" { "enter" } else { shown };
-            assert_eq!(k(source), Some(choice), "{shown}");
-        }
+        // Before the list arrives, Enter and digits do nothing.
+        assert_eq!(choice_of_key(&key("enter"), &[]), None);
+        assert_eq!(choice_of_key(&key("1"), &[]), None);
+        assert_eq!(choice_of_key(&key("s"), &[]), Some(Choice::Shell));
         assert!(is_escape(&key("escape")));
         assert!(!is_escape(&key("cmd-escape")) && !is_escape(&key("n")));
     }
 
     #[test]
-    fn rows_name_the_kinds_like_the_tui() {
-        // The default before the name is read is the kind word.
-        let rows = row_texts(&Labels::default());
-        let names: Vec<_> = rows.iter().map(|(_, _, name)| name.as_str()).collect();
-        assert_eq!(
-            names,
-            [
-                "claude-a",
-                "claude-b",
-                "codex",
-                "shell",
-                "Custom name and model"
-            ]
-        );
-        // Chips go only on the claude-a, claude-b and codex rows.
-        let chips: Vec<_> = rows
-            .iter()
-            .map(|(choice, ..)| chip(choice.word()).map(|(letter, _)| letter))
-            .collect();
-        assert_eq!(chips, [Some("A"), Some("B"), Some("C"), None, None]);
-    }
-
-    #[test]
-    fn rows_show_account_labels_and_keep_keys_and_choices() {
-        // claude-a has a label, codex has an automatic name. claude-b has nothing set, so it shows the id. shell's label is not used.
-        let config =
-            "[accounts.claude-a]\nlabel = \"personal\"\n[accounts.shell]\nlabel = \"sh\"\n";
-        let rows = row_texts(&labels_from(config));
+    fn app_launcher_rows_follow_profiles() {
+        let mut m = Model::new(PathBuf::from("/p"));
+        // Before the daemon sends the list, only shell and the typed form.
+        let keys = |m: &Model| -> Vec<String> {
+            row_texts(&m.profiles)
+                .into_iter()
+                .map(|row| row.key)
+                .collect()
+        };
+        assert_eq!(keys(&m), ["s", "n"]);
+        let mut list = builtin();
+        let mut team = profile("team", ProfileKind::Claude, "team", "#98c379");
+        team.logged_in = false;
+        list.push(team);
+        m.on_link(LinkEvent::Msg(FromDaemon::Profiles { profiles: list }));
+        let rows = row_texts(&m.profiles);
         let shown: Vec<_> = rows
             .iter()
-            .map(|(_, key, name)| (*key, name.as_str()))
+            .map(|row| (row.key.as_str(), row.label.as_str()))
             .collect();
         assert_eq!(
             shown,
             [
-                ("↵", "personal"),
-                ("b", "claude-b"),
-                ("x", "Codex"),
+                ("1", "personal"),
+                ("2", "work"),
+                ("3", "Codex"),
+                ("4", "team"),
                 ("s", "shell"),
                 ("n", "Custom name and model"),
             ]
         );
-        // The value that picks a row is the kind word as is, regardless of the name (it becomes the session's account id).
-        let words: Vec<_> = rows.iter().map(|(choice, ..)| choice.word()).collect();
+        // The chip is the profile's letter and color; shell and the typed form have none.
+        let chips: Vec<_> = rows.iter().map(|row| row.chip.clone()).collect();
         assert_eq!(
-            words,
+            chips,
             [
-                Some("claude-a"),
-                Some("claude-b"),
-                Some("codex"),
-                Some("shell"),
+                Some(("P".to_string(), 0xe5c07b)),
+                Some(("W".to_string(), 0xc678dd)),
+                Some(("C".to_string(), 0x56b6c2)),
+                Some(("T".to_string(), 0x98c379)),
+                None,
+                None,
+            ]
+        );
+        // Only the profile that isn't logged in carries the login note.
+        let hints: Vec<_> = rows.iter().map(|row| row.hint.as_deref()).collect();
+        assert_eq!(
+            hints,
+            [
+                None,
+                None,
+                None,
+                Some("Not logged in · mine profile login team"),
+                None,
                 None
             ]
         );
+        // The value that picks a row is the profile id, regardless of its label.
+        assert_eq!(rows[1].choice, Choice::Profile("claude-b".into()));
+        // The footer names the Enter row.
+        assert_eq!(footer(&m.profiles), "↵ personal · ⌘W close");
+        assert_eq!(footer(&[]), "⌘W close");
     }
 }

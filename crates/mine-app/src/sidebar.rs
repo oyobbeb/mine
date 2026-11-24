@@ -7,6 +7,8 @@ use gpui::{
     StatefulInteractiveElement, Styled, div, px, rgb,
 };
 use gpui_component::{StyledExt, h_flex, v_flex};
+use mine_core::launch;
+use mine_core::profiles::ProfileInfo;
 use mine_core::session::{SessionInfo, SessionState};
 use mine_core::view::{Group, folder_name};
 
@@ -256,7 +258,7 @@ fn session_row(m: &Model, i: usize, cx: &mut Context<Workspace>) -> impl IntoEle
                         .text_color(rgb(if selected { TITLE } else { TEXT }))
                         .child(s.meta.name.clone()),
                 )
-                .children(account_chip(s.meta.account.as_deref())),
+                .children(account_chip(s.meta.account.as_deref(), &m.profiles)),
         )
         .child(
             h_flex()
@@ -276,23 +278,28 @@ fn session_row(m: &Model, i: usize, cx: &mut Context<Workspace>) -> impl IntoEle
         )
 }
 
-/// Account chip (A·B·C). An account with no chip, like shell, is `None`. Tabs use it too.
-pub fn account_chip(account: Option<&str>) -> Option<impl IntoElement + use<>> {
-    let (letter, color) = chip(account)?;
-    Some(
-        div()
-            .flex()
-            .flex_shrink_0()
-            .items_center()
-            .justify_center()
-            .size(px(16.))
-            .rounded(px(3.))
-            .bg(rgb(color))
-            .text_color(rgb(CHIP_FG))
-            .text_size(px(10.))
-            .font_weight(FontWeight::BOLD)
-            .child(letter),
-    )
+/// The chip of a session's profile: its letter on its color. A shell, or a profile that isn't in the list, has none. Tabs use it too.
+pub fn account_chip(
+    account: Option<&str>,
+    profiles: &[ProfileInfo],
+) -> Option<impl IntoElement + use<>> {
+    launch::profile(profiles, account?).map(|p| chip(p.chip.clone(), p.rgb()))
+}
+
+/// A chip: a profile's letter on its color (`0xrrggbb`). The launcher rows use it too.
+pub fn chip(letter: String, color: u32) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_shrink_0()
+        .items_center()
+        .justify_center()
+        .size(px(16.))
+        .rounded(px(3.))
+        .bg(rgb(color))
+        .text_color(rgb(CHIP_FG))
+        .text_size(px(10.))
+        .font_weight(FontWeight::BOLD)
+        .child(letter)
 }
 
 /// "＋ Add project". Clicking picks a folder and registers it as a project.

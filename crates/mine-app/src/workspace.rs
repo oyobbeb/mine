@@ -122,10 +122,8 @@ impl Workspace {
         }
     }
 
-    /// Hooks this window to tell the daemon whether it is active, and to re-read account names when it is activated. Safe to call
-    /// on every draw: it hooks only once per window (a window reopened from the Dock is a new window, so it hooks again).
-    ///
-    /// ponytail: no file watcher. An edited label or a changed account shows up when you return to the window.
+    /// Hooks this window to tell the daemon whether it is active. Safe to call on every draw: it hooks only once per window (a window
+    /// reopened from the Dock is a new window, so it hooks again).
     fn watch_activation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let id = window.window_handle().window_id();
         if self
@@ -135,11 +133,8 @@ impl Workspace {
         {
             return;
         }
-        let subscription = cx.observe_window_activation(window, |ws, window, cx| {
+        let subscription = cx.observe_window_activation(window, |ws, window, _| {
             ws.set_focused(window.is_window_active());
-            if window.is_window_active() {
-                ws.reload_labels(cx);
-            }
         });
         self.activation = Some((id, subscription));
         // The window may have become active before this hook existed.
@@ -149,14 +144,6 @@ impl Workspace {
     fn set_focused(&mut self, focused: bool) {
         let effects = self.model.set_focused(focused);
         self.apply(effects);
-    }
-
-    /// Re-reads the account names, and redraws if they changed.
-    fn reload_labels(&mut self, cx: &mut Context<Self>) {
-        let home = std::env::home_dir();
-        if self.model.reload_labels(&self.state, home.as_deref()) {
-            cx.notify();
-        }
     }
 
     /// The launcher's input box. It exists only while open.
@@ -311,7 +298,7 @@ impl Workspace {
             self.changed(window, cx);
             cx.stop_propagation();
         } else if !self.model.typing
-            && let Some(choice) = launcher::choice_of_key(key)
+            && let Some(choice) = launcher::choice_of_key(key, &self.model.profiles)
         {
             self.launch(choice, window, cx);
             cx.stop_propagation();

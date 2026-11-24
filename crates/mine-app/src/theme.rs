@@ -25,10 +25,6 @@ pub const APPROVAL: u32 = 0xe5c07b;
 /// The Working symbol ◐ and the Done symbol ✓. Same colors as the TUI list.
 pub const WORKING: u32 = 0x56b6c2;
 pub const DONE: u32 = 0x98c379;
-/// Account chips: claude-a, claude-b, codex.
-pub const CHIP_A: u32 = 0xe5c07b;
-pub const CHIP_B: u32 = 0xc678dd;
-pub const CHIP_C: u32 = 0x56b6c2;
 /// Chip text color.
 pub const CHIP_FG: u32 = 0x1e2128;
 
@@ -69,16 +65,6 @@ pub fn indexed(i: u8) -> u32 {
 /// A `#rrggbb` string.
 pub fn hex(color: u32) -> String {
     format!("#{color:06x}")
-}
-
-/// Text and background colors of an account chip. claude-a is `A`, claude-b is `B`, codex is `C`, and anything else (shell) has no chip.
-pub fn chip(account: Option<&str>) -> Option<(&'static str, u32)> {
-    match account? {
-        "claude-a" => Some(("A", CHIP_A)),
-        "claude-b" => Some(("B", CHIP_B)),
-        "codex" => Some(("C", CHIP_C)),
-        _ => None,
-    }
 }
 
 fn hsla(color: u32) -> Hsla {
@@ -124,14 +110,5 @@ mod tests {
         assert_eq!(indexed(232), 0x080808);
         assert_eq!(indexed(255), 0xeeeeee);
         assert_eq!(hex(TERM_BG), "#1e2128");
-    }
-
-    #[test]
-    fn chips_follow_accounts() {
-        assert_eq!(chip(Some("claude-a")), Some(("A", CHIP_A)));
-        assert_eq!(chip(Some("claude-b")), Some(("B", CHIP_B)));
-        assert_eq!(chip(Some("codex")), Some(("C", CHIP_C)));
-        assert_eq!(chip(None), None);
-        assert_eq!(chip(Some("shell")), None);
     }
 }

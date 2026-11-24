@@ -18,6 +18,3 @@ futures.workspace = true
 gpui = { version = "=0.2.2", features = ["runtime_shaders"] }
 gpui-component = "=0.4.1"
 mine-core = { path = "../mine-core" }
-
-[dev-dependencies]
-tempfile.workspace = true

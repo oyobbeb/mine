@@ -5,10 +5,9 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use mine_core::accounts::Labels;
 use mine_core::launch::{self, Choice};
 use mine_core::link::LinkEvent;
-use mine_core::paths::State;
+use mine_core::profiles::ProfileInfo;
 use mine_core::proto::{FromDaemon, ToDaemon};
 use mine_core::screen::Screen;
 use mine_core::session::{NewSession, SessionInfo, SessionState};
@@ -59,15 +58,37 @@ const NOT_CONNECTED: &str =
 const CLOSE_OFFLINE: &str =
     "Can't close the session while disconnected from the daemon. Try again once it reconnects.";
 
-/// Names built from a label config (`config.toml` contents). Used by screen-string tests. There is no home, so codex is the only automatic name.
+/// A logged-in profile as the daemon sends it. The chip is the label's first letter, uppercased.
 #[cfg(test)]
-pub(crate) fn labels_from(config: &str) -> Labels {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("config.toml"), config).unwrap();
-    let state = State {
-        root: dir.path().to_path_buf(),
-    };
-    Labels::load(&state, None)
+pub(crate) fn profile(
+    id: &str,
+    kind: mine_core::profiles::ProfileKind,
+    label: &str,
+    color: &str,
+) -> ProfileInfo {
+    ProfileInfo {
+        id: id.into(),
+        kind,
+        label: label.into(),
+        color: color.into(),
+        chip: label.chars().next().unwrap().to_uppercase().to_string(),
+        default: false,
+        logged_in: true,
+    }
+}
+
+/// The built-in three, logged in: claude-a `personal` (the default Claude profile), claude-b `work`, and codex `Codex`.
+#[cfg(test)]
+pub(crate) fn builtin() -> Vec<ProfileInfo> {
+    use mine_core::profiles::ProfileKind::{Claude, Codex};
+    let mut list = vec![
+        profile("claude-a", Claude, "personal", "#e5c07b"),
+        profile("claude-b", Claude, "work", "#c678dd"),
+        profile("codex", Codex, "Codex", "#56b6c2"),
+    ];
+    list[0].default = true;
+    list[2].default = true;
+    list
 }
 
 pub struct Model {
@@ -114,8 +135,8 @@ pub struct Model {
     listed: bool,
     /// The session to attach to was chosen from the first list received.
     started: bool,
-    /// Names used when showing account ids as text. Read when the app starts, and again when the window is reactivated ([`Model::reload_labels`]).
-    pub labels: Labels,
+    /// The profiles the daemon sent last (`FromDaemon::Profiles`), in launcher order. Empty until the first list arrives; kept while disconnected.
+    pub profiles: Vec<ProfileInfo>,
     /// The app window is the active window ([`Model::set_focused`]).
     focused: bool,
 }
@@ -144,19 +165,9 @@ impl Model {
             attach_sent: false,
             listed: false,
             started: false,
-            labels: Labels::default(),
+            profiles: Vec::new(),
             focused: false,
         }
-    }
-
-    /// Re-reads the account names. Returns `true` if they changed (a redraw is needed).
-    ///
-    /// ponytail: no file watcher. They are re-read when you change accounts or edit a label and return to the window.
-    pub fn reload_labels(&mut self, state: &State, home: Option<&Path>) -> bool {
-        let labels = Labels::load(state, home);
-        let changed = labels != self.labels;
-        self.labels = labels;
-        changed
     }
 
     /// The app window became active or inactive. The daemon shows approval notifications only while no client is focused,
@@ -238,13 +249,17 @@ impl Model {
                 }
                 Vec::new()
             }
+            // Sent after hello and after every reload: the launcher rows and chips follow the last one.
+            LinkEvent::Msg(FromDaemon::Profiles { profiles }) => {
+                self.profiles = profiles;
+                Vec::new()
+            }
             // The connection checked the version. A screen for another session was sent before the attached session changed, so drop it.
-            // Labels are still read locally (`Labels::load`), so the profile list is unused. The connection already skips unknown messages.
+            // The connection already skips unknown messages.
             LinkEvent::Msg(
                 FromDaemon::Hello { .. }
                 | FromDaemon::Snapshot { .. }
                 | FromDaemon::Output { .. }
-                | FromDaemon::Profiles { .. }
                 | FromDaemon::Unknown,
             ) => Vec::new(),
         }
@@ -442,11 +457,15 @@ impl Model {
     }
 
     /// Picks a launcher row. The session is created right away under a new name (`t<N>`), and attaching happens after it shows up in the list.
-    /// `Typed` opens the input box.
+    /// `Typed` opens the input box. A profile that isn't logged in doesn't start, and the message says how to log in.
     pub fn launch(&mut self, choice: Choice) -> Vec<Effect> {
         self.message = None;
         if choice == Choice::Typed {
             self.typing = true;
+            return Vec::new();
+        }
+        if let Some(refusal) = launch::refusal(choice.account(), &self.profiles) {
+            self.message = Some(refusal);
             return Vec::new();
         }
         // While waiting for the answer to an earlier `New`, don't accept another. This keeps two sends under the same name from tangling.
@@ -464,26 +483,35 @@ impl Model {
         }
         let project = self.project().to_path_buf();
         let name = launch::next_name(&self.sessions, &project);
-        match launch::new_session(choice, &name, &project) {
+        match launch::new_session(&choice, &name, &project, &self.profiles) {
             Some(spec) => self.create(spec),
             None => Vec::new(),
         }
     }
 
-    /// Creates a session from the input box's text (`view::parse_new` format). If it is wrong, it shows the reason and leaves the box open.
+    /// Creates a session from the input box's text (`view::parse_new` format). If it is wrong, or names a profile that isn't logged
+    /// in, it shows the reason and leaves the box open.
     pub fn submit_typed(&mut self, text: &str) -> Vec<Effect> {
         if !self.connected {
             self.message = Some(NOT_CONNECTED.into());
             return Vec::new();
         }
-        match view::parse_new(text, self.project(), self.labels.profiles()) {
+        let spec = view::parse_new(text, self.project(), &self.profiles)
+            .map_err(|e| format!("{e:#}"))
+            .and_then(
+                |spec| match launch::refusal(spec.account.as_deref(), &self.profiles) {
+                    Some(refusal) => Err(refusal),
+                    None => Ok(spec),
+                },
+            );
+        match spec {
             Ok(spec) => {
                 self.typing = false;
                 self.message = None;
                 self.create(spec)
             }
-            Err(e) => {
-                self.message = Some(format!("{e:#}"));
+            Err(message) => {
+                self.message = Some(message);
                 Vec::new()
             }
         }
@@ -749,6 +777,7 @@ pub fn status_text(s: &SessionInfo) -> (&str, bool) {
 pub(crate) mod tests {
     use super::*;
     use alacritty_terminal::grid::Dimensions;
+    use mine_core::profiles::ProfileKind;
     use mine_core::session::{Kind, Meta, Restore};
 
     fn s(project: &str, name: &str, state: SessionState) -> SessionInfo {
@@ -772,35 +801,43 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn reload_labels_picks_up_new_aliases_and_logins() {
-        let dir = tempfile::tempdir().unwrap();
-        let home = dir.path().join("home");
-        let state = State {
-            root: dir.path().join("state"),
-        };
-        std::fs::create_dir_all(&home).unwrap();
-        std::fs::create_dir_all(&state.root).unwrap();
+    fn profiles_from_the_daemon_replace_the_last_list() {
         let mut m = Model::new(PathBuf::from("/p"));
-        // Before reading, it is the id as is.
-        assert_eq!(m.labels.get("claude-a"), "claude-a");
-        // The only thing that changes on the first read is codex's automatic name.
-        assert!(m.reload_labels(&state, Some(&home)));
-        assert_eq!(m.labels.get("claude-a"), "claude-a");
-        assert_eq!(m.labels.get("codex"), "Codex");
-        // Re-reading the same content changes nothing (no redraw).
-        assert!(!m.reload_labels(&state, Some(&home)));
-        // When the window is reactivated: a login makes the automatic name appear, and a label makes the label appear.
-        let login = r#"{"oauthAccount":{"emailAddress":"yb@gmail.com"}}"#;
-        std::fs::write(home.join(".claude.json"), login).unwrap();
-        assert!(m.reload_labels(&state, Some(&home)));
-        assert_eq!(m.labels.get("claude-a"), "yb");
-        std::fs::write(
-            state.root.join("config.toml"),
-            "[accounts.claude-a]\nlabel = \"personal\"\n",
-        )
-        .unwrap();
-        assert!(m.reload_labels(&state, Some(&home)));
-        assert_eq!(m.labels.get("claude-a"), "personal");
+        assert!(m.profiles.is_empty());
+        let profiles = |profiles| LinkEvent::Msg(FromDaemon::Profiles { profiles });
+        assert!(m.on_link(profiles(builtin())).is_empty());
+        assert_eq!(m.profiles, builtin());
+        // After a reload the daemon sends the whole list again, and it replaces the old one.
+        let codex = vec![builtin().remove(2)];
+        m.on_link(profiles(codex.clone()));
+        assert_eq!(m.profiles, codex);
+        // A dropped connection keeps the last list.
+        m.on_link(LinkEvent::Disconnected("disconnected".into()));
+        assert_eq!(m.profiles, codex);
+    }
+
+    #[test]
+    fn app_digit_key_starts_profile() {
+        let key = |source: &str| gpui::Keystroke::parse(source).unwrap();
+        let mut m = connected("/p");
+        let two = crate::launcher::choice_of_key(&key("2"), &m.profiles).unwrap();
+        assert_eq!(
+            m.launch(two),
+            [new_msg("/p", "t1", Kind::Claude, Some("claude-b"))]
+        );
+        // A profile that isn't logged in doesn't start, and says how to log in. Enter is the default Claude profile.
+        let mut m = connected("/p");
+        let mut list = builtin();
+        list[0].logged_in = false;
+        m.on_link(LinkEvent::Msg(FromDaemon::Profiles { profiles: list }));
+        let enter = crate::launcher::choice_of_key(&key("enter"), &m.profiles).unwrap();
+        assert_eq!(enter, Choice::Profile("claude-a".into()));
+        assert!(m.launch(enter).is_empty());
+        assert!(m.pending.is_none());
+        assert_eq!(
+            m.message.as_deref(),
+            Some("Not logged in. Run: mine profile login claude-a")
+        );
     }
 
     /// The daemon sent a list. Returns what the model asked for.
@@ -811,10 +848,14 @@ pub(crate) mod tests {
     /// The test's terminal pane size (columns, rows).
     const GRID: (u16, u16) = (80, 24);
 
-    /// An attached model. The terminal pane size is [`GRID`], and the first list is empty, so it doesn't attach to any session on its own.
+    /// An attached model that received the built-in profiles ([`builtin`]). The terminal pane size is [`GRID`], and the first list is
+    /// empty, so it doesn't attach to any session on its own.
     fn connected(project: &str) -> Model {
         let mut m = Model::new(PathBuf::from(project));
         m.on_link(LinkEvent::Connected);
+        m.on_link(LinkEvent::Msg(FromDaemon::Profiles {
+            profiles: builtin(),
+        }));
         assert!(m.set_grid(GRID.0, GRID.1).is_empty());
         assert!(listed(&mut m, Vec::new()).is_empty());
         m
@@ -1199,7 +1240,7 @@ pub(crate) mod tests {
     fn launch_creates_t_n_and_attaches_when_listed() {
         let mut m = connected("/p");
         assert_eq!(
-            m.launch(Choice::ClaudeA),
+            m.launch(Choice::Profile("claude-a".into())),
             [new_msg("/p", "t1", Kind::Claude, Some("claude-a"))]
         );
         // While waiting for an answer, other rows aren't accepted. This keeps two sends under the same name from tangling.
@@ -1215,7 +1256,7 @@ pub(crate) mod tests {
         // The next name is t2. If the daemon refuses, it shows the reason and you can pick again.
         m.new_task();
         assert_eq!(
-            m.launch(Choice::Codex),
+            m.launch(Choice::Profile("codex".into())),
             [new_msg("/p", "t2", Kind::Codex, Some("codex"))]
         );
         m.on_link(LinkEvent::Msg(FromDaemon::Error {
@@ -1223,7 +1264,7 @@ pub(crate) mod tests {
         }));
         assert_eq!(m.message.as_deref(), Some("nope"));
         assert_eq!(
-            m.launch(Choice::ClaudeB),
+            m.launch(Choice::Profile("claude-b".into())),
             [new_msg("/p", "t2", Kind::Claude, Some("claude-b"))]
         );
         assert_eq!(m.message, None);
@@ -1257,7 +1298,7 @@ pub(crate) mod tests {
             [new_msg("/p", "t1", Kind::Shell, None)]
         );
         // Picking while waiting for an answer reports that it is being created.
-        assert!(m.launch(Choice::Codex).is_empty());
+        assert!(m.launch(Choice::Profile("codex".into())).is_empty());
         assert_eq!(m.message.as_deref(), Some("Creating…"));
         // If the shell ends right away, the daemon answers without a session. The list didn't change, so the daemon doesn't announce, and only the answer comes.
         assert!(listed(&mut m, Vec::new()).is_empty());
@@ -1293,34 +1334,55 @@ pub(crate) mod tests {
     #[test]
     fn typed_choice_parses_kind_name_and_model() {
         let mut m = connected("/p");
-        m.labels = labels_from("[profiles.claude-b]\nkind = \"claude\"\n");
+        let mut list = builtin();
+        list.push(profile("team", ProfileKind::Claude, "team", "#98c379"));
+        m.on_link(LinkEvent::Msg(FromDaemon::Profiles { profiles: list }));
         assert!(m.launch(Choice::Typed).is_empty());
         assert!(m.typing && m.pending.is_none());
-        // Wrong input shows the reason and leaves the box open.
+        // Wrong input shows the reason with the usage, and leaves the box open.
         assert!(m.submit_typed("gpt x").is_empty());
         assert!(m.typing);
-        assert!(
-            m.message
-                .as_deref()
-                .unwrap()
-                .contains("Unknown profile: gpt")
-        );
-        let Effect::Send(ToDaemon::New { spec }) = &m.submit_typed("claude-b mine opus")[0] else {
+        let message = m.message.clone().unwrap();
+        assert!(message.contains("Unknown profile: gpt"), "{message}");
+        assert!(message.contains(view::NEW_USAGE), "{message}");
+        // Any profile in the list can be typed, not only the built-in ones.
+        let Effect::Send(ToDaemon::New { spec }) = &m.submit_typed("team t9 opus")[0] else {
             panic!("not a New");
         };
         assert_eq!(
             (
+                spec.kind,
                 spec.name.as_str(),
                 spec.account.as_deref(),
                 spec.model.as_deref()
             ),
-            ("mine", Some("claude-b"), Some("opus"))
+            (Kind::Claude, "t9", Some("team"), Some("opus"))
         );
         assert!(!m.typing && m.message.is_none());
         let p = m.pending.as_ref().unwrap();
         assert_eq!(
             (p.project.as_path(), p.name.as_str()),
-            (Path::new("/p"), "mine")
+            (Path::new("/p"), "t9")
+        );
+    }
+
+    #[test]
+    fn app_typed_form_refuses_a_profile_that_isnt_logged_in() {
+        let mut m = connected("/p");
+        let mut list = builtin();
+        list[1].logged_in = false;
+        m.on_link(LinkEvent::Msg(FromDaemon::Profiles { profiles: list }));
+        m.launch(Choice::Typed);
+        // Like a typing error: nothing is sent, the box stays open, and the message says how to log in.
+        assert!(m.submit_typed("claude-b t9").is_empty());
+        assert!(m.typing && m.pending.is_none());
+        assert_eq!(
+            m.message.as_deref(),
+            Some("Not logged in. Run: mine profile login claude-b")
+        );
+        assert_eq!(
+            m.submit_typed("claude-a t9"),
+            [new_msg("/p", "t9", Kind::Claude, Some("claude-a"))]
         );
     }
 

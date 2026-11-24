@@ -29,7 +29,6 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use copymode::{CopyMode, CopyOut};
 use input::{Action, Cmd, InputParser};
-use mine_core::accounts::Labels;
 use mine_core::conn::Conn;
 use mine_core::keys::KeyModes;
 use mine_core::launch::{self, Choice};
@@ -54,8 +53,6 @@ type Cells = Vec<(u16, u16, Cell)>;
 
 /// Runs the client. Returns `Ok` when it exits via `⌃a d`. The daemon and sessions keep running.
 pub async fn run(state: State, project: PathBuf) -> Result<()> {
-    // Account names are read once at startup. They're read before grabbing the outer terminal so a warning left while reading doesn't corrupt the screen.
-    let labels = Labels::load(&state, std::env::home_dir().as_deref());
     let _tty = tty::Tty::enter()?;
     // Ask before starting the stdin reader thread and finish (R13). Keys that arrive in the meantime are fed first below.
     let (colors, early) = tty::probe_colors();
@@ -71,7 +68,6 @@ pub async fn run(state: State, project: PathBuf) -> Result<()> {
     )))?;
     let mut rx = conn.rx;
     let mut app = App::new(conn.tx, project, terminal.size()?);
-    app.m.labels = labels;
     if let Some((fg, bg)) = colors {
         app.send(ToDaemon::Colors {
             fg: fg.to_string(),
@@ -223,7 +219,7 @@ impl App {
                 toggled: Vec::new(),
                 status: None,
                 launcher: false,
-                labels: Labels::default(),
+                profiles: Vec::new(),
             },
             screen: None,
             tx,
@@ -313,12 +309,16 @@ impl App {
                 self.pending = None;
                 self.say(&message);
             }
-            // The version was checked at connect time, and the other sessions' screens are no longer viewed. Labels are still read
-            // locally (`Labels::load`), so the profile list is unused. The connection already skips unknown messages.
+            // Sent after hello and after every reload: the launcher rows, chips and labels follow the last one.
+            FromDaemon::Profiles { profiles } => {
+                self.m.profiles = profiles;
+                self.dirty = true;
+            }
+            // The version was checked at connect time, and the other sessions' screens are no longer viewed. The connection already
+            // skips unknown messages.
             FromDaemon::Hello { .. }
             | FromDaemon::Snapshot { .. }
             | FromDaemon::Output { .. }
-            | FromDaemon::Profiles { .. }
             | FromDaemon::Unknown => {}
         }
     }
@@ -818,9 +818,13 @@ impl App {
     }
 
     /// Interprets the input of `n` in the launcher and sends `New`. When the new session appears in the list, it attaches (`on_sessions`).
+    /// A profile that isn't logged in is refused like a row's key.
     fn submit_new(&mut self, text: &str) {
-        match view::parse_new(text, self.m.project(), self.m.labels.profiles()) {
-            Ok(spec) => self.create(spec),
+        match view::parse_new(text, self.m.project(), &self.m.profiles) {
+            Ok(spec) => match launch::refusal(spec.account.as_deref(), &self.m.profiles) {
+                Some(refusal) => self.say(&refusal),
+                None => self.create(spec),
+            },
             Err(e) => self.say(&format!("{e:#}")),
         }
     }
@@ -838,7 +842,7 @@ impl App {
                 self.m.launcher = false;
                 self.dirty = true;
             }
-        } else if let Some(choice) = launcher::choice_of_key(bytes) {
+        } else if let Some(choice) = launcher::choice_of_key(bytes, &self.m.profiles) {
             self.launch(choice);
         } else if String::from_utf8_lossy(bytes).chars().any(input::is_hangul) {
             self.hangul_hint();
@@ -857,11 +861,15 @@ impl App {
     }
 
     /// Starts the chosen row. The session is created right away with a new name (`t<N>`), and attaching happens after it appears in the list (`on_sessions`).
+    /// A profile that isn't logged in doesn't start; the status line says how to log in.
     fn launch(&mut self, choice: Choice) {
         if choice == Choice::Typed {
             self.m.prompt = Some(Prompt::New(String::new()));
             self.dirty = true;
             return;
+        }
+        if let Some(refusal) = launch::refusal(choice.account(), &self.m.profiles) {
+            return self.say(&refusal);
         }
         // While waiting for the answer to a `New` sent earlier, don't accept another. Keeps sending the same name again from tangling.
         if self.pending.is_some() {
@@ -869,7 +877,7 @@ impl App {
         }
         let project = self.m.project().to_path_buf();
         let name = launch::next_name(&self.m.sessions, &project);
-        if let Some(spec) = launch::new_session(choice, &name, &project) {
+        if let Some(spec) = launch::new_session(&choice, &name, &project, &self.m.profiles) {
             self.create(spec);
         }
     }
@@ -1049,10 +1057,12 @@ mod tests {
     use super::*;
     use mine_core::session::Kind;
 
-    /// Outer terminal 120x40 with the list open, so the terminal pane is 86x39 at (34, 0). Attached to session `s1`, with `feed` already fed to the screen.
+    /// Outer terminal 120x40 with the list open, so the terminal pane is 86x39 at (34, 0). Attached to session `s1`, with `feed` already
+    /// fed to the screen, and the built-in profiles ([`ui::builtin`]) received.
     fn app(feed: &[u8]) -> (App, UnboundedReceiver<ToDaemon>) {
         let (tx, rx) = unbounded_channel();
         let mut app = App::new(tx, PathBuf::from("/p"), Size::new(120, 40));
+        app.m.profiles = ui::builtin();
         app.m.attached = Some("s1".into());
         let mut screen = Screen::new(86, 39);
         screen.feed(feed);
@@ -1947,18 +1957,25 @@ mod tests {
         }
     }
 
-    /// A client that received the first list saying project `/p` has no sessions at all.
+    /// A client that received the built-in profiles ([`ui::builtin`]) and then the first list saying project `/p` has no sessions at all.
     fn empty_app() -> (App, UnboundedReceiver<ToDaemon>) {
         let (tx, rx) = unbounded_channel();
         let mut app = App::new(tx, PathBuf::from("/p"), Size::new(120, 40));
+        app.on_msg(FromDaemon::Profiles {
+            profiles: ui::builtin(),
+        });
         app.on_msg(FromDaemon::Sessions { sessions: vec![] });
         (app, rx)
     }
 
-    /// A client that received the first list where project `/p`'s sessions are `names`. It attaches to the first row's session, and the `Attach` sent then is drained.
+    /// A client that received the built-in profiles and the first list where project `/p`'s sessions are `names`. It attaches to the
+    /// first row's session, and the `Attach` sent then is drained.
     fn started_app(names: &[&str]) -> (App, UnboundedReceiver<ToDaemon>) {
         let (tx, mut rx) = unbounded_channel();
         let mut app = App::new(tx, PathBuf::from("/p"), Size::new(120, 40));
+        app.on_msg(FromDaemon::Profiles {
+            profiles: ui::builtin(),
+        });
         app.on_msg(FromDaemon::Sessions {
             sessions: names.iter().map(|n| shell(n)).collect(),
         });
@@ -2007,11 +2024,12 @@ mod tests {
     }
 
     #[test]
-    fn b_x_s_start_the_other_kinds_with_the_next_free_name() {
+    fn digit_starts_that_profile() {
         // t1 and t3 exist, so the new name is the free slot t2. `⌃a c` opens the launcher over the attached session.
         for (key, kind, account) in [
-            (b"b", Kind::Claude, Some("claude-b")),
-            (b"x", Kind::Codex, Some("codex")),
+            (b"1", Kind::Claude, Some("claude-a")),
+            (b"2", Kind::Claude, Some("claude-b")),
+            (b"3", Kind::Codex, Some("codex")),
             (b"s", Kind::Shell, None),
         ] {
             let (mut app, mut rx) = started_app(&["t1", "t3"]);
@@ -2021,6 +2039,110 @@ mod tests {
             app.on_input(key);
             assert_eq!(sent(&mut rx), [new_session(kind, account, "t2")], "{key:?}");
         }
+        // The rows follow whatever list the daemon sent last, in its order.
+        let (mut app, mut rx) = empty_app();
+        let mut list = ui::builtin();
+        list.insert(
+            0,
+            ui::profile(
+                "team",
+                mine_core::profiles::ProfileKind::Claude,
+                "team",
+                "#98c379",
+            ),
+        );
+        app.on_msg(FromDaemon::Profiles { profiles: list });
+        app.on_input(b"2");
+        assert_eq!(
+            sent(&mut rx),
+            [new_session(Kind::Claude, Some("claude-a"), "t1")]
+        );
+    }
+
+    #[test]
+    fn not_logged_in_row_refuses() {
+        let (mut app, mut rx) = empty_app();
+        let mut list = ui::builtin();
+        list[0].logged_in = false;
+        list[1].logged_in = false;
+        app.on_msg(FromDaemon::Profiles { profiles: list });
+        app.on_input(b"2");
+        assert!(sent(&mut rx).is_empty());
+        assert_eq!(
+            app.m.message,
+            "Not logged in. Run: mine profile login claude-b"
+        );
+        assert!(app.m.launcher && app.pending.is_none());
+        // Enter on a default profile that isn't logged in refuses the same way; the other rows still start.
+        app.on_input(b"\r");
+        assert!(sent(&mut rx).is_empty());
+        assert_eq!(
+            app.m.message,
+            "Not logged in. Run: mine profile login claude-a"
+        );
+        app.on_input(b"3");
+        assert_eq!(
+            sent(&mut rx),
+            [new_session(Kind::Codex, Some("codex"), "t1")]
+        );
+    }
+
+    #[test]
+    fn before_the_profile_list_arrives_only_shell_and_typed_start() {
+        let (tx, mut rx) = unbounded_channel();
+        let mut app = App::new(tx, PathBuf::from("/p"), Size::new(120, 40));
+        app.on_msg(FromDaemon::Sessions { sessions: vec![] });
+        app.on_input(b"\r");
+        app.on_input(b"1");
+        assert!(sent(&mut rx).is_empty() && app.pending.is_none());
+        app.on_input(b"s");
+        assert_eq!(sent(&mut rx), [new_session(Kind::Shell, None, "t1")]);
+    }
+
+    #[test]
+    fn typed_form_starts_any_profile_and_shows_the_usage_on_error() {
+        let (mut app, mut rx) = empty_app();
+        let mut list = ui::builtin();
+        list.push(ui::profile(
+            "team",
+            mine_core::profiles::ProfileKind::Claude,
+            "team",
+            "#98c379",
+        ));
+        app.on_msg(FromDaemon::Profiles { profiles: list });
+        app.on_input(b"n");
+        app.on_input(b"gpt t9\r");
+        assert!(sent(&mut rx).is_empty());
+        assert!(app.m.message.contains(view::NEW_USAGE), "{}", app.m.message);
+        app.on_input(b"n");
+        app.on_input(b"team t9\r");
+        assert_eq!(
+            sent(&mut rx),
+            [new_session(Kind::Claude, Some("team"), "t9")]
+        );
+    }
+
+    #[test]
+    fn typed_form_refuses_a_profile_that_isnt_logged_in() {
+        let (mut app, mut rx) = empty_app();
+        let mut list = ui::builtin();
+        list[1].logged_in = false;
+        app.on_msg(FromDaemon::Profiles { profiles: list });
+        app.on_input(b"n");
+        app.on_input(b"claude-b t9\r");
+        assert!(sent(&mut rx).is_empty());
+        assert_eq!(
+            app.m.message,
+            "Not logged in. Run: mine profile login claude-b"
+        );
+        assert!(app.pending.is_none());
+        // A shell and a logged-in profile still start from the typed form.
+        app.on_input(b"n");
+        app.on_input(b"claude-a t9\r");
+        assert_eq!(
+            sent(&mut rx),
+            [new_session(Kind::Claude, Some("claude-a"), "t9")]
+        );
     }
 
     #[test]
@@ -2092,7 +2214,6 @@ mod tests {
         app.on_input(b"\x1b");
         assert!(app.m.prompt.is_none() && app.m.launcher);
         // Creates one by typing the profile, name and model.
-        app.m.labels = ui::labels_from("[profiles.claude-b]\nkind = \"claude\"\n");
         app.on_input(b"n");
         app.on_input(b"claude-b mine opus\r");
         let mut spec = new_session(Kind::Claude, Some("claude-b"), "mine");
@@ -2172,10 +2293,10 @@ mod tests {
         let (mut app, _rx) = empty_app();
         // Wide characters are written with a cursor move per cell, so look at the ASCII text only.
         let out = frame(&mut app);
-        assert!(out.contains("claude-b") && out.contains("shell"), "{out:?}");
+        assert!(out.contains("work") && out.contains("shell"), "{out:?}");
         // The status line hint in the launcher.
         assert!(
-            out.contains("↵ claude-a · b claude-b · x codex · s shell"),
+            out.contains("↵ personal · 1–3 profiles · s shell"),
             "{out:?}"
         );
         // Opening status line input with `n` shows the cursor in the status line.

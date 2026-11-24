@@ -15,21 +15,43 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::client::launcher;
-use mine_core::accounts::Labels;
-use mine_core::launch::Choice;
+use mine_core::launch::{self, Choice};
+use mine_core::profiles::ProfileInfo;
 use mine_core::screen::Screen;
 use mine_core::session::{SessionInfo, SessionState};
 use mine_core::view::{self, Group, NEW_USAGE, PROJECT_COLORS, RailItem};
 
-/// Names built from a label config (the contents of `config.toml`). Used by the on-screen string tests. There's no home, so codex is the only automatic name.
+/// A logged-in profile as the daemon sends it. The chip is the label's first letter, uppercased.
 #[cfg(test)]
-pub(super) fn labels_from(config: &str) -> Labels {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("config.toml"), config).unwrap();
-    let state = mine_core::paths::State {
-        root: dir.path().to_path_buf(),
-    };
-    Labels::load(&state, None)
+pub(super) fn profile(
+    id: &str,
+    kind: mine_core::profiles::ProfileKind,
+    label: &str,
+    color: &str,
+) -> ProfileInfo {
+    ProfileInfo {
+        id: id.into(),
+        kind,
+        label: label.into(),
+        color: color.into(),
+        chip: label.chars().next().unwrap().to_uppercase().to_string(),
+        default: false,
+        logged_in: true,
+    }
+}
+
+/// The built-in three, logged in: claude-a `personal` (the default Claude profile), claude-b `work`, and codex `Codex`.
+#[cfg(test)]
+pub(super) fn builtin() -> Vec<ProfileInfo> {
+    use mine_core::profiles::ProfileKind::{Claude, Codex};
+    let mut list = vec![
+        profile("claude-a", Claude, "personal", "#e5c07b"),
+        profile("claude-b", Claude, "work", "#c678dd"),
+        profile("codex", Codex, "Codex", "#56b6c2"),
+    ];
+    list[0].default = true;
+    list[2].default = true;
+    list
 }
 
 /// Client state to draw on screen.
@@ -51,8 +73,8 @@ pub struct Model {
     pub status: Option<String>,
     /// Draws the launcher (`launcher`) in the terminal pane. True when no session is attached and while it's open via `⌃a c`.
     pub launcher: bool,
-    /// Names used to show an account id as text. Read by the client at startup.
-    pub labels: Labels,
+    /// The profiles the daemon sent last (`FromDaemon::Profiles`), in launcher order. Empty until the first list arrives.
+    pub profiles: Vec<ProfileInfo>,
 }
 
 impl Model {
@@ -109,7 +131,7 @@ pub struct Areas {
 
 /// What a mouse position points at. `Rail` is a project rail item, `Group` is a group header (index into `Model::visible_groups`),
 /// `Row` is an index into `Model::sessions`, and `Term` is coordinates inside the terminal pane (0-based).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Hit {
     Rail(usize),
     Group(usize),
@@ -145,7 +167,6 @@ const ALL_BG: Color = rgb(0x3a3d45);
 const ALL_FG: Color = rgb(0xd0d3da);
 const MARK: Color = rgb(0xe6e6e6);
 const YELLOW: Color = rgb(0xe5c07b);
-const PURPLE: Color = rgb(0xc678dd);
 const CYAN: Color = rgb(0x56b6c2);
 const GREEN: Color = rgb(0x98c379);
 pub(super) const MUTED: Color = rgb(0x6b707a);
@@ -197,7 +218,7 @@ pub fn draw(f: &mut Frame, m: &Model, screen: Option<&Screen>) {
     }
     paint_edges(f.buffer_mut(), &a);
     if m.launcher {
-        launcher::draw(f.buffer_mut(), a.term, m.project(), &m.labels);
+        launcher::draw(f.buffer_mut(), a.term, m.project(), &m.profiles);
     } else if let Some(sc) = screen {
         draw_term(f.buffer_mut(), a.term, sc);
         if m.attached.is_some()
@@ -233,7 +254,7 @@ pub fn hit(a: &Areas, m: &Model, col: u16, row: u16) -> Hit {
     if a.term.contains(pos) {
         // While the launcher covers the session pane, only the chosen rows can be clicked.
         if m.launcher {
-            return launcher::hit(a.term, col, row, &m.labels).map_or(Hit::None, Hit::Launch);
+            return launcher::hit(a.term, col, row, &m.profiles).map_or(Hit::None, Hit::Launch);
         }
         return Hit::Term(col - a.term.x, row - a.term.y);
     }
@@ -416,7 +437,7 @@ fn session_line(m: &Model, rail: &[RailItem], i: usize, width: usize) -> Line<'s
         left.push(Span::styled("■ ", color));
     }
     let ended = (s.state == SessionState::Ended).then(|| Span::styled(" Exited", MUTED));
-    let chip = chip(s.meta.account.as_deref());
+    let chip = account_chip(m, s.meta.account.as_deref());
     let fixed = spans_width(&left)
         + ended.as_ref().map_or(0, Span::width)
         + chip.as_ref().map_or(0, Span::width)
@@ -444,16 +465,18 @@ fn session_line(m: &Model, rail: &[RailItem], i: usize, width: usize) -> Line<'s
     }
 }
 
-/// Account chip. claude-a `A` yellow, claude-b `B` purple, codex `C` teal. None for anything else (shell).
-pub(super) fn chip(account: Option<&str>) -> Option<Span<'static>> {
-    let (letter, bg) = match account? {
-        "claude-a" => ("A", YELLOW),
-        "claude-b" => ("B", PURPLE),
-        "codex" => ("C", CYAN),
-        _ => return None,
-    };
-    let style = Style::new().fg(DARK).bg(bg).add_modifier(Modifier::BOLD);
-    Some(Span::styled(letter, style))
+/// A profile's chip: its letter on its color.
+pub(super) fn chip(info: &ProfileInfo) -> Span<'static> {
+    let style = Style::new()
+        .fg(DARK)
+        .bg(rgb(info.rgb()))
+        .add_modifier(Modifier::BOLD);
+    Span::styled(info.chip.clone(), style)
+}
+
+/// The chip of a session's profile. None for a shell, or a profile that isn't in the list.
+fn account_chip(m: &Model, account: Option<&str>) -> Option<Span<'static>> {
+    launch::profile(&m.profiles, account?).map(chip)
 }
 
 fn spans_width(spans: &[Span]) -> usize {
@@ -623,9 +646,15 @@ fn draw_status(f: &mut Frame, area: Rect, m: &Model) {
                 Some(s) => {
                     let path = format!("{}/{}", s.meta.project.display(), s.meta.name);
                     left.push(Span::raw(path));
+                    // The profile's label and chip; a profile that isn't in the list shows its id.
                     if let Some(account) = &s.meta.account {
                         left.push(sep());
-                        left.push(Span::raw(m.labels.get(account).to_string()));
+                        let info = launch::profile(&m.profiles, account);
+                        left.push(Span::raw(info.map_or(account, |p| &p.label).clone()));
+                        if let Some(info) = info {
+                            left.push(Span::raw(" "));
+                            left.push(chip(info));
+                        }
                     }
                 }
                 // With no attached session, show the selected project's full path (instead of showing the icon name).
@@ -637,7 +666,7 @@ fn draw_status(f: &mut Frame, area: Rect, m: &Model) {
             }
             if m.message.is_empty() {
                 let keys = if m.launcher {
-                    launcher::keys(&m.labels)
+                    launcher::keys(&m.profiles)
                 } else {
                     KEYS.to_string()
                 };
@@ -719,7 +748,7 @@ mod tests {
             toggled: Vec::new(),
             status: None,
             launcher: false,
-            labels: Labels::default(),
+            profiles: builtin(),
         }
     }
 
@@ -787,7 +816,7 @@ mod tests {
         assert!(text(&buf).contains("◆ Needs approval"));
         assert!(text(&buf).contains("Approve npm run deploy?"));
         assert_eq!(cell(&buf, 1, 1).symbol(), "∗");
-        assert!(row_of(&buf, "billing").ends_with("B"));
+        assert!(row_of(&buf, "billing").ends_with("W"));
     }
 
     #[test]
@@ -816,7 +845,7 @@ mod tests {
         let buf = render(&m, 100, 20);
         assert_eq!(row_text(&buf, 0).trim(), "kyoto");
         assert!(row_of(&buf, "gone").contains("gone Exited"));
-        assert!(row_of(&buf, "gone").ends_with('A'));
+        assert!(row_of(&buf, "gone").ends_with('P'));
         assert!(text(&buf).contains("▸ ○ Idle"));
         assert!(!text(&buf).contains("core"));
         m.filter = None;
@@ -938,26 +967,78 @@ mod tests {
     }
 
     #[test]
-    fn status_line_and_launcher_hint_show_account_labels() {
+    fn status_line_and_launcher_hint_show_profile_labels() {
         let mut m = kyoto();
-        m.labels = labels_from("[accounts.claude-b]\nlabel = \"Work\"\n");
         m.attached = Some("k-billing".into());
         let status = row_text(&render(&m, 140, 20), 19);
         assert!(
-            status.starts_with("mine │ /p/kyoto/billing │ Work"),
+            status.starts_with("mine │ /p/kyoto/billing │ work W"),
             "{status}"
         );
         assert!(!status.contains("claude-b"), "{status}");
-        // A codex session has an automatic name.
         m.attached = Some("k-ui".into());
         let status = row_text(&render(&m, 140, 20), 19);
-        assert!(status.starts_with("mine │ /p/kyoto/ui │ Codex"), "{status}");
+        assert!(
+            status.starts_with("mine │ /p/kyoto/ui │ Codex C"),
+            "{status}"
+        );
+        // A session whose profile isn't in the list shows its id and no chip.
+        m.profiles.retain(|p| p.id != "codex");
+        let status = row_text(&render(&m, 140, 20), 19);
+        assert!(
+            status.starts_with("mine │ /p/kyoto/ui │ codex  "),
+            "{status}"
+        );
         // The launcher rows and key hints use the same names.
+        m.profiles = builtin();
         m.launcher = true;
         let buf = render(&m, 140, 20);
-        assert!(row_of(&buf, "↵").contains("↵  claude-a"));
-        assert!(row_of(&buf, "b  Work").ends_with("B"));
-        assert!(row_text(&buf, 19).ends_with("↵ claude-a · b Work · x Codex · s shell"));
+        assert!(row_of(&buf, "1  personal").ends_with("P"));
+        assert!(row_of(&buf, "2  work").ends_with("W"));
+        assert!(row_text(&buf, 19).ends_with("↵ personal · 1–3 profiles · s shell"));
+        // Before the list arrives only shell is offered.
+        m.profiles.clear();
+        let status = row_text(&render(&m, 140, 20), 19);
+        assert!(
+            status.ends_with(" s shell") && !status.contains('↵'),
+            "{status}"
+        );
+    }
+
+    #[test]
+    fn chip_uses_profile_color() {
+        let mut m = model(vec![s("/p/kyoto", "deploy", Idle, "zeta", None)]);
+        m.profiles = vec![profile(
+            "zeta",
+            mine_core::profiles::ProfileKind::Claude,
+            "ops",
+            "#123456",
+        )];
+        m.attached = Some("k-deploy".into());
+        let buf = render(&m, 140, 20);
+        // The list row ends with the profile's chip letter on the profile's color.
+        let y = y_of(&buf, "deploy");
+        let x = (0..LIST_W + RAIL_W)
+            .rev()
+            .find(|&x| cell(&buf, x, y).symbol() != " ")
+            .unwrap();
+        assert_eq!(cell(&buf, x, y).symbol(), "O");
+        assert_eq!(cell(&buf, x, y).bg, Color::Rgb(0x12, 0x34, 0x56));
+        // The status line carries the same chip after the label.
+        let status = row_text(&buf, 19);
+        assert!(
+            status.starts_with("mine │ /p/kyoto/deploy │ ops O"),
+            "{status}"
+        );
+        let x = status.chars().position(|c| c == 'O').unwrap() as u16;
+        assert_eq!(cell(&buf, x, 19).bg, Color::Rgb(0x12, 0x34, 0x56));
+        // A session on a profile that isn't in the list has no chip.
+        m.profiles.clear();
+        assert!(
+            row_of(&render(&m, 140, 20), "deploy")
+                .trim_end()
+                .ends_with("deploy")
+        );
     }
 
     #[test]
@@ -967,7 +1048,7 @@ mod tests {
         let buf = render(&m, 140, 20);
         let status = row_text(&buf, 19);
         assert!(
-            status.starts_with("mine │ /p/kyoto/billing │ claude-b"),
+            status.starts_with("mine │ /p/kyoto/billing │ work"),
             "{status}"
         );
         assert!(status.ends_with("d detach"), "{status}");
@@ -1107,20 +1188,23 @@ mod tests {
         let buf = render_with_screen(&m, &sc, 100, 20);
         // The launcher is drawn in the terminal pane instead of the session screen.
         assert!(!text(&buf).contains("hello"));
-        assert!(row_of(&buf, "claude-a").contains("↵  claude-a"));
-        assert!(row_text(&buf, 19).ends_with("↵ claude-a · b claude-b · x codex · s shell"));
+        assert!(row_of(&buf, "personal").contains("1  personal"));
+        assert!(row_text(&buf, 19).ends_with("↵ personal · 1–3 profiles · s shell"));
         // Mouse: a chosen row is `Launch`; the rest of the pane isn't passed to the session.
-        let y = y_of(&buf, "claude-b");
+        let y = y_of(&buf, "work");
         let x = (0..100)
-            .find(|&x| cell(&buf, x, y).symbol() == "b")
+            .find(|&x| cell(&buf, x, y).symbol() == "2")
             .unwrap();
-        assert_eq!(hit(&a, &m, x, y), Hit::Launch(Choice::ClaudeB));
+        assert_eq!(
+            hit(&a, &m, x, y),
+            Hit::Launch(Choice::Profile("claude-b".into()))
+        );
         assert_eq!(hit(&a, &m, a.term.x, a.term.y), Hit::None);
         // Turning it off returns to the session screen and the usual hints.
         m.launcher = false;
         m.attached = Some("k-x".into());
         let buf = render_with_screen(&m, &sc, 100, 20);
-        assert!(text(&buf).contains("hello") && !text(&buf).contains("claude-a"));
+        assert!(text(&buf).contains("hello") && !text(&buf).contains("personal"));
         assert!(row_text(&buf, 19).ends_with("d detach"));
         assert_eq!(hit(&a, &m, a.term.x, a.term.y), Hit::Term(0, 0));
     }

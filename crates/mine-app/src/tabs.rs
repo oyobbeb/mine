@@ -52,7 +52,7 @@ pub fn render(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
                 )
             })
             .child(s.meta.name.clone())
-            .children(account_chip(s.meta.account.as_deref()))
+            .children(account_chip(s.meta.account.as_deref(), &m.profiles))
             .on_click(cx.listener(move |ws, _, window, cx| ws.attach(&id, window, cx)))
     });
     let plus = div()

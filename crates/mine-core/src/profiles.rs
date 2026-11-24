@@ -457,6 +457,17 @@ pub struct ProfileInfo {
     pub logged_in: bool,
 }
 
+impl ProfileInfo {
+    /// `color` as `0xrrggbb`, for drawing the chip. A color that isn't `#rrggbb` (a daemon from another build) is gray.
+    pub fn rgb(&self) -> u32 {
+        self.color
+            .strip_prefix('#')
+            .filter(|hex| hex.len() == 6 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+            .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+            .unwrap_or(0x808080)
+    }
+}
+
 /// The display data of every profile, in list order.
 ///
 /// `user_home` is the user's home directory (`~`). Without it, the profiles at the CLI's default home (and any `~` path) can't be
@@ -936,6 +947,13 @@ mod tests {
         let chip = |id: &str| infos.iter().find(|i| i.id == id).unwrap().chip.clone();
         assert_eq!(chip("personal"), "P");
         assert_eq!(chip("a"), "A");
+        // Clients draw the color as a number; anything that isn't `#rrggbb` is gray.
+        let mut info = infos[2].clone();
+        assert_eq!(info.rgb(), 0x123456);
+        for bad in ["123456", "#12345", "#12345g", "#+12345", "", "#1234567"] {
+            info.color = bad.into();
+            assert_eq!(info.rgb(), 0x808080, "{bad:?}");
+        }
     }
 
     #[test]

@@ -3875,7 +3875,6 @@ dependencies = [
  "gpui",
  "gpui-component",
  "mine-core",
- "tempfile",
 ]
 
 [[package]]

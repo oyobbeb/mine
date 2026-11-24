@@ -99,7 +99,6 @@ fn root_view(cx: &mut App) -> AnyView {
     let mut model = Model::new(current);
     model.home_fallback = home_fallback;
     model.registered = project::registered(&state).unwrap_or_default();
-    model.reload_labels(&state, std::env::home_dir().as_deref());
     let link = link::start(state.clone(), mine, login);
     cx.new(|cx| Workspace::new(model, state, link, cx)).into()
 }
