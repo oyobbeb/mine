@@ -98,6 +98,16 @@ const FEATURES: &[&str] = &["profiles", "presence", "ask"];
 const PROFILES_SINCE: u32 = 4;
 /// How long a permission request is held before it goes to Claude's own prompt. `MINE_ASK_TIMEOUT_MS` overrides it (tests).
 const ASK_TIMEOUT: Duration = Duration::from_secs(120);
+/// A lone ⌃C or Esc press, as the whole `Input`: the legacy bytes, then what the app's encoder and the TUI's outer terminal send
+/// under kitty keyboard flag 1 (Esc, also spelled with its default modifier, and ⌃C) and modifyOtherKeys 2 (⌃C; Esc stays legacy).
+const INTERRUPTS: &[&[u8]] = &[
+    b"\x03",
+    b"\x1b",
+    b"\x1b[27u",
+    b"\x1b[27;1u",
+    b"\x1b[99;5u",
+    b"\x1b[27;5;99~",
+];
 
 // ponytail: global lock; per-session locks once there are hundreds of sessions
 type Shared = Arc<Mutex<Daemon>>;
@@ -1612,8 +1622,8 @@ impl Daemon {
     }
 
     /// `Input`: sends it to the holder process. If it was waiting for approval, records an `Input` event. If a claude or codex session
-    /// was Working and the input is exactly one ⌃C or one Esc, records an `Interrupt`: neither CLI fires a `Stop` for that, so the
-    /// session would stay Working forever. An arrow key (`\x1b[A`) or a paste that contains a ⌃C is longer than one byte and is no interrupt.
+    /// was Working and the input is exactly one ⌃C or one Esc (`INTERRUPTS`), records an `Interrupt`: neither CLI fires a `Stop` for that, so the
+    /// session would stay Working forever. An arrow key (`\x1b[A`), ⌃A (`\x1b[97;5u`) or a paste that contains a ⌃C is no interrupt.
     ///
     /// A focus report (exactly `\x1b[I` or `\x1b[O`), which the TUI passes on to a session that turned mode 1004 on, isn't typing:
     /// it reaches the app, but records no event, takes no size and isn't input. Typed keys never arrive as these bytes: the TUI
@@ -1643,12 +1653,12 @@ impl Daemon {
         if let Some(size) = size {
             s.resize(size);
         }
-        let bare_interrupt = matches!(data.as_slice(), [0x03] | [0x1b]);
+        let interrupt = INTERRUPTS.contains(&data.as_slice());
         s.send_hold(HoldIn::Input { data });
         let kind = match s.state {
             _ if !typed => return,
             SessionState::Approval => EventKind::Input,
-            SessionState::Working if bare_interrupt && s.meta.kind != Kind::Shell => {
+            SessionState::Working if interrupt && s.meta.kind != Kind::Shell => {
                 EventKind::Interrupt
             }
             _ => return,

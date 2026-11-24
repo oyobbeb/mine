@@ -942,6 +942,44 @@ fn bare_ctrl_c_while_working_goes_idle() {
     }
 }
 
+/// `data`, sent as the whole input to a Working Claude session, makes it Idle.
+fn interrupts(data: &[u8]) {
+    let (_bin, st, mut c) = working_session("claude");
+    input_and_sync(&mut c, data);
+    wait_until(|| ls(&st)[0][4] == "idle");
+}
+
+// ⌃C and Esc as the app and the TUI's outer terminal encode them under kitty keyboard (flag 1) and modifyOtherKeys 2.
+#[test]
+fn kitty_ctrl_c_while_working_goes_idle() {
+    interrupts(b"\x1b[99;5u");
+}
+
+#[test]
+fn modify_other_keys_ctrl_c_while_working_goes_idle() {
+    interrupts(b"\x1b[27;5;99~");
+}
+
+#[test]
+fn kitty_esc_while_working_goes_idle() {
+    interrupts(b"\x1b[27u");
+}
+
+#[test]
+fn kitty_esc_with_explicit_modifier_while_working_goes_idle() {
+    interrupts(b"\x1b[27;1u");
+}
+
+#[test]
+fn other_kitty_ctrl_key_keeps_working() {
+    let (_bin, st, mut c) = working_session("claude");
+    // ⌃A, and an encoded ⌃C followed by more input.
+    for data in [&b"\x1b[97;5u"[..], b"\x1b[99;5ua"] {
+        input_and_sync(&mut c, data);
+        assert_eq!(ls(&st)[0][4], "working", "{data:?}");
+    }
+}
+
 #[test]
 fn escape_sequence_keeps_working() {
     let (_bin, st, mut c) = working_session("claude");
