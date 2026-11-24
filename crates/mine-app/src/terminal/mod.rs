@@ -290,7 +290,7 @@ impl Workspace {
                 });
                 self.term.find = Some(FindBox {
                     input: input.clone(),
-                    state: FindState::default(),
+                    state: FindState::new(self.model.attached.clone()),
                     _events: events,
                 });
                 input
@@ -345,6 +345,23 @@ impl Workspace {
         self.term.find = None;
         window.focus(&self.term.focus);
         cx.notify();
+    }
+
+    /// Closes a find box left open for another session (a switch, or the attached session vanishing). Called while
+    /// drawing, so it also covers switches the daemon causes. The launcher takes focus itself (`fix_focus`).
+    pub(crate) fn close_stale_find(&mut self, window: &mut Window) {
+        let attached = self.model.attached.as_deref();
+        if self
+            .term
+            .find
+            .as_ref()
+            .is_some_and(|f| !f.state.searches(attached))
+        {
+            self.term.find = None;
+            if !self.model.launcher_open() {
+                window.focus(&self.term.focus);
+            }
+        }
     }
 
     /// A key with an encoding of its own goes to the session in the session's key modes, and stops here so the input
@@ -543,7 +560,10 @@ fn layout(
         ws.term.geometry = Some(geometry);
         let effects = ws.model.set_grid(cols, rows);
         ws.apply(effects);
-        let composing = ws.term.ime.marked().zip(ws.ime_cell()).map(composing_run);
+        let composing = (ws.term.ime)
+            .shown(ws.model.attached.as_deref())
+            .zip(ws.ime_cell())
+            .map(composing_run);
         let Some(screen) = &ws.model.screen else {
             return (Vec::new(), None, None, Vec::new());
         };
@@ -703,7 +723,8 @@ impl EntityInputHandler for Workspace {
         cx.notify();
     }
 
-    /// Committed text (a finished syllable, or a plain character) goes to the session.
+    /// Committed text (a finished syllable, or a plain character) goes to the session, unless it ends a composition
+    /// started in another session ([`Ime`]).
     fn replace_text_in_range(
         &mut self,
         _: Option<Range<usize>>,
@@ -711,7 +732,7 @@ impl EntityInputHandler for Workspace {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let bytes = self.term.ime.commit(text);
+        let bytes = self.term.ime.commit(text, self.model.attached.as_deref());
         self.term_send(bytes, cx);
     }
 
@@ -723,7 +744,7 @@ impl EntityInputHandler for Workspace {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.term.ime.mark(text);
+        self.term.ime.mark(text, self.model.attached.as_deref());
         cx.notify();
     }
 
@@ -1053,9 +1074,9 @@ mod tests {
         let mut sent = Vec::new();
         for (k, marked) in [("g", "ㅎ"), ("k", "하"), ("s", "한")] {
             sent.extend(keys::encode_key(&key(k, Some(k)), &modes));
-            ime.mark(marked);
+            ime.mark(marked, Some("s"));
         }
-        sent.push(ime.commit("한"));
+        sent.push(ime.commit("한", Some("s")));
         sent.extend(keys::encode_key(&key("enter", Some("\n")), &modes));
         assert_eq!(sent, ["한".as_bytes(), b"\r"]);
     }

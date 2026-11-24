@@ -14,9 +14,24 @@ pub struct FindState {
     pub query: String,
     pub hits: Vec<(usize, usize)>,
     pub current: usize,
+    /// The session the box was opened for (`Model::attached`). Its matches and count are that session's.
+    session: Option<String>,
 }
 
 impl FindState {
+    pub fn new(session: Option<String>) -> FindState {
+        FindState {
+            session,
+            ..FindState::default()
+        }
+    }
+
+    /// Whether this is the find box of `attached`. When another session is attached, the box closes rather than
+    /// showing the old session's count.
+    pub fn searches(&self, attached: Option<&str>) -> bool {
+        self.session.as_deref() == attached
+    }
+
     /// Finds the query in `lines`, ignoring case. The current match is the newest one, nearest the live screen.
     pub fn search(&mut self, lines: &[String]) {
         self.hits = find(lines, &self.query);
@@ -150,6 +165,15 @@ mod tests {
         let mut s = Screen::new(cols, rows);
         s.feed(bytes);
         s
+    }
+
+    #[test]
+    fn find_box_belongs_to_the_session_it_was_opened_for() {
+        let f = FindState::new(Some("a".into()));
+        assert!(f.searches(Some("a")));
+        // Another session attached, or none (the session vanished): the box closes.
+        assert!(!f.searches(Some("b")));
+        assert!(!f.searches(None));
     }
 
     #[test]

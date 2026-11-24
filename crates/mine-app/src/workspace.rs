@@ -405,6 +405,7 @@ impl Render for Workspace {
         if !self.model.typing {
             self.close_typed(window, cx);
         }
+        self.close_stale_find(window);
         self.watch_activation(window, cx);
         self.fix_focus(window, cx);
         frame()
