@@ -4,6 +4,7 @@
 //! reopens the window with the same view. ⌘Q quits only the app; the daemon and sessions stay.
 
 mod actions;
+mod appearance;
 mod launcher;
 mod model;
 mod sidebar;
@@ -52,7 +53,7 @@ fn main() {
     });
     app.run(|cx| {
         gpui_component::init(cx);
-        theme::install(cx);
+        theme::install(cx, &theme::Theme::dark_glass());
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.bind_keys(actions::bindings());
         cx.set_menus(vec![Menu {

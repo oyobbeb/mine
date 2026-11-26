@@ -203,7 +203,8 @@ impl Profiles {
     }
 
     /// Builds the list from the text of `config.toml` (`None` for no file). `state` is only used to see whether the built-in
-    /// `claude-b` exists.
+    /// `claude-b` exists. Only `[profiles]` and `[accounts]` are read: the rest of the file, such as the desktop app's `[appearance]`,
+    /// is ignored without a warning.
     pub fn parse(text: Option<&str>, state: &State) -> (Profiles, Vec<String>) {
         let mut warnings = Vec::new();
         let mut broken = None;
@@ -856,6 +857,31 @@ mod tests {
             ProfileKind::Codex.shareable(),
             ["AGENTS.md", "prompts", "config.toml"]
         );
+    }
+
+    #[test]
+    fn appearance_table_is_ignored_by_profiles() {
+        let env = Env::new();
+        // `[appearance]` belongs to the desktop app: no warning, and the profiles are not "broken", whatever it holds.
+        for appearance in [
+            "[appearance]\nmode = \"dark\"\nglass = false\n",
+            "[appearance]\nmode = \"blue\"\n",
+            "appearance = 5\n",
+        ] {
+            env.config(&format!(
+                "{appearance}[profiles.team]\nkind = \"claude\"\n[profiles.zeta]\nkind = \"codex\"\n"
+            ));
+            let (p, warnings) = env.load();
+            assert!(warnings.is_empty(), "{appearance:?}: {warnings:?}");
+            assert_eq!(p.broken, None, "{appearance:?}");
+            assert_eq!(ids(&p), ["team", "zeta"], "{appearance:?}");
+        }
+        // Alone it is the same as no config: the built-in list, still without a warning.
+        env.config("[appearance]\nmode = \"light\"\n");
+        let (p, warnings) = env.load();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(p.broken, None);
+        assert!(p.builtin);
     }
 
     #[test]
