@@ -1755,6 +1755,58 @@ fn reload_keeps_the_last_good_profiles_on_a_broken_config() {
 }
 
 #[test]
+fn broken_config_fixed_by_hand_starts_without_restart() {
+    // `mine profile add/rm` refuse a file that isn't TOML, so the user fixes it by hand and nothing sends `ReloadProfiles`.
+    // The next start rereads it: a new session, and a saved one started again by attaching.
+    for resume in [false, true] {
+        let bin = tmp();
+        let trace = fake_claude(bin.path());
+        let st = state_with_path(bin.path());
+        fs::create_dir_all(&st.root).unwrap();
+        let config = st.root.join("config.toml");
+        fs::write(&config, "[profiles.work]\nkind = \"claude\"\nlabel = \"W\n").unwrap();
+        let id = saved_claude(&st, "c", "work");
+        ls(&st); // Starts the daemon on the broken file.
+        let mut c = client(&st);
+        let mut other = client(&st);
+        let start = |c: &mut Client| {
+            if resume {
+                return attach_error(c, &id);
+            }
+            c.send(&ToDaemon::New {
+                spec: NewSession {
+                    project: st.project.clone(),
+                    name: "n".into(),
+                    kind: Kind::Claude,
+                    account: None,
+                    model: None,
+                },
+            });
+            recv_until(c, |m| match m {
+                FromDaemon::Error { message } => Some(Some(message)),
+                FromDaemon::Sessions { sessions } => {
+                    sessions.iter().any(|s| s.meta.name == "n").then_some(None)
+                }
+                _ => None,
+            })
+        };
+        let error = start(&mut c).expect("a start on the broken config");
+        assert!(error.contains("config.toml line 3"), "{error}");
+        assert!(!trace.exists());
+        fs::write(
+            &config,
+            "[profiles.work]\nkind = \"claude\"\nlabel = \"W\"\n",
+        )
+        .unwrap();
+        assert_eq!(start(&mut c), None, "resume = {resume}");
+        wait_until(|| trace.exists());
+        // Other clients get the fixed list, as after `ReloadProfiles`.
+        let lists = profile_ids_after_list(&mut other);
+        assert_eq!(lists.last(), Some(&vec!["work".to_string()]), "{lists:?}");
+    }
+}
+
+#[test]
 fn session_without_a_profile_gets_the_default_of_its_kind() {
     // The id is stored at creation, so a session keeps its login even after the default of its kind moves to another profile.
     let bin = tmp();

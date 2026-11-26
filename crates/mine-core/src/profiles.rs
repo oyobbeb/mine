@@ -223,7 +223,9 @@ impl Profiles {
             }
         };
         let (mut list, is_builtin) = match table.get("profiles") {
+            // An empty `[profiles]` header moves no id, so it is the same as none.
             None => (builtin(state), true),
+            Some(toml::Value::Table(entries)) if entries.is_empty() => (builtin(state), true),
             Some(toml::Value::Table(entries)) => {
                 let mut list: Vec<Profile> = Vec::new();
                 for (id, value) in entries {
@@ -874,7 +876,6 @@ mod tests {
         // Valid TOML that isn't a usable table doesn't strand the user either.
         for text in [
             "profiles = 5\n",
-            "[profiles]\n",
             "[profiles]\nteam = 3\n",
             "[profiles.team]\nkind = \"gpt\"\n",
         ] {
@@ -904,7 +905,6 @@ mod tests {
                 "line 3",
             ),
             ("profiles = 5\n", "must be a table"),
-            ("[profiles]\n", "no usable profile"),
             (
                 "[profiles.claude-b]\nkind = \"claude\"\nhome = \"work\"\n",
                 "no usable profile",
@@ -932,6 +932,19 @@ mod tests {
         assert_eq!(p.usable("w").unwrap().id, "w");
         let e = p.usable("claude-b").unwrap_err().to_string();
         assert_eq!(e, "Unknown profile: claude-b");
+    }
+
+    #[test]
+    fn empty_profiles_table_is_builtins_not_broken() {
+        // An empty `[profiles]` header moves no id, so it is the built-in list, like no table, and starts sessions.
+        let env = Env::new();
+        env.config("[profiles]\n");
+        let (p, warnings) = env.load();
+        assert_eq!(p.broken, None);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(p.builtin);
+        assert_eq!(ids(&p), ["claude-a", "codex"]);
+        assert_eq!(p.usable("claude-a").unwrap().id, "claude-a");
     }
 
     #[test]

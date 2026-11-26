@@ -596,6 +596,7 @@ async fn create(shared: &Shared, spec: NewSession) -> Result<()> {
                 spec.name
             );
         }
+        d.reread_if_broken();
         // No profile means the default of the kind. Its id is stored now, so the session keeps that login if the default moves.
         let default = match spec.kind {
             Kind::Claude => d.profiles.default_of(ProfileKind::Claude),
@@ -1319,6 +1320,14 @@ impl Daemon {
         }
     }
 
+    /// Before a profile session starts: while the config is broken, rereads it, so a file fixed by hand (which `mine profile add`
+    /// and `rm` can't do for a broken one) is used without `ReloadProfiles` or a daemon restart.
+    fn reread_if_broken(&mut self) {
+        if self.profiles.broken.is_some() {
+            self.reload_profiles();
+        }
+    }
+
     /// Puts it in the client queue. If the queue is full or closed, drops that client.
     fn send(&mut self, client: u64, msg: FromDaemon) {
         let Some(c) = self.clients.get(&client) else {
@@ -1579,6 +1588,7 @@ impl Daemon {
             eprintln!("{e:#}");
         }
         let meta = s.meta.clone();
+        self.reread_if_broken();
         Some((self.start(), meta))
     }
 
