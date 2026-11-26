@@ -6,8 +6,8 @@
 //! clip the shadow away); put it on a child.
 
 use gpui::{
-    BorderStyle, Corners, Div, Hsla, IntoElement, ParentElement, Pixels, Styled, canvas, div, px,
-    quad,
+    BorderStyle, Corners, Div, Hsla, InteractiveElement, IntoElement, ParentElement, Pixels,
+    Stateful, StatefulInteractiveElement, Styled, canvas, div, px, quad,
 };
 
 use crate::theme::{Theme, Tint};
@@ -30,22 +30,23 @@ const ROW_RADIUS: f32 = 16.;
 /// What `rounded_full` uses. GPUI clamps a radius to half the shorter side, so it becomes height ÷ 2.
 const FULL_RADIUS: f32 = 9999.;
 
-/// How far each kind of shadow spreads (its Gaussian's sigma, in px; it fades out by 3 × that). A panel's is gone before it crosses
-/// the 12 px gap to the next panel; a sheet's is deeper.
-const PANEL_BLUR: f32 = 5.;
+/// How far each kind of shadow spreads (its Gaussian's sigma, in px; it fades out by 3 × that). A panel's is gone 7 px out: the
+/// panels sit 7 px below the tab bar (a 38 px bar centered in the 52 px title row), and a wider one would paint over the bar's
+/// bottom edge. A sheet's is deeper.
+const PANEL_BLUR: f32 = 2.3;
 const SHEET_BLUR: f32 = 10.;
 const CAPSULE_BLUR: f32 = 2.;
 
 /// The task list and the terminal pane: radius 20, `panel` fill, edge and highlight, and a shadow.
 pub fn panel(theme: &Theme) -> Div {
-    floating(theme, theme.panel, PANEL_RADIUS, PANEL_BLUR)
+    floating(theme, theme.panel, PANEL_RADIUS, PANEL_BLUR, theme.shadow)
 }
 
 /// The launcher and dialogs: radius 28, `sheet` fill, and a deeper shadow.
 // ponytail: the launcher restyle (Task 4) is its first user.
 #[allow(dead_code)]
 pub fn sheet(theme: &Theme) -> Div {
-    floating(theme, theme.sheet, SHEET_RADIUS, SHEET_BLUR)
+    floating(theme, theme.sheet, SHEET_RADIUS, SHEET_BLUR, theme.shadow)
 }
 
 /// A capsule (fully rounded): the tab bar, buttons. `strong` is the active or primary one (`panel_strong`); it then stands out by its
@@ -56,25 +57,101 @@ pub fn capsule(theme: &Theme, strong: bool) -> Div {
     } else {
         theme.panel
     };
-    floating(theme, fill, FULL_RADIUS, CAPSULE_BLUR)
+    floating(theme, fill, FULL_RADIUS, CAPSULE_BLUR, theme.shadow)
 }
 
 /// A list row: radius 16. Selected, it gets `panel_strong` plus the edge outline and the highlight line, because in light glass
 /// `panel_strong` is barely brighter than the panel under it. Unselected, the outline is clear, so selecting doesn't move it.
-// ponytail: the task list and launcher restyles (Tasks 3, 4) are its first users.
-#[allow(dead_code)]
 pub fn row(theme: &Theme, selected: bool) -> Div {
-    let row = div().relative().rounded(px(ROW_RADIUS)).border_1();
     if selected {
-        row.bg(theme.panel_strong.hsla())
-            .border_color(theme.edge.hsla())
-            .child(highlight(theme, ROW_RADIUS))
+        lit(theme, Some(theme.panel_strong), theme.edge, ROW_RADIUS)
     } else {
-        row.border_color(Hsla::transparent_black())
+        plain(ROW_RADIUS)
     }
 }
 
-fn floating(theme: &Theme, fill: Tint, radius: f32, blur: f32) -> Div {
+/// A row that waits for approval: the `row_pending` fill with a `row_pending_edge` outline, and the highlight line.
+pub fn pending_row(theme: &Theme) -> Div {
+    lit(
+        theme,
+        Some(theme.row_pending),
+        theme.row_pending_edge,
+        ROW_RADIUS,
+    )
+}
+
+/// A capsule in a group of them (a tab, the round "+"): the active one is a strong [`capsule`]; the others are clear, with a clear
+/// outline so that becoming active doesn't move them.
+pub fn pill(theme: &Theme, active: bool) -> Div {
+    if active {
+        capsule(theme, true)
+    } else {
+        plain(FULL_RADIUS)
+    }
+}
+
+/// A clear capsule: no fill, only the edge and the highlight line (Deny, the project filter).
+pub fn clear_capsule(theme: &Theme) -> Div {
+    lit(theme, None, theme.edge, FULL_RADIUS)
+}
+
+/// The one action that matters (Allow): an `accent` capsule with a soft glow in the accent's translucent edge color.
+pub fn accent_capsule(theme: &Theme) -> Div {
+    floating(
+        theme,
+        theme.accent,
+        FULL_RADIUS,
+        CAPSULE_BLUR,
+        theme.row_pending_edge,
+    )
+}
+
+/// How much a pressed control keeps of its look: press dims it slightly.
+const PRESSED: f32 = 0.85;
+
+/// Hover and press for a control without a fill of its own: hover raises it one step, to [`Theme::hover`]; press dims it.
+pub fn hover_fill(control: Stateful<Div>, theme: &Theme) -> Stateful<Div> {
+    let fill = theme.hover().hsla();
+    control
+        .cursor_pointer()
+        .hover(move |s| s.bg(fill))
+        .active(|s| s.opacity(PRESSED))
+}
+
+/// Hover and press for a control that has a fill already (selected, strong, pending or accent). Its stack is at the 0.92 alpha cap
+/// already, so hover lights its edge up to `rim` instead of adding fill. Press dims it.
+pub fn hover_edge(control: Stateful<Div>, rim: Tint) -> Stateful<Div> {
+    let rim = rim.hsla();
+    control
+        .cursor_pointer()
+        .hover(move |s| s.border_color(rim))
+        .active(|s| s.opacity(PRESSED))
+}
+
+/// A surface with no fill and a clear 1 px outline, so it lines up with its lit or strong form.
+fn plain(radius: f32) -> Div {
+    div()
+        .relative()
+        .rounded(px(radius))
+        .border_1()
+        .border_color(Hsla::transparent_black())
+}
+
+/// A surface lit from above, with no shadow: an optional fill, a 1 px `edge` outline and the highlight line.
+fn lit(theme: &Theme, fill: Option<Tint>, edge: Tint, radius: f32) -> Div {
+    let surface = div()
+        .relative()
+        .rounded(px(radius))
+        .border_1()
+        .border_color(edge.hsla())
+        .child(highlight(theme, radius));
+    match fill {
+        Some(fill) => surface.bg(fill.hsla()),
+        None => surface,
+    }
+}
+
+fn floating(theme: &Theme, fill: Tint, radius: f32, blur: f32, shadow_color: Tint) -> Div {
     div()
         .relative()
         .rounded(px(radius))
@@ -82,7 +159,7 @@ fn floating(theme: &Theme, fill: Tint, radius: f32, blur: f32) -> Div {
         .border_1()
         .border_color(theme.edge.hsla())
         .child(highlight(theme, radius))
-        .child(shadow(theme.shadow, radius, blur))
+        .child(shadow(shadow_color, radius, blur))
 }
 
 /// The brighter 1 px line along the top, just inside the edge. GPUI has no inset shadow; a top-only border on a box of the same shape
@@ -192,11 +269,14 @@ mod tests {
         assert_eq!(pad(14.), px(13.));
     }
 
-    /// The rings sit edge to edge from 1 px outside the surface (none inside it, none twice) and fade from half the shadow alpha.
+    /// The rings sit edge to edge from 1 px outside the surface (none inside it, none twice) and fade from half the shadow alpha. A
+    /// panel's stop short of the tab bar, which ends (52 − 38) / 2 = 7 px above the panels.
     #[test]
     fn shadow_rings_fade_out_outside_the_edge() {
         let rings: Vec<_> = rings(0.28, PANEL_BLUR).collect();
-        assert_eq!(rings.len(), 15);
+        let bar = crate::tabs::HEIGHT + 2. * 4.;
+        assert_eq!(rings.len(), 7);
+        assert!(rings.len() as f32 <= (crate::workspace::TITLE_ROW - bar) / 2.);
         assert_eq!(rings[0].0, 1.);
         assert!((rings[0].1 - 0.14).abs() < 0.005, "{rings:?}");
         assert!(

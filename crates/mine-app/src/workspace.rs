@@ -551,10 +551,10 @@ fn center(ws: &Workspace, window: &Window, cx: &mut Context<Workspace>) -> impl 
 
 /// Height of the title-bar row. The traffic lights (`main::TRAFFIC_LIGHTS`) and the tab bar are centered in it.
 pub const TITLE_ROW: f32 = 52.;
-/// Room at each side of the title-bar row, as in the mockup: 20 px padding, the traffic lights' 52 px and an 8 px gap on the left,
-/// mirrored on the right so `title` is centered on the window. (macOS draws its own traffic lights, 14 px with wider spacing than
-/// the mockup's 12 px and 8 px gap, so they end at x 81.)
-const TITLE_ROW_SIDE: f32 = 80.;
+/// Room at each side of the title-bar row: 20 px padding, the traffic lights and the mockup's 8 px gap on the left, mirrored on the
+/// right so `title` is centered on the window. macOS draws its own lights, 14 px with wider spacing than the mockup's 12 px and 8 px
+/// gap, so they end at x 80 (measured), not 72: 80 + 8, rounded up. A full tab bar then stops short of the zoom button.
+const TITLE_ROW_SIDE: f32 = 90.;
 
 /// The whole-window frame: the clear title-bar row with `title` centered in it, and the content below. gpui-component's `Root`
 /// paints the window tint under all of it, so the frame paints no background of its own.

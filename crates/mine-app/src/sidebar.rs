@@ -1,12 +1,15 @@
 //! The left list: New task, the project picker, sessions grouped by state, and Add project. All state lives in `Model`;
 //! this module only draws and wires clicks through to `Workspace`.
+//!
+//! Sizes follow the mockup. Its text uses the browser's normal line height, so the line heights here are what that renders in the
+//! system font (a fallback glyph such as "＋" or "◆" makes the line a pixel taller). GPUI's own default would be 1.618 em.
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AnyElement, Axis, Context, ElementId, FontWeight, Hsla, InteractiveElement, IntoElement,
-    MouseButton, ParentElement, StatefulInteractiveElement, Styled, div, px, rgb,
+    AnyElement, App, Axis, Context, Div, ElementId, FontWeight, Hsla, InteractiveElement,
+    IntoElement, MouseButton, ParentElement, StatefulInteractiveElement, Styled, div, px, rgb,
 };
-use gpui_component::{StyledExt, h_flex, v_flex};
+use gpui_component::{StyledExt, Theme as UiTheme, h_flex, v_flex};
 use mine_core::launch;
 use mine_core::profiles::ProfileInfo;
 use mine_core::session::{SessionInfo, SessionState};
@@ -14,11 +17,16 @@ use mine_core::view::{Group, folder_name};
 
 use crate::glass;
 use crate::model::{self, Model, ProjectItem};
-use crate::theme::{self, CHIP_FG, Theme};
+use crate::theme::{self, Theme};
 use crate::workspace::Workspace;
 
-/// List width, the mockup's 286.
-pub const WIDTH: f32 = 286.;
+/// List width. The mockup's panel is `width: 286px` with 12 px of padding at each side in CSS's content-box sizing, so it renders
+/// 310 wide and its blocks 286.
+pub const WIDTH: f32 = 310.;
+
+/// The gap between the list's blocks, and between a group's header and rows.
+const BLOCK_GAP: f32 = 12.;
+const GROUP_GAP: f32 = 6.;
 
 pub fn render(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
     let m = &ws.model;
@@ -28,8 +36,7 @@ pub fn render(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
     if groups.is_empty() && m.connected {
         list.push(
             div()
-                .px_3()
-                .pt_3()
+                .px(px(6.))
                 .text_size(px(12.))
                 .text_color(t.text_tertiary.hsla())
                 .child("No sessions")
@@ -37,14 +44,11 @@ pub fn render(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
         );
     }
     for (gi, g) in groups.iter().enumerate() {
-        list.push(group_head(gi, g, &t, cx).into_any_element());
+        let mut block = v_flex().gap(px(GROUP_GAP)).child(group_head(gi, g, &t, cx));
         if !g.collapsed {
-            list.extend(
-                g.rows
-                    .iter()
-                    .map(|&i| session_row(m, i, &t, cx).into_any_element()),
-            );
+            block = block.children(g.rows.iter().map(|&i| session_row(m, i, &t, cx)));
         }
+        list.push(block.into_any_element());
     }
     // The panel carries its own shadow outside it, so the clipping is on the content inside.
     glass::panel(&t)
@@ -59,18 +63,20 @@ pub fn render(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
                 // The mockup's panel: padding 14 × 12 and 12 between its blocks.
                 .py(glass::pad(14.))
                 .px(glass::pad(12.))
-                .gap(px(12.))
+                .gap(px(BLOCK_GAP))
                 .when_some(m.offline.as_deref(), |this, reason| {
                     this.child(offline_banner(reason, &t))
                 })
                 .child(new_task(&t, cx))
                 .child(project_picker(m, ws.picker_open, &t, cx))
+                // The groups take the room left above Add project, the mockup's spacer.
                 .child(
-                    v_flex()
-                        .id("groups")
-                        .flex_1()
-                        .min_h_0()
-                        .child(div().pb_2().children(list).scrollable(Axis::Vertical)),
+                    v_flex().id("groups").flex_1().min_h_0().child(
+                        v_flex()
+                            .gap(px(BLOCK_GAP))
+                            .children(list)
+                            .scrollable(Axis::Vertical),
+                    ),
                 )
                 .child(add_project(&t, cx)),
         )
@@ -98,32 +104,32 @@ fn offline_banner(reason: &str, t: &Theme) -> impl IntoElement {
         )
 }
 
-/// "＋ New task". Clicking opens the launcher (same as ⌘N).
+/// "＋ New task ⌘N", a strong capsule. Clicking opens the launcher (same as ⌘N).
 fn new_task(t: &Theme, cx: &mut Context<Workspace>) -> impl IntoElement {
-    h_flex()
+    let capsule = glass::capsule(t, true)
         .id("new-task")
-        .px_2()
-        .h(px(30.))
-        .rounded(px(6.))
-        .text_size(px(13.))
-        .cursor_pointer()
-        .hover(|s| s.bg(t.panel_strong.hsla()))
-        .child(
-            div()
-                .flex_1()
-                .text_color(t.text.hsla())
-                .child("＋ New task"),
-        )
+        .flex()
+        .items_center()
+        .justify_between()
+        .py(glass::pad(10.))
+        .px(glass::pad(14.))
+        .line_height(px(18.))
+        .text_size(px(14.))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(t.text.hsla())
+        .child("＋ New task")
         .child(
             div()
                 .text_size(px(12.))
-                .text_color(t.text_tertiary.hsla())
+                .font_weight(FontWeight::NORMAL)
+                .text_color(t.text_secondary.hsla())
                 .child("⌘N"),
         )
-        .on_click(cx.listener(|ws, _, window, cx| ws.new_task(window, cx)))
+        .on_click(cx.listener(|ws, _, window, cx| ws.new_task(window, cx)));
+    glass::hover_edge(capsule, t.highlight)
 }
 
-/// Project picker. Clicking expands it downward to show "All projects" and the projects; choosing one collapses it.
+/// Project picker, a clear capsule. Clicking expands it downward to show "All projects" and the projects; choosing one collapses it.
 fn project_picker(
     m: &Model,
     open: bool,
@@ -139,53 +145,57 @@ fn project_picker(
             root: m.filter.clone(),
             approval: false,
         });
-    let head = h_flex()
+    // The mockup's "◆ ▾" is one run in the approval color.
+    let caret = if open { "▴" } else { "▾" };
+    let (mark, mark_color) = if current.approval {
+        (format!("◆ {caret}"), t.approval)
+    } else {
+        (caret.to_string(), t.text_secondary)
+    };
+    let head = glass::clear_capsule(t)
         .id("picker")
-        .px_2()
-        .h(px(28.))
+        .flex()
+        .items_center()
         .gap_1p5()
-        .cursor_pointer()
+        .py(glass::pad(8.))
+        .px(glass::pad(14.))
         .child(
             div()
                 .flex_1()
                 .min_w_0()
                 .truncate()
-                .text_color(t.text.hsla())
                 .child(project_name(&current)),
         )
-        .when(current.approval, |this| this.child(approval_mark(t)))
-        .child(
-            div()
-                .text_color(t.text_tertiary.hsla())
-                .child(if open { "▴" } else { "▾" }),
-        )
+        .child(div().text_color(mark_color.hsla()).child(mark))
         .on_click(cx.listener(|ws, _, _, cx| ws.toggle_picker(cx)));
+    let head = glass::hover_fill(head, t);
     let rows = open.then(|| {
         items.into_iter().enumerate().map(|(k, item)| {
             let selected = item.root == m.filter;
             let name = project_name(&item);
             let approval = item.approval;
-            h_flex()
+            let row = glass::row(t, selected)
                 .id(("project", k))
-                .px_2()
-                .h(px(26.))
+                .flex()
+                .items_center()
                 .gap_1p5()
-                .cursor_pointer()
-                .border_t_1()
-                .border_color(t.edge.hsla())
-                .when(selected, |this| this.bg(t.panel_strong.hsla()))
-                .hover(|s| s.bg(t.panel_strong.hsla()))
+                .py(glass::pad(6.))
+                .px(glass::pad(14.))
                 .child(div().flex_1().min_w_0().truncate().child(name))
                 .when(approval, |this| this.child(approval_mark(t)))
-                .on_click(cx.listener(move |ws, _, _, cx| ws.pick_project(item.root.clone(), cx)))
+                .on_click(cx.listener(move |ws, _, _, cx| ws.pick_project(item.root.clone(), cx)));
+            if selected {
+                glass::hover_edge(row, t.highlight)
+            } else {
+                glass::hover_fill(row, t)
+            }
         })
     });
     v_flex()
-        .rounded(px(6.))
-        .border_1()
-        .border_color(t.edge.hsla())
-        .overflow_hidden()
+        .gap_1()
         .text_size(px(13.))
+        .line_height(px(17.))
+        .text_color(t.text.hsla())
         .child(head)
         .children(rows.into_iter().flatten())
 }
@@ -200,38 +210,59 @@ fn approval_mark(t: &Theme) -> impl IntoElement {
     div().text_color(t.approval.hsla()).child("◆")
 }
 
-/// Group header: `▾ ◆ Needs approval  1`. Clicking collapses or expands it.
+/// The group headers' letter spacing, the mockup's 0.06 em at 11 px.
+const HEAD_SIZE: f32 = 11.;
+const TRACKING: f32 = 0.06 * HEAD_SIZE;
+
+/// `text` at [`HEAD_SIZE`] with [`TRACKING`] after each letter, as CSS letter spacing adds it.
+///
+/// GPUI 0.2.2 has no letter spacing, so each letter is its own text in a box as wide as the letter's advance plus the tracking. (A
+/// text sizes itself to its width rounded up to a whole pixel, which would add about half a pixel per letter.)
+// ponytail: this loses kerning between the letters. Use GPUI's own letter spacing if it gets one.
+fn tracked(text: &str, cx: &App) -> Vec<Div> {
+    let system = cx.text_system();
+    let font = system.resolve_font(&gpui::font(UiTheme::global(cx).font_family.clone()));
+    text.chars()
+        .map(|c| {
+            // A lone space would be an empty line; a no-break space keeps its width.
+            let c = if c == ' ' { '\u{a0}' } else { c };
+            let letter = div().flex_shrink_0().child(c.to_string());
+            match system.advance(font, px(HEAD_SIZE), c) {
+                Ok(advance) => letter.w(advance.width + px(TRACKING)),
+                Err(_) => letter.mr(px(TRACKING)),
+            }
+        })
+        .collect()
+}
+
+/// Group header: `◆ NEEDS APPROVAL` with the count at the right, small uppercase secondary text with letter spacing. Clicking
+/// collapses or expands it.
 fn group_head(gi: usize, g: &Group, t: &Theme, cx: &mut Context<Workspace>) -> impl IntoElement {
+    let label = format!(" {}", model::group_label(&g.state).to_uppercase());
+    // The mockup's line is 14 px where the symbol comes from a fallback font (◆ ◐), 13 px otherwise.
+    let line = match g.state {
+        SessionState::Approval | SessionState::Working => 14.,
+        _ => 13.,
+    };
     h_flex()
         .id(("group", gi))
-        .px_3()
-        .pt_3()
-        .pb_1()
-        .gap_1p5()
+        .justify_between()
+        .px(px(6.))
+        .line_height(px(line))
+        .text_size(px(HEAD_SIZE))
+        .text_color(t.text_secondary.hsla())
         .cursor_pointer()
-        .text_size(px(12.))
         .child(
-            div()
-                .w(px(10.))
-                .text_color(t.text_tertiary.hsla())
-                .child(if g.collapsed { "▸" } else { "▾" }),
+            h_flex()
+                .child(
+                    div()
+                        .mr(px(TRACKING))
+                        .text_color(state_color(t, &g.state))
+                        .child(model::glyph(&g.state)),
+                )
+                .children(tracked(&label, cx)),
         )
-        .child(
-            div()
-                .text_color(state_color(t, &g.state))
-                .child(model::glyph(&g.state)),
-        )
-        .child(
-            div()
-                .flex_1()
-                .text_color(t.text_secondary.hsla())
-                .child(model::group_label(&g.state)),
-        )
-        .child(
-            div()
-                .text_color(t.text_tertiary.hsla())
-                .child(g.rows.len().to_string()),
-        )
+        .child(h_flex().children(tracked(&g.rows.len().to_string(), cx)))
         .on_click({
             // Holds the state, not the position. Even if a new list arrives after drawing and the groups shift, the clicked group is the one that changes.
             let state = g.state.clone();
@@ -250,63 +281,71 @@ pub fn state_color(t: &Theme, state: &SessionState) -> Hsla {
     .hsla()
 }
 
-/// A session row. The first line is the name and chip, the second is `project · waiting text or status`. Clicking attaches to that session.
-fn session_row(m: &Model, i: usize, t: &Theme, cx: &mut Context<Workspace>) -> impl IntoElement {
+/// A session row. The first line is the name and chip, the second is `project · waiting text or status`. Clicking attaches to that
+/// session. A row with a held request is a pending row with Allow and Deny under its lines.
+fn session_row(m: &Model, i: usize, t: &Theme, cx: &Context<Workspace>) -> impl IntoElement {
     let s: &SessionInfo = &m.sessions[i];
     // Holds the id, not the position. Even if a new list arrives after drawing and the rows shift, it attaches to the clicked session.
     let id = s.meta.id.clone();
     let selected = m.attached.as_ref() == Some(&s.meta.id);
+    let request = m.answerable(s);
     let (status, waiting) = model::status_text(s);
-    v_flex()
-        .id(("row", i))
-        .mx_2()
-        .px_2()
-        .py_1p5()
-        .gap_0p5()
-        .rounded(px(6.))
-        .cursor_pointer()
-        .when(selected, |this| this.bg(t.panel_strong.hsla()))
-        .hover(|s| s.bg(t.panel_strong.hsla()))
-        .on_click(cx.listener(move |ws, _, window, cx| ws.attach(&id, window, cx)))
-        .child(
-            h_flex()
-                .gap_2()
-                .text_size(px(13.))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .text_color(t.text.hsla())
-                        .child(s.meta.name.clone()),
-                )
-                .children(account_chip(s.meta.account.as_deref(), &m.profiles)),
-        )
-        .child(
-            h_flex()
-                .gap_1()
-                .min_w_0()
-                .text_size(px(12.))
-                .text_color(t.text_secondary.hsla())
-                .child(div().flex_shrink_0().child(folder_name(&s.meta.project)))
-                .child(
-                    div()
-                        .flex_shrink_0()
-                        .text_color(t.text_tertiary.hsla())
-                        .child("·"),
-                )
-                .child(
-                    div()
-                        .min_w_0()
-                        .truncate()
-                        .when(waiting, |this| this.text_color(t.accent_text.hsla()))
-                        .child(status.to_string()),
-                ),
-        )
-        .children(
-            m.answerable(s)
-                .map(|request| answer_buttons(&s.meta.id, request, t, cx)),
-        )
+    let row = match request {
+        Some(_) => glass::pending_row(t),
+        None => glass::row(t, selected),
+    }
+    .id(("row", i))
+    .flex()
+    .flex_col()
+    .py(glass::pad(10.))
+    .px(glass::pad(12.))
+    .gap(px(if request.is_some() { 8. } else { 4. }))
+    .on_click(cx.listener(move |ws, _, window, cx| ws.attach(&id, window, cx)))
+    .child(
+        h_flex()
+            .justify_between()
+            .gap_2()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(14.))
+                    .line_height(px(17.))
+                    .text_color(t.text.hsla())
+                    .when(selected || request.is_some(), |this| {
+                        this.font_weight(FontWeight::SEMIBOLD)
+                    })
+                    .child(s.meta.name.clone()),
+            )
+            .children(account_chip(s.meta.account.as_deref(), &m.profiles)),
+    )
+    .child(
+        h_flex()
+            .min_w_0()
+            .text_size(px(12.))
+            .line_height(px(15.))
+            .text_color(t.text_secondary.hsla())
+            // A no-break space, so the space before the status keeps its width.
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .child(format!("{} ·\u{a0}", folder_name(&s.meta.project))),
+            )
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .when(waiting, |this| this.text_color(t.accent_text.hsla()))
+                    .child(status.to_string()),
+            ),
+    )
+    .children(request.map(|request| answer_buttons(&s.meta.id, request, false, t, cx)));
+    match (request, selected) {
+        (Some(_), _) => glass::hover_edge(row, t.accent_text),
+        (None, true) => glass::hover_edge(row, t.highlight),
+        (None, false) => glass::hover_fill(row, t),
+    }
 }
 
 /// The element id of the `label` button (Allow or Deny) for held request `request` of session `session`.
@@ -323,44 +362,54 @@ fn button_id(label: &str, session: &str, request: u64) -> ElementId {
 }
 
 /// Allow and Deny for held request `request` of session `id`. Each answers exactly that request, the one the row or tab showed when it
-/// was drawn. A press on them stays on them: it doesn't also select the row or tab underneath. Tabs use it too.
+/// was drawn. A press on them stays on them: it doesn't also select the row or tab underneath. Tabs use it too, `compact`.
+///
+/// Allow is an accent capsule, Deny a clear one. In a row they share its width; in a tab they are as small as its chip.
 pub fn answer_buttons(
     id: &str,
     request: u64,
+    compact: bool,
     t: &Theme,
     cx: &Context<Workspace>,
 ) -> impl IntoElement {
     let button = |label: &'static str, allow: bool| {
         let session = id.to_string();
-        div()
+        let capsule = if allow {
+            glass::accent_capsule(t)
+                .text_color(t.on_accent.hsla())
+                .font_weight(FontWeight::BOLD)
+        } else {
+            glass::clear_capsule(t)
+                .text_color(t.text.hsla())
+                .font_weight(FontWeight::SEMIBOLD)
+        };
+        let button = capsule
             .id(button_id(label, id, request))
-            .flex_shrink_0()
-            .px_1p5()
-            .h(px(18.))
             .flex()
             .items_center()
-            .rounded(px(4.))
-            .text_size(px(11.))
-            .cursor_pointer()
+            .justify_center()
+            .map(|this| {
+                if compact {
+                    this.flex_shrink_0()
+                        .h(px(18.))
+                        .px(glass::pad(8.))
+                        .text_size(px(11.))
+                } else {
+                    this.flex_1()
+                        .py(glass::pad(7.))
+                        .text_size(px(13.))
+                        .line_height(px(16.))
+                }
+            })
             // The parent's click starts from its own mouse-down, so stopping this one keeps the row from selecting itself.
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(move |ws, _, _, _| ws.answer(&session, request, allow)))
-            .map(|this| {
-                if allow {
-                    this.bg(t.accent.hsla())
-                        .text_color(t.on_accent.hsla())
-                        .font_weight(FontWeight::BOLD)
-                } else {
-                    this.border_1()
-                        .border_color(t.edge.hsla())
-                        .text_color(t.text_secondary.hsla())
-                        .hover(|s| s.bg(t.panel_strong.hsla()))
-                }
-            })
-            .child(label)
+            .child(label);
+        // Both have their own edge to light up, so neither adds a fill over the row or tab under it.
+        glass::hover_edge(button, t.highlight)
     };
     h_flex()
-        .gap_1p5()
+        .gap(px(if compact { 6. } else { 8. }))
         .child(button("Allow", true))
         .child(button("Deny", false))
 }
@@ -373,42 +422,58 @@ pub fn account_chip(
     launch::profile(profiles, account?).map(|p| chip(p.chip.clone(), p.rgb()))
 }
 
-/// A chip: a profile's letter on its color (`0xrrggbb`). The launcher rows use it too.
-pub fn chip(letter: String, color: u32) -> impl IntoElement {
+/// A chip: a profile's letter on its color (`0xrrggbb`), an 18 px circle. The letter is dark or white, whichever reads better on that
+/// color. The launcher rows use it too.
+pub fn chip(letter: String, color: u32) -> Div {
     div()
         .flex()
         .flex_shrink_0()
         .items_center()
         .justify_center()
-        .size(px(16.))
-        .rounded(px(3.))
+        .size(px(18.))
+        .rounded_full()
         .bg(rgb(color))
-        .text_color(rgb(CHIP_FG))
-        .text_size(px(10.))
+        .text_color(rgb(theme::chip_text(color)))
+        .text_size(px(11.))
+        .line_height(px(18.))
         .font_weight(FontWeight::BOLD)
         .child(letter)
 }
 
-/// "＋ Add project". Clicking picks a folder and registers it as a project.
+/// "＋ Add project", a quiet text capsule. Clicking picks a folder and registers it as a project.
 fn add_project(t: &Theme, cx: &mut Context<Workspace>) -> impl IntoElement {
-    h_flex()
+    let capsule = div()
         .id("add-project")
         .flex_shrink_0()
-        .px_3()
-        .h(px(36.))
-        .border_t_1()
-        .border_color(t.edge.hsla())
-        .text_size(px(12.))
-        .text_color(t.text_tertiary.hsla())
-        .cursor_pointer()
-        .hover(|s| s.text_color(t.text.hsla()))
+        .flex()
+        .items_center()
+        .rounded_full()
+        .py(px(8.))
+        .px(px(12.))
+        .text_size(px(13.))
+        .line_height(px(17.))
+        .text_color(t.text_secondary.hsla())
         .child("＋ Add project")
-        .on_click(cx.listener(|ws, _, _, cx| ws.add_project(cx)))
+        .on_click(cx.listener(|ws, _, _, cx| ws.add_project(cx)));
+    glass::hover_fill(capsule, t)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::theme::Tint;
+
+    /// The letter is dark or white by contrast with the chip (`theme::chip_text`), so a color a user picks stays readable.
+    #[test]
+    fn chip_letter_uses_chip_text() {
+        let letter = |color: u32| {
+            let mut chip = chip("N".into(), color);
+            chip.style().text.as_ref().and_then(|text| text.color)
+        };
+        // Navy gets a white letter, gold a dark one.
+        assert_eq!(letter(0x000080), Some(Tint::solid(0xffffff).hsla()));
+        assert_eq!(letter(0xe5c07b), Some(Tint::solid(0x1b1d23).hsla()));
+    }
 
     /// A button's id carries the session, the request and the action, so it can't be taken over by another row that moves into the same slot.
     #[test]

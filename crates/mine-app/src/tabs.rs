@@ -1,5 +1,5 @@
-//! The tab bar, a glass capsule centered in the title-bar row: the selected project's sessions in name order, with a "＋" at the end.
-//! Each tab carries a status symbol, a name, and a chip.
+//! The tab bar, a glass capsule centered in the title-bar row: the selected project's sessions in name order, with a "+" at the end.
+//! Each tab is a capsule with a status symbol, a name, and a chip; the active one is a strong capsule.
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
@@ -15,10 +15,11 @@ use crate::sidebar::{account_chip, answer_buttons, state_color};
 use crate::theme;
 use crate::workspace::Workspace;
 
-/// The mockup's tab bar: pills with 6 × 14 px padding around an 18 px line (the chip's height), so 30 px tall like the round "＋";
-/// 4 px of padding and 4 px gaps in the bar, so the bar is 38 px, centered in the 52 px title-bar row.
+/// The mockup's tab bar: pills with 6 × 14 px padding around a 16 px line (its 13 px text). A chip or the compact Allow/Deny (18 px)
+/// makes a pill 30 tall, like the round "+"; a pill without one is 28, centered. 4 px of padding and 4 px gaps in the bar, so the bar
+/// is 38 px, centered in the 52 px title-bar row.
 pub const HEIGHT: f32 = 30.;
-const LINE: f32 = 18.;
+const LINE: f32 = 16.;
 
 pub fn render(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
     let m = &ws.model;
@@ -28,22 +29,20 @@ pub fn render(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
     let all = m.filter.is_none();
     let tabs = m.tabs().into_iter().enumerate().map(|(k, i)| {
         let s = &m.sessions[i];
-        // When the launcher covers the view, "＋" is the selected tab.
+        // When the launcher covers the view, "+" is the selected tab.
         let selected = !launcher && m.attached.as_ref() == Some(&s.meta.id);
         let id = s.meta.id.clone();
-        h_flex()
+        let tab = glass::pill(&t, selected)
             .id(("tab", k))
+            .flex()
+            .items_center()
             .flex_shrink_0()
-            .py(px((HEIGHT - LINE) / 2.))
-            .px(px(14.))
+            .py(glass::pad(6.))
+            .px(glass::pad(14.))
             .line_height(px(LINE))
             .gap_1p5()
-            .rounded_full()
-            .cursor_pointer()
             .text_size(px(13.))
             .text_color(if selected { t.text } else { t.text_secondary }.hsla())
-            .when(selected, |this| this.bg(t.panel_strong.hsla()))
-            .hover(|style| style.bg(t.panel_strong.hsla()))
             .child(
                 div()
                     .text_color(state_color(&t, &s.state))
@@ -60,25 +59,31 @@ pub fn render(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
             .children(account_chip(s.meta.account.as_deref(), &m.profiles))
             .children(
                 m.answerable(s)
-                    .map(|request| answer_buttons(&s.meta.id, request, &t, cx)),
+                    .map(|request| answer_buttons(&s.meta.id, request, true, &t, cx)),
             )
-            .on_click(cx.listener(move |ws, _, window, cx| ws.attach(&id, window, cx)))
+            .on_click(cx.listener(move |ws, _, window, cx| ws.attach(&id, window, cx)));
+        if selected {
+            glass::hover_edge(tab, t.highlight)
+        } else {
+            glass::hover_fill(tab, &t)
+        }
     });
-    let plus = div()
+    let plus = glass::pill(&t, launcher)
         .id("new-tab")
         .flex_shrink_0()
         .flex()
         .items_center()
         .justify_center()
         .size(px(HEIGHT))
-        .rounded_full()
-        .cursor_pointer()
         .text_size(px(16.))
-        .text_color(if launcher { t.text } else { t.text_tertiary }.hsla())
-        .when(launcher, |this| this.bg(t.panel_strong.hsla()))
-        .hover(|style| style.bg(t.panel_strong.hsla()))
-        .child("＋")
+        .text_color(if launcher { t.text } else { t.text_secondary }.hsla())
+        .child("+")
         .on_click(cx.listener(|ws, _, window, cx| ws.new_task(window, cx)));
+    let plus = if launcher {
+        glass::hover_edge(plus, t.highlight)
+    } else {
+        glass::hover_fill(plus, &t)
+    };
     // The bar occludes the title-bar row under it, so a double click on a tab doesn't also zoom the window. That also hides the frame
     // from its clicks, so the bar reports them as user input itself (presence), on the way down like the frame does. It scrolls
     // inside, because the capsule paints its shadow outside itself.

@@ -2,18 +2,12 @@
 //!
 //! - The token layer ([`Theme`]): the dark and light glass palettes as data, a model of GPUI's blend ([`composite`]), and the
 //!   contrast rule the palettes are tested against. Views read the current [`Theme`] with [`current`].
-//! - The terminal colors, and the chip letter the views still draw with. Values are the `0xrrggbb` passed to GPUI `rgb()`.
-//!   `TERM_*`, [`ANSI`] and [`indexed`] stay; [`CHIP_FG`] goes when chips move to [`chip_text`].
-// ponytail: parts of the token layer (`chip_text`, the pending-row tokens) wait for the task list restyle, so the lint is off.
-#![allow(dead_code)]
+//! - The terminal colors. Values are the `0xrrggbb` passed to GPUI `rgb()`.
 
 use gpui::{App, Global, Hsla, WindowBackgroundAppearance, rgb};
 use gpui_component::{Theme as UiTheme, ThemeMode};
 
 use crate::appearance::Mode;
-
-/// Chip text color.
-pub const CHIP_FG: u32 = 0x1e2128;
 
 /// Default terminal text and background. On connect, the app sends these two colors to the daemon with `ToDaemon::Colors`.
 pub const TERM_FG: u32 = 0xd0d3da;
@@ -81,9 +75,10 @@ const fn tint(rgb: u32, alpha: f32) -> Tint {
 /// Every color the views draw with, for one look: dark or light, glass or opaque.
 ///
 /// Surfaces are drawn bottom to top, and each one only adds to what is below it: the window tint over the blurred wallpaper, then a
-/// `panel` (the task list, the tab bar, the center pane), then a `panel_strong` (the selected row, the active tab), a `row_pending`, or
-/// the launcher's `sheet`; the `terminal` fill replaces `panel` in the center pane. No text sits on the bare window tint: the title
-/// row holds only the tab capsule. See [`composite`] for how GPUI blends such a stack.
+/// `panel` (the task list, the tab bar, the center pane), then a `panel_strong` (the selected row, the active tab), a `row_pending`, a
+/// [`Theme::hover`], or the launcher's `sheet`; the `terminal` fill replaces `panel` in the center pane. Nothing translucent goes on top
+/// of those (their stacks are at the 0.92 alpha cap), so a control that has a fill lights its edge on hover instead. No text sits on
+/// the bare window tint: the title row holds only the tab capsule. See [`composite`] for how GPUI blends such a stack.
 /// Text and status colors are solid: a translucent glyph would let the wallpaper through it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Theme {
@@ -204,6 +199,14 @@ impl Theme {
             row_pending: solid(&[w, p, self.row_pending]),
             row_pending_edge: solid(&[w, p, self.row_pending_edge]),
             ..self.clone()
+        }
+    }
+
+    /// A control without a fill, under the pointer: raised one step, to half a `panel_strong`.
+    pub fn hover(&self) -> Tint {
+        Tint {
+            alpha: self.panel_strong.alpha / 2.,
+            ..self.panel_strong
         }
     }
 
@@ -403,10 +406,12 @@ mod tests {
 
     /// The surfaces text is drawn on, bottom to top. The terminal pane has its own rule. The bare window tint is not one: the title
     /// row holds only the tab capsule, and the launcher's sheet sits in the center pane (Ruling G-R3).
-    fn surface_stacks(th: &Theme) -> [(&'static str, Vec<Tint>); 4] {
+    fn surface_stacks(th: &Theme) -> [(&'static str, Vec<Tint>); 5] {
         let w = th.window_tint;
         [
             ("[window_tint, panel]", vec![w, th.panel]),
+            // A row, tab or button without a fill of its own, under the pointer.
+            ("[window_tint, panel, hover]", vec![w, th.panel, th.hover()]),
             (
                 "[window_tint, panel, panel_strong]",
                 vec![w, th.panel, th.panel_strong],
