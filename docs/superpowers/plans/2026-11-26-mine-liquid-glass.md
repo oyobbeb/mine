@@ -40,7 +40,7 @@
   - terminal `#d0d3da` on `terminal` ≥ 7
   - `#5c6370` on `terminal` ≥ 3
   - The opaque variants must pass too.
-- **Config (spec 5):** `[appearance] mode = "system"|"dark"|"light"` (default `system`), `glass = true|false` (default `true`).
+- **Config (spec 5):** `[appearance] mode = "system"|"dark"|"light"` (default `system`), `glass = "clear"|"balanced"|"solid"` (default `clear`; `true` → clear, `false` → solid; Task 5).
   - The app reads it itself, at start and on window activation.
   - The daemon's profile parser ignores the `appearance` table silently.
 - **Safety:**
@@ -200,3 +200,36 @@ The spec 4.3 rules for these components:
     - Mirror both changes in `README.ko.md` (polite 해요체).
 - [ ] **Step 4: Confirm the tests pass.** Run the check command → PASS. Capture both modes once more for the report. Kill everything you started.
 - [ ] **Step 5: Commit.** `feat(app): restyle the launcher, terminal pane, find box, and bars as Liquid Glass`
+
+### Task 5: Glass levels (clear, balanced, solid)
+
+The user compared a build with the mockup and asked for the mockup's translucency by default, with a setting to go back (spec 5, 7, call 9).
+
+**Files:**
+- Modify: `crates/mine-app/src/appearance.rs` (the level), `crates/mine-app/src/theme.rs` (clear palettes, `resolve`, per-level floors), the views that draw secondary or tertiary text (weight), `crates/mine-app/src/launcher.rs` (carried items)
+- Modify: `README.md`, `README.ko.md`, `docs/images/mine-app.png`
+
+**Interfaces:**
+- **Consumes:** Tasks 1–4.
+- **Produces:**
+  - `pub enum Glass { Clear, Balanced, Solid }` in `appearance.rs`, default `Clear`; `Appearance.glass: Glass`.
+  - `resolve(mode, system_dark, glass: Glass, reduce_transparency) -> Theme`. Reduce transparency → solid at any level.
+  - `Theme::dark_clear()`, `Theme::light_clear()`. `dark_glass()` and `light_glass()` stay as the balanced palettes.
+  - `Theme.secondary_weight: FontWeight`: `MEDIUM` in clear, `NORMAL` otherwise. Every view that draws `text_secondary` or `text_tertiary` uses it.
+
+- [ ] **Step 1: Write the failing tests.**
+  - `glass_levels_parse`: `"clear"`, `"balanced"`, `"solid"` → the variants; `true` → `Clear`; `false` → `Solid`; missing → `Clear`; `"foggy"` → `Clear` with one warning.
+  - `clear_matches_mockup_show_through`: show-through is `1 − Σα` of the stack. For `[window_tint, panel]` it's 0.41 ± 0.03 in dark clear and 0.29 ± 0.03 in light clear. For `[window_tint, terminal]` it's 0.09 ± 0.03 in both.
+  - `contrast_floors_hold_for_every_palette` covers the clear palettes with the `clear` floors from spec 7. Balanced and solid keep the full floors.
+  - The `resolve` table covers every level × reduce transparency.
+- [ ] **Step 2: Confirm the failure.** Run: `cargo test -p mine-app -- glass_levels clear_matches contrast_floors` → FAIL.
+- [ ] **Step 3: Implement.**
+  - Tune the clear palettes until the tests pass. Coverage moves off the panels, and text tokens brighten.
+  - **Launcher (carried from Task 4):**
+    - The Enter or hovered row gets the mockup's `panel_strong` fill wherever the stack still fits under 0.92. Otherwise it keeps today's outline and highlight. The contrast test models whichever applies.
+    - Rows show the mockup's right-hand meta in `text_secondary`. It's the agent ("Claude" or "Codex"), with " · ↵" on the Enter row. Not-logged-in rows keep their login hint.
+  - **README:**
+    - Re-capture `docs/images/mine-app.png` in dark clear, the default (D-R4, neutral demo data). Check that nothing legible from other windows shows through the glass.
+    - Document the three levels in both READMEs.
+- [ ] **Step 4: Confirm the tests pass.** Run the check command → PASS. Capture dark and light clear, plus dark balanced, for the report. Kill everything you started.
+- [ ] **Step 5: Commit.** `feat(app): add clear, balanced, and solid glass levels with the mockup's translucency by default`

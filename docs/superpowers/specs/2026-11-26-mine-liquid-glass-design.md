@@ -30,7 +30,7 @@ This is a visual pass. It changes no behavior.
    - A config override in `<state>/config.toml` lets the user pin the mode or turn glass off.
 6. macOS **Reduce transparency** is respected: when it's on, every surface becomes opaque, with the same layout and palette.
 7. Text stays readable on any wallpaper. This is enforced by a contrast test over worst-case backdrops (section 7).
-8. The terminal stays a dark, nearly opaque glass pane in both modes. Its ANSI palette is unchanged, so session output looks exactly as it does today.
+8. The terminal stays a dark, solid pane in both modes and at every glass level (G-R14); it keeps the glass radius, edge, highlight, and shadow. Its ANSI palette is unchanged, so session output looks exactly as it does today.
 
 **Non-goals**
 
@@ -86,7 +86,7 @@ Each palette defines these tokens as RGBA. Names are fixed; values are the build
 | `sheet` (launcher, dialog) | white at ~0.10–0.14 plus a deep shadow | white at ~0.8 |
 | `edge`, `highlight` | white ~0.08 / ~0.22 | black ~0.05 / white ~0.95 |
 | `shadow` | black ~0.28 | slate `#3c465a` ~0.16 |
-| `terminal` | `#12141a` at ≥ 0.80 | `#181a20` at ≥ 0.86 (the terminal stays dark in light mode) |
+| `terminal` | solid `#0b0c10` (TERM_BG, G-R4) | the same; the terminal stays dark in light mode |
 | `text`, `text_secondary`, `text_tertiary` | `#e8eaef`, white ~0.62, white ~0.45 | `#1d1d1f`, `#48484a`, `#6e6e73` |
 | `accent` (Allow, focus, ◆) | `#e5c07b` | `#e5c07b` fill with dark text; `#9a6a12` for ◆ and accent text |
 | status ◆ ◐ ✓ ○ | current colors | darker variants that pass on light |
@@ -119,7 +119,7 @@ Chips keep each profile's color (profiles spec 5). The letter is dark or white, 
 - **Launcher sheet:**
   - A `sheet` centered over the terminal pane.
   - Profile rows are 16 px rounded, and the hovered or Enter row uses `panel_strong`.
-  - Key hints are small capsules: the Enter row's key is accent-filled, the others `panel_strong`.
+  - Key hints are small capsules: the Enter row's key is accent-filled, the others clear (G-R15: a key fill on a hovered row would exceed the 0.92 cap).
   - Not-logged-in rows use tertiary text.
 - **Close-confirm dialog:** stays the native macOS alert (`window.prompt`). It keeps its modality, Return = Cancel (D-R9), Esc, and ⌘W. macOS Tahoe already draws it in its own glass, following the system appearance.
 - **Find box:** a small glass capsule at the top right of the terminal pane. The match count is secondary text.
@@ -133,16 +133,22 @@ Chips keep each profile's color (profiles spec 5). The letter is dark or white, 
 # <state>/config.toml
 [appearance]
 mode = "system"   # "system" (default) | "dark" | "light"
-glass = true      # false = opaque surfaces with the same palette
+glass = "clear"   # "clear" (default) | "balanced" | "solid"
 ```
+
+- **Glass levels** (the user's call, 2026-11-26, after comparing a build with the mockup):
+  - **`clear`** (default): the mockup's translucency. Show-through is measured as `1 − Σα` under GPUI's blend, the share of the blurred backdrop that reaches the eye. Panels show ≈ 41 % (dark) and ≈ 29 % (light) of it. Those are the mockup's browser values. The terminal stays solid at every level, unlike the mockup's ≈ 9 %: more show-through can't hold ANSI 8 at 3:1 over white (Ruling G-R14). Secondary and tertiary text are drawn one weight heavier (Medium), and brighter in dark or darker in light, to hold up. Text is weaker than in `balanced` over a very bright backdrop in dark mode, or a very dark one in light mode; section 7 states the floors.
+  - **`balanced`**: the tuning Tasks 1–4 shipped. It's readable over pure white at the full floors.
+  - **`solid`**: the opaque variant (below).
+  - Old configs keep working: `glass = true` → `clear`, `glass = false` → `solid`.
 
 - **`mode = "system"`:** the app reads `window.appearance()` at start and on `observe_window_appearance`. `Dark` and `VibrantDark` map to dark; `Light` and `VibrantLight` map to light.
 - **Switching:**
   - Swaps the `Theme` global, re-applies gpui-component's theme (`Theme::change(ThemeMode, …)` plus mine's overrides), and refreshes the window.
   - No surface may keep the old palette; this is tested.
-- **Opaque:** each translucent token is composited over its backdrop color into an opaque one, and the window background becomes `Opaque`. This happens when `glass = false`, or when macOS **Reduce transparency** is on.
+- **Opaque:** each translucent token is composited over its backdrop color into an opaque one, and the window background becomes `Opaque`. This happens when `glass = "solid"` (or `false`), or when macOS **Reduce transparency** is on, whatever the level.
   - The app reads Reduce transparency at start and on window activation. The builder picks the mechanism, for example `defaults read com.apple.universalaccess reduceTransparency`, or a macOS API through a crate already in the dependency tree. A new dependency needs its reason in the commit body.
-- **Bad config:** each bad value in `[appearance]` falls back to its default, with one warning per bad value in the app's log. A warning gives the reason only, never the value. It never blocks the app.
+- **Bad config:** each bad value in `[appearance]` falls back to its default, with one warning per bad value in the app's log. A warning names the place (line or key) and the reason, never the value. It never blocks the app.
 - **Who reads it:** `[appearance]` is a client-side setting. The app reads `<state>/config.toml` itself, at start and on window activation, so edits apply the next time the window is focused.
   - The daemon's profile parser must ignore the `[appearance]` table silently, so it never warns about it or treats the config as broken.
 - **Pinned mode and native chrome:** `mode = "dark"` or `"light"` restyles mine's own surfaces only. GPUI 0.2.2 can't set the NSApp/NSWindow appearance, and mine adds no objc code for it, so native chrome follows the system: the close alert, the Add-project folder panel, and menus.
@@ -174,6 +180,10 @@ For each palette, and for each text token over each surface it appears on, a uni
   - `#d0d3da` on `terminal` over both backdrops: ≥ 7:1.
   - The worst ANSI foreground used by agents (`#5c6370`): ≥ 3:1.
 - The opaque variants must pass the same floors.
+- **`clear` floors:**
+  - Over `#000000`: the full floors above.
+  - Over `#ffffff`: the user traded some readability for translucency. `text` ≥ 3.5, `text_secondary` ≥ 3, `text_tertiary`, status symbols, and accent text ≥ 2.
+  - Chip letters (chips are opaque) and the terminal floors hold over both backdrops.
 - The builder tunes the alphas until every case passes. The test is the authority for values; the mockup is the authority for feel.
 
 ## 8. Testing and review focus
@@ -199,6 +209,7 @@ For each palette, and for each text token over each surface it appears on, a uni
 6. The app reads `[appearance]` itself, at start and on activation; the daemon ignores that table.
 7. The chip letter color is chosen by contrast.
 8. gpui-component's `Root` and `TitleBar` paint opaque theme colors today. The theme sets them transparent or to glass tokens, so the window blur shows.
+9. Glass levels (section 5) were the user's call after comparing a build with the mockup: `clear` by default, `balanced` and `solid` in config.
 
 ## 10. Left to the builder
 
