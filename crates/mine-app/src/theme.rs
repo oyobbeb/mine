@@ -9,9 +9,11 @@ use gpui_component::{Theme as UiTheme, ThemeMode};
 
 use crate::appearance::Mode;
 
-/// Default terminal text and background. On connect, the app sends these two colors to the daemon with `ToDaemon::Colors`.
+/// Default terminal text and background. On connect, the app sends these two colors to the daemon with `ToDaemon::Colors`, which
+/// answers OSC 10/11 with them. The background is the pane's own color, the `terminal` token, so what an app learns from OSC 11, the
+/// input method's composing fill and inverse video match the pane (Ruling G-R4).
 pub const TERM_FG: u32 = 0xd0d3da;
-pub const TERM_BG: u32 = 0x1e2128;
+pub const TERM_BG: u32 = 0x0b0c10;
 pub const TERM_CURSOR: u32 = 0xd0d3da;
 /// The background of selected terminal text and of the find box's matches. The text keeps its own color.
 pub const TERM_SELECTION: u32 = 0x2f323a;
@@ -98,7 +100,8 @@ pub struct Theme {
     pub highlight: Tint,
     /// The drop shadow of a floating surface.
     pub shadow: Tint,
-    /// The terminal pane. Dark in both modes.
+    /// The terminal pane. Dark in both modes, and solid: it covers the wallpaper so session output reads as it always has (Ruling
+    /// G-R2), and it is [`TERM_BG`].
     pub terminal: Tint,
     pub text: Tint,
     pub text_secondary: Tint,
@@ -135,7 +138,7 @@ impl Theme {
             edge: tint(0xffffff, 0.14),
             highlight: tint(0xffffff, 0.36),
             shadow: tint(0x000000, 0.28),
-            terminal: tint(0x0b0c10, 0.97),
+            terminal: Tint::solid(TERM_BG),
             text: Tint::solid(0xf5f6f8),
             text_secondary: Tint::solid(0xc2c5cc),
             text_tertiary: Tint::solid(0xa6aab3),
@@ -164,7 +167,7 @@ impl Theme {
             edge: tint(0x000000, 0.06),
             highlight: tint(0xffffff, 0.95),
             shadow: tint(0x3c465a, 0.16),
-            terminal: tint(0x0b0c10, 0.97),
+            terminal: Tint::solid(TERM_BG),
             text: Tint::solid(0x1d1d1f),
             text_secondary: Tint::solid(0x3f3f43),
             text_tertiary: Tint::solid(0x5a5a5f),
@@ -359,7 +362,7 @@ mod tests {
         assert_eq!(indexed(231), 0xffffff);
         assert_eq!(indexed(232), 0x080808);
         assert_eq!(indexed(255), 0xeeeeee);
-        assert_eq!(hex(TERM_BG), "#1e2128");
+        assert_eq!(hex(TERM_BG), "#0b0c10");
     }
 
     #[test]
@@ -405,7 +408,9 @@ mod tests {
     }
 
     /// The surfaces text is drawn on, bottom to top. The terminal pane has its own rule. The bare window tint is not one: the title
-    /// row holds only the tab capsule, and the launcher's sheet sits in the center pane (Ruling G-R3).
+    /// row holds only the tab capsule, the message bar and the offline banner are capsules, and the launcher's sheet sits in the
+    /// center pane (Ruling G-R3). Everything on the sheet is on `[window_tint, panel, sheet]`, which is at the alpha cap: the rows,
+    /// the lit row, the clear key capsules and the hints add no fill. The lit row's key is `on_accent` on the solid `accent`.
     fn surface_stacks(th: &Theme) -> [(&'static str, Vec<Tint>); 5] {
         let w = th.window_tint;
         [
@@ -456,6 +461,15 @@ mod tests {
             assert_eq!(th.on_accent.alpha, 1.0, "{name}: on_accent is solid");
             let ratio = contrast(th.on_accent.rgb, th.accent.rgb);
             assert!(ratio >= 4.5, "{name}: on_accent on accent is {ratio:.2}:1");
+            // The find box over the terminal: the panel's solid form, under the input's text and the match count.
+            let find = th.opaque().panel.rgb;
+            for (token, tint) in [("text", th.text), ("text_secondary", th.text_secondary)] {
+                let ratio = contrast(tint.rgb, find);
+                assert!(
+                    ratio >= 4.5,
+                    "{name}: {token} on the find box is {ratio:.2}:1"
+                );
+            }
             // The terminal stays dark in both modes, and its text is read on it.
             for backdrop in BACKDROPS {
                 let bg = composite(&[th.window_tint, th.terminal], backdrop);
@@ -466,6 +480,22 @@ mod tests {
                         "{name}: {what} on [window_tint, terminal] over {backdrop:06x} is {ratio:.2}:1, needs {floor}"
                     );
                 }
+            }
+        }
+    }
+
+    /// What apps learn from OSC 11 (the daemon answers with `TERM_BG`), the input method's composing fill and inverse video are the
+    /// pane's own color, in every palette and over any wallpaper (Ruling G-R4).
+    #[test]
+    fn term_bg_is_the_terminal_pane() {
+        for (name, th) in palettes() {
+            for backdrop in BACKDROPS {
+                let pane = composite(&[th.window_tint, th.terminal], backdrop);
+                assert_eq!(
+                    hex(pane),
+                    hex(TERM_BG),
+                    "{name}: the terminal pane over {backdrop:06x}"
+                );
             }
         }
     }

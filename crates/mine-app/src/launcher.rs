@@ -1,5 +1,9 @@
-//! The launcher: the menu, drawn in the center, that starts a session with a single key. It shows when no session is attached or when ⌘N, ＋ or New task is pressed.
-//! Same content as the TUI's launcher (`mine-cli` `client::launcher`): one row per profile, then shell and the typed form. `Model` handles the state and sending `New`.
+//! The launcher: the sheet, centered in the empty terminal pane, that starts a session with a single key. It shows when no session is
+//! attached or when ⌘N, ＋ or New task is pressed. Same content as the TUI's launcher (`mine-cli` `client::launcher`): one row per
+//! profile, then shell and the typed form. `Model` handles the state and sending `New`.
+//!
+//! Sizes follow the mockup's Launcher artboard as Chrome renders it: the sheet is 504 wide (460 plus 2 × 22 of content-box padding),
+//! and each text sets the line height Chrome gives it.
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
@@ -12,28 +16,34 @@ use mine_core::launch::{self, Choice, enter_choice, tilde};
 use mine_core::profiles::ProfileInfo;
 use mine_core::view::folder_name;
 
-use crate::sidebar::chip;
+use crate::glass;
+use crate::sidebar::{chip, tracked};
+use crate::terminal::FONT_FAMILY;
 use crate::theme::{self, Theme};
 use crate::workspace::Workspace;
 
-/// Minimum menu width, and the name column's minimum width. The chip lines up after the name column, and a longer row widens the menu.
-///
-/// ponytail: the name column isn't measured, so a label wider than `LABEL_W` pushes its own chip right. Measure with the window's
-/// text system if labels that long become common.
-const MENU_W: f32 = 340.;
-const LABEL_W: f32 = 150.;
+/// The sheet's width, and the gap between its blocks and between its rows.
+const SHEET_W: f32 = 504.;
+const BLOCK_GAP: f32 = 14.;
+const ROW_GAP: f32 = 4.;
+/// A row's key capsule and chip, and the gap between a row's parts.
+const KEY: f32 = 26.;
+const CHIP: f32 = 20.;
+const PART_GAP: f32 = 12.;
 
-/// A menu row as drawn: what it picks, its key (blank past the ninth profile), its name, and for a profile its chip (letter, color)
-/// and, if it isn't logged in, the login note. Drawing and tests use the same values.
+/// A menu row as drawn: what it picks, its key (blank past the ninth profile), its name, for a profile its chip (letter, color) and,
+/// if it isn't logged in, the login note, and whether Enter picks it. Drawing and tests use the same values.
 struct Row {
     choice: Choice,
     key: String,
     label: String,
     chip: Option<(String, u32)>,
     hint: Option<String>,
+    enter: bool,
 }
 
 fn row_texts(profiles: &[ProfileInfo]) -> Vec<Row> {
+    let enter = enter_choice(profiles);
     launch::rows(profiles)
         .into_iter()
         .map(|(choice, key)| {
@@ -46,18 +56,34 @@ fn row_texts(profiles: &[ProfileInfo]) -> Vec<Row> {
                 label: choice.label(profiles).to_string(),
                 chip: info.map(|p| (p.chip.clone(), p.rgb())),
                 hint: info.and_then(launch::login_hint),
+                enter: enter.as_ref() == Some(&choice),
                 choice,
             }
         })
         .collect()
 }
 
-/// The hint under the menu: what Enter starts, and ⌘W.
-fn footer(profiles: &[ProfileInfo]) -> String {
-    match enter_choice(profiles) {
-        Some(choice) => format!("↵ {} · ⌘W close", choice.label(profiles)),
-        None => "⌘W close".into(),
+/// The row Enter picks is lit: the typed form's while it is open, otherwise the default profile's.
+fn lit(row: &Row, typing: bool) -> bool {
+    if typing {
+        row.choice == Choice::Typed
+    } else {
+        row.enter
     }
+}
+
+/// The hints under the menu, one part each: what Enter starts, or in the typed form what Enter and Esc do, then ⌘W.
+fn footer(profiles: &[ProfileInfo], typing: bool) -> Vec<String> {
+    let mut parts: Vec<String> = if typing {
+        vec!["Enter create".into(), "Esc back".into()]
+    } else {
+        enter_choice(profiles)
+            .map(|choice| format!("↵ {}", choice.label(profiles)))
+            .into_iter()
+            .collect()
+    };
+    parts.push("⌘W close".into());
+    parts
 }
 
 /// The row that one key picks: Enter, `1`–`9`, `s` or `n`. Keys with modifiers (including ⇧) and any other key are ignored.
@@ -81,56 +107,65 @@ pub fn is_escape(k: &Keystroke) -> bool {
     k.key == "escape" && !k.modifiers.modified()
 }
 
-/// The launcher that fills the center. Order: header (project name and `~` path), "New session", menu rows, input box, hint.
+/// The launcher that fills the center: a sheet centered in the pane. Order: the project name and `~` path, "New session", the menu
+/// rows, the typed form's input, the hints.
 pub fn render(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
     let m = &ws.model;
     let t = theme::current(cx).clone();
     let project = m.project();
     let home = std::env::home_dir();
-    let head = h_flex()
-        .gap_3()
-        .items_baseline()
-        .min_w_0()
+    let head = v_flex()
+        .px(px(8.))
+        .gap(px(2.))
         .child(
             div()
-                .flex_shrink_0()
-                .text_size(px(15.))
+                .truncate()
+                .text_size(px(20.))
+                .line_height(px(23.))
                 .font_weight(FontWeight::BOLD)
                 .text_color(t.text.hsla())
                 .child(folder_name(project)),
         )
-        // Zero width plus grow: a long path fills what the rows leave and truncates, instead of widening the menu.
         .child(
             div()
-                .w_0()
-                .flex_1()
                 .truncate()
-                .text_size(px(13.))
-                .text_color(t.text_tertiary.hsla())
+                .font_family(FONT_FAMILY)
+                .text_size(px(12.))
+                .line_height(px(14.))
+                .text_color(t.text_secondary.hsla())
                 .child(tilde(project, home.as_deref())),
         );
-    let rows = row_texts(&m.profiles)
-        .into_iter()
-        .enumerate()
-        .map(|(k, r)| {
-            let selected = m.typing && r.choice == Choice::Typed;
-            row(k, r, selected, &t, cx)
-        })
-        .collect::<Vec<_>>();
+    let label = h_flex()
+        .px(px(8.))
+        .text_size(px(11.))
+        .line_height(px(13.))
+        .text_color(t.text_secondary.hsla())
+        .children(tracked(&"New session".to_uppercase(), cx));
+    let mut rows = v_flex().gap(px(ROW_GAP));
+    for (k, r) in row_texts(&m.profiles).into_iter().enumerate() {
+        // A line between the profiles and shell, 4 × 12 inside the rows' gaps.
+        if k > 0 && r.choice == Choice::Shell {
+            rows = rows.child(div().h(px(1.)).mx(px(12.)).my(px(4.)).bg(t.edge.hsla()));
+        }
+        let lit = lit(&r, m.typing);
+        rows = rows.child(row(k, r, lit, &t, cx));
+    }
+    // The input is clear like the rows; it follows the parent's text size, 14 px like a row name.
     let typed = ws.typed_input().filter(|_| m.typing).map(|input| {
-        // The input box follows the parent's text size. Set it to 13px like the menu, not the root's 16px.
-        v_flex()
-            .mt_2()
-            .gap_1()
-            .text_size(px(13.))
-            .child(Input::new(input))
-            .child(
-                div()
-                    .text_size(px(11.))
-                    .text_color(t.text_tertiary.hsla())
-                    .child("Enter create · Esc back"),
-            )
+        glass::clear_capsule(&t)
+            .px(glass::pad(6.))
+            .py(glass::pad(4.))
+            .text_size(px(14.))
+            .child(Input::new(input).appearance(false))
     });
+    let hints = h_flex()
+        .justify_center()
+        .gap(px(18.))
+        .pt(px(4.))
+        .text_size(px(12.))
+        .line_height(px(15.))
+        .text_color(t.text_secondary.hsla())
+        .children(footer(&m.profiles, m.typing));
     div()
         .id("launcher")
         .flex_1()
@@ -139,73 +174,92 @@ pub fn render(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
         .items_center()
         .justify_center()
         .child(
-            v_flex()
-                .min_w(px(MENU_W))
+            glass::sheet(&t)
+                .w(px(SHEET_W))
+                .flex()
+                .flex_col()
+                .gap(px(BLOCK_GAP))
+                .pt(glass::pad(26.))
+                .px(glass::pad(22.))
+                .pb(glass::pad(18.))
                 .child(head)
-                .child(
-                    div()
-                        .mt_5()
-                        .mb_2()
-                        .text_size(px(13.))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(t.text.hsla())
-                        .child("New session"),
-                )
-                .children(rows)
+                .child(label)
+                .child(rows)
                 .children(typed)
-                .child(
-                    div()
-                        .mt_5()
-                        .text_size(px(12.))
-                        .text_color(t.text_tertiary.hsla())
-                        .child(footer(&m.profiles)),
-                ),
+                .child(hints),
         )
 }
 
-/// One menu row: `1  personal   [P]`, and the dim login note for a profile that isn't logged in. Clicking picks that row.
+/// One menu row: the key capsule, the chip (or its empty slot), the name, and at the right the login note of a profile that isn't
+/// logged in, whose row reads dim. Clicking picks that row.
+///
+/// The sheet's stack is at the 0.92 alpha cap, so nothing on it adds a translucent fill: the lit row shows by its edge and highlight,
+/// hover lights a row's edge, and the key capsules are clear, except the lit row's, which is the solid accent.
 fn row(
     k: usize,
     r: Row,
-    selected: bool,
+    lit: bool,
     t: &Theme,
     cx: &mut Context<Workspace>,
 ) -> impl IntoElement + use<> {
     let choice = r.choice;
-    h_flex()
+    let ink = if r.hint.is_some() {
+        t.text_tertiary
+    } else {
+        t.text
+    };
+    let key = if lit {
+        div().bg(t.accent.hsla()).text_color(t.on_accent.hsla())
+    } else {
+        glass::clear_capsule(t)
+    };
+    let key = key
+        .flex()
+        .flex_shrink_0()
+        .items_center()
+        .justify_center()
+        .min_w(px(KEY))
+        .h(px(KEY))
+        .px(glass::pad(6.))
+        .rounded_full()
+        .text_size(px(12.))
+        .line_height(px(15.))
+        .font_weight(FontWeight::SEMIBOLD)
+        .child(r.key);
+    // Shell and the typed form keep the chip's slot, so the names line up.
+    let chip = match r.chip {
+        Some((letter, color)) => chip(letter, color).size(px(CHIP)).line_height(px(CHIP)),
+        None => div().flex_shrink_0().w(px(CHIP)),
+    };
+    let row = glass::clear_row(t, lit)
         .id(("launch", k))
-        .h(px(30.))
-        .px_2()
-        .gap_3()
-        .rounded(px(6.))
-        .cursor_pointer()
-        .text_size(px(13.))
-        .when(selected, |this| this.bg(t.panel_strong.hsla()))
-        .hover(|s| s.bg(t.panel_strong.hsla()))
+        .flex()
+        .items_center()
+        .gap(px(PART_GAP))
+        .py(glass::pad(10.))
+        .px(glass::pad(12.))
+        .text_color(ink.hsla())
+        .child(key)
+        .child(chip)
         .child(
             div()
-                .w(px(16.))
-                .flex_shrink_0()
-                .font_weight(FontWeight::BOLD)
-                .text_color(t.text.hsla())
-                .child(r.key),
-        )
-        .child(
-            div()
-                .min_w(px(LABEL_W))
-                .flex_shrink_0()
-                .whitespace_nowrap()
-                .text_color(t.text.hsla())
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_size(px(14.))
+                .line_height(px(17.))
+                .when(lit, |name| name.font_weight(FontWeight::SEMIBOLD))
                 .child(r.label),
         )
-        .children(r.chip.map(|(letter, color)| chip(letter, color)))
         .children(r.hint.map(|hint| {
             div()
                 .flex_shrink_0()
                 .whitespace_nowrap()
-                .text_color(t.text_tertiary.hsla())
+                .text_size(px(12.))
+                .line_height(px(15.))
                 .child(hint)
-        }))
+        }));
+    glass::hover_edge(row, if lit { t.highlight } else { t.edge })
         .on_click(cx.listener(move |ws, _, window, cx| ws.launch(choice.clone(), window, cx)))
 }
 
@@ -322,7 +376,27 @@ mod tests {
         // The value that picks a row is the profile id, regardless of its label.
         assert_eq!(rows[1].choice, Choice::Profile("claude-b".into()));
         // The footer names the Enter row.
-        assert_eq!(footer(&m.profiles), "↵ personal · ⌘W close");
-        assert_eq!(footer(&[]), "⌘W close");
+        assert_eq!(footer(&m.profiles, false), ["↵ personal", "⌘W close"]);
+        assert_eq!(footer(&[], false), ["⌘W close"]);
+    }
+
+    /// The Enter row is lit (spec 4.3): the default profile's, or the typed form's while it is open. The footer then says what Enter
+    /// and Esc do in the form.
+    #[test]
+    fn the_enter_row_is_lit() {
+        let list = builtin();
+        let lits = |typing| -> Vec<bool> {
+            row_texts(&list)
+                .iter()
+                .map(|row| lit(row, typing))
+                .collect()
+        };
+        assert_eq!(lits(false), [true, false, false, false, false]);
+        assert_eq!(lits(true), [false, false, false, false, true]);
+        assert!(row_texts(&[]).iter().all(|row| !lit(row, false)));
+        assert_eq!(
+            footer(&list, true),
+            ["Enter create", "Esc back", "⌘W close"]
+        );
     }
 }

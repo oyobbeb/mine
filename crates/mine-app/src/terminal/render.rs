@@ -8,7 +8,7 @@ use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Rgb};
 use mine_core::screen::Screen;
 
-use crate::theme::{ANSI, TERM_BG, TERM_CURSOR, TERM_FG, indexed};
+use crate::theme::{ANSI, TERM_BG, TERM_CURSOR, TERM_FG, TERM_SELECTION, indexed};
 
 /// Cells that continue in the same style along one row. Occupies `cells` columns starting at `col`. Colors are `0xRRGGBB`.
 ///
@@ -122,6 +122,22 @@ pub fn row_runs(screen: &Screen, row: usize) -> Vec<CellRun> {
         open = plain.then_some(width);
     }
     runs
+}
+
+/// The background quads of a frame as (row, col, cells, color): each run's own background, then the marks (the selection and the
+/// find box's matches, as (row, col, cells)) on the selection color, in paint order. A default-background cell paints nothing, so
+/// the pane's own fill shows there.
+pub fn backgrounds(
+    runs: &[(u16, CellRun)],
+    marks: &[(u16, u16, u16)],
+) -> Vec<(u16, u16, u16, u32)> {
+    let own = runs
+        .iter()
+        .filter_map(|(row, run)| Some((*row, run.col, run.cells, run.bg?)));
+    let marked = marks
+        .iter()
+        .map(|&(row, col, cells)| (row, col, cells, TERM_SELECTION));
+    own.chain(marked).collect()
 }
 
 /// A cell that doesn't need to be drawn: a space on the default background with no underline, strikethrough, inverse or link.
@@ -274,7 +290,7 @@ pub fn openable(url: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::theme::{TERM_BG, TERM_FG};
+    use crate::theme::{TERM_BG, TERM_FG, TERM_SELECTION};
 
     fn screen(cols: u16, rows: u16, bytes: &[u8]) -> Screen {
         let mut s = Screen::new(cols, rows);
@@ -326,6 +342,25 @@ mod tests {
         // An inverse blank has a background, so it stays even at the end of a line.
         let runs = row_runs(&screen(20, 3, b"a\x1b[7m  "), 0);
         assert_eq!(texts(&runs), [(0, 1, "a"), (1, 2, "  ")]);
+    }
+
+    /// The pane's own fill shows through every default-background cell (spec 4.3). Only a cell with a background of its own and a
+    /// marked (selected or found) cell paint, so a full-screen app keeps its colors and nothing else covers the pane.
+    #[test]
+    fn default_bg_cells_skip_paint_explicit_bg_cells_paint() {
+        let s = screen(20, 3, b"ab\x1b[44mc\x1b[0mdef\r\nplain");
+        let row = |r: u16| -> Vec<(u16, CellRun)> {
+            row_runs(&s, usize::from(r))
+                .into_iter()
+                .map(|run| (r, run))
+                .collect()
+        };
+        // "c" has a blue background of its own; "e" (column 4) is selected.
+        assert_eq!(
+            backgrounds(&row(0), &[(0, 4, 1)]),
+            [(0, 2, 1, 0x61afef), (0, 4, 1, TERM_SELECTION)]
+        );
+        assert!(backgrounds(&row(1), &[]).is_empty());
     }
 
     #[test]

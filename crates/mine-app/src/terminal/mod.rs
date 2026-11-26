@@ -41,7 +41,7 @@ use mine_core::select::{MouseEv, MouseKind};
 
 use crate::actions::{self, CloseFind, Find, FindPrev, Paste};
 use crate::glass;
-use crate::theme::{self, TERM_BG, TERM_CURSOR, TERM_FG, TERM_SELECTION};
+use crate::theme::{self, TERM_BG, TERM_CURSOR, TERM_FG};
 use crate::workspace::Workspace;
 use find::FindState;
 use ime::Ime;
@@ -54,7 +54,7 @@ pub const CONTEXT: &str = "Terminal";
 /// The find box's key context, for Shift+Enter and Esc. The box is beside the pane, not in it, so keys typed into it
 /// don't reach the pane's key-down listener (and the session).
 pub const FIND_CONTEXT: &str = "TerminalFind";
-const FONT_FAMILY: &str = "Menlo";
+pub(crate) const FONT_FAMILY: &str = "Menlo";
 const FONT_SIZE: Pixels = px(13.);
 /// Margin around the pane's edge.
 /// The mockup's terminal pane padding, 22 × 26 from the pane's outer edge, inside its 1 px edge. It is the pane's own padding,
@@ -512,27 +512,38 @@ fn track_mouse(ws: &Entity<Workspace>, window: &mut Window) {
     });
 }
 
-/// The find box over the pane's top right corner, with the match count. Enter arrives as the input's own
-/// `PressEnter`; Shift+Enter and Esc are bindings in [`FIND_CONTEXT`]. It occludes the pane, so clicks and drags in
-/// it don't select terminal text.
+/// The find box: a small glass capsule over the pane's top right corner, with the match count in secondary text. Enter arrives as
+/// the input's own `PressEnter`; Shift+Enter and Esc are bindings in [`FIND_CONTEXT`]. It occludes the pane, so clicks and drags in
+/// it don't select terminal text. That also hides a click in it from the frame's capture-phase presence listener, so the box reports
+/// it itself, as the tab bar does.
+///
+/// Its fill is the panel's solid form. No wallpaper shows over the terminal anyway, the light palette's translucent panel would read
+/// dark there under dark text, and a solid box hides the terminal text under it.
 fn find_box(find: &FindBox, cx: &mut Context<Workspace>) -> impl IntoElement {
-    let faint = theme::current(cx).text_tertiary.hsla();
-    let status = find
-        .state
-        .status()
-        .map(|status| div().text_size(px(11.)).text_color(faint).child(status));
-    div()
+    let t = theme::current(cx).clone();
+    let status = find.state.status().map(|status| {
+        div()
+            .text_size(px(11.))
+            .text_color(t.text_secondary.hsla())
+            .child(status)
+    });
+    glass::capsule(&t, false)
+        .bg(t.opaque().panel.hsla())
         .absolute()
         .top(PAD_Y)
         .right(px(16.))
         .w(px(260.))
+        .px(glass::pad(6.))
+        .py(glass::pad(4.))
         .key_context(FIND_CONTEXT)
         .occlude()
+        .capture_any_mouse_down(cx.listener(|ws, _, _, _| ws.user_input()))
         .on_action(cx.listener(|ws, _: &FindPrev, _, cx| ws.find_step(false, cx)))
         .on_action(cx.listener(|ws, _: &CloseFind, window, cx| ws.find_close(window, cx)))
         .child(
             Input::new(&find.input)
                 .small()
+                .appearance(false)
                 .when_some(status, |input, status| input.suffix(status)),
         )
 }
@@ -589,9 +600,9 @@ fn layout(
         }
         (runs, render::cursor(screen), composing, marks)
     });
-    let marks = marks
+    let fills = render::backgrounds(&runs, &marks)
         .into_iter()
-        .map(|(row, col, cells)| geometry.cell_bounds(col, row, cells))
+        .map(|(row, col, cells, color)| (geometry.cell_bounds(col, row, cells), hsla(color)))
         .collect();
     let text = window.text_system().clone();
     let cells = runs
@@ -608,7 +619,7 @@ fn layout(
         bounds,
         line_h: metrics.line_h,
         cells,
-        marks,
+        fills,
         caret,
         composing,
     }
@@ -642,8 +653,9 @@ struct Frame {
     bounds: Bounds<Pixels>,
     line_h: Pixels,
     cells: Vec<Painted>,
-    /// The selected cells and the find box's matches. Painted over the cell backgrounds; the text stays as it is.
-    marks: Vec<Bounds<Pixels>>,
+    /// The cells' own backgrounds, then the selection and the find box's matches over them ([`render::backgrounds`]). The text
+    /// stays as it is.
+    fills: Vec<(Bounds<Pixels>, Hsla)>,
     caret: Option<Caret>,
     /// The text being composed, drawn over the cursor.
     composing: Option<Painted>,
@@ -655,13 +667,8 @@ impl Frame {
             bounds: self.bounds,
         };
         window.with_content_mask(Some(mask), |window| {
-            for cell in &self.cells {
-                if let Some(bg) = cell.bg {
-                    window.paint_quad(fill(cell.bounds, bg));
-                }
-            }
-            for mark in &self.marks {
-                window.paint_quad(fill(*mark, hsla(TERM_SELECTION)));
+            for &(bounds, color) in &self.fills {
+                window.paint_quad(fill(bounds, color));
             }
             if let Some(caret) = &self.caret
                 && caret.filled()
@@ -867,7 +874,6 @@ fn key_in(k: &Keystroke) -> KeyIn {
 /// One shaped text run and its position.
 struct Painted {
     bounds: Bounds<Pixels>,
-    bg: Option<Hsla>,
     line: ShapedLine,
     /// Where to place the text. A wide character is pushed to the middle of its two cells.
     text_at: Point<Pixels>,
@@ -921,7 +927,6 @@ impl Painted {
         }
         Painted {
             bounds,
-            bg: run.bg.map(hsla),
             line,
             text_at,
             color,

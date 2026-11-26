@@ -1275,7 +1275,7 @@ pub(crate) mod tests {
                 Effect::Send(ToDaemon::List),
                 Effect::Send(ToDaemon::Colors {
                     fg: "#d0d3da".into(),
-                    bg: "#1e2128".into(),
+                    bg: "#0b0c10".into(),
                 }),
             ]
         );

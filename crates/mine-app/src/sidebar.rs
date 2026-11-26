@@ -82,14 +82,16 @@ pub fn render(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
         )
 }
 
-/// The strip above the list while the connection is down. The reason it dropped (if the version differs, how to restart the daemon) is written small below.
+/// The clear box at the top of the list while the connection is down. The reason it dropped (if the version differs, how to restart
+/// the daemon) is written small below. It has no fill: it sits in the panel, whose stack can't take another one. It is a row's 16 px
+/// rounding, not a capsule: a capsule's ends would cut into the first and last of its several lines.
 fn offline_banner(reason: &str, t: &Theme) -> impl IntoElement {
-    v_flex()
-        .px_3()
-        .py_2()
-        .gap_0p5()
-        .border_b_1()
-        .border_color(t.edge.hsla())
+    glass::clear_row(t, true)
+        .flex()
+        .flex_col()
+        .px(glass::pad(14.))
+        .py(glass::pad(8.))
+        .gap(px(2.))
         .child(
             div()
                 .text_size(px(12.))
@@ -219,7 +221,7 @@ const TRACKING: f32 = 0.06 * HEAD_SIZE;
 /// GPUI 0.2.2 has no letter spacing, so each letter is its own text in a box as wide as the letter's advance plus the tracking. (A
 /// text sizes itself to its width rounded up to a whole pixel, which would add about half a pixel per letter.)
 // ponytail: this loses kerning between the letters. Use GPUI's own letter spacing if it gets one.
-fn tracked(text: &str, cx: &App) -> Vec<Div> {
+pub(crate) fn tracked(text: &str, cx: &App) -> Vec<Div> {
     let system = cx.text_system();
     let font = system.resolve_font(&gpui::font(UiTheme::global(cx).font_family.clone()));
     text.chars()

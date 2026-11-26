@@ -43,8 +43,6 @@ pub fn panel(theme: &Theme) -> Div {
 }
 
 /// The launcher and dialogs: radius 28, `sheet` fill, and a deeper shadow.
-// ponytail: the launcher restyle (Task 4) is its first user.
-#[allow(dead_code)]
 pub fn sheet(theme: &Theme) -> Div {
     floating(theme, theme.sheet, SHEET_RADIUS, SHEET_BLUR, theme.shadow)
 }
@@ -65,6 +63,16 @@ pub fn capsule(theme: &Theme, strong: bool) -> Div {
 pub fn row(theme: &Theme, selected: bool) -> Div {
     if selected {
         lit(theme, Some(theme.panel_strong), theme.edge, ROW_RADIUS)
+    } else {
+        plain(ROW_RADIUS)
+    }
+}
+
+/// A row with no fill of its own, for a stack at the 0.92 alpha cap (a [`sheet`]'s rows) or a box in a panel (the offline banner).
+/// Lit, it shows by the edge outline and the highlight line; unlit, the outline is clear.
+pub fn clear_row(theme: &Theme, on: bool) -> Div {
+    if on {
+        lit(theme, None, theme.edge, ROW_RADIUS)
     } else {
         plain(ROW_RADIUS)
     }
@@ -118,8 +126,8 @@ pub fn hover_fill(control: Stateful<Div>, theme: &Theme) -> Stateful<Div> {
         .active(|s| s.opacity(PRESSED))
 }
 
-/// Hover and press for a control that has a fill already (selected, strong, pending or accent). Its stack is at the 0.92 alpha cap
-/// already, so hover lights its edge up to `rim` instead of adding fill. Press dims it.
+/// Hover and press for a control that has a fill already (selected, strong, pending or accent), or that sits on a sheet. Its stack is
+/// at the 0.92 alpha cap already, so hover lights its edge up to `rim` instead of adding fill. Press dims it.
 pub fn hover_edge(control: Stateful<Div>, rim: Tint) -> Stateful<Div> {
     let rim = rim.hsla();
     control
@@ -253,6 +261,14 @@ mod tests {
         assert_eq!(fill(capsule(&dark, true)), token(dark.panel_strong));
         assert_eq!(fill(row(&dark, true)), token(dark.panel_strong));
         assert_eq!(fill(row(&dark, false)), None);
+        // Nothing translucent goes on a sheet: a lit launcher row shows by its edge.
+        assert_eq!(fill(clear_row(&dark, true)), None);
+        assert_eq!(border(clear_row(&light, true)), Some(light.edge.hsla()));
+        assert_eq!(
+            border(clear_row(&light, false)),
+            Some(Hsla::transparent_black())
+        );
+        assert_eq!(radius(clear_row(&dark, true)), px(16.));
         // Spec 4.1 radii; a capsule is fully rounded.
         assert_eq!(radius(panel(&dark)), px(20.));
         assert_eq!(radius(sheet(&dark)), px(28.));

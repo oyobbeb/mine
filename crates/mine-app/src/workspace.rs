@@ -533,16 +533,15 @@ fn center(ws: &Workspace, window: &Window, cx: &mut Context<Workspace>) -> impl 
             pane.bg(t.terminal.hsla())
                 .child(terminal::render(ws, window, cx))
         })
+        // A capsule in the message's own row, so the terminal resizes for it as before and the text never sits on the bare tint.
         .when_some(m.message.clone(), |this, message| {
             this.child(
-                div()
+                glass::capsule(&t, false)
                     .flex_shrink_0()
-                    .px_3()
-                    .py_1p5()
-                    .bg(t.panel.hsla())
-                    .border_t_1()
-                    .border_color(t.edge.hsla())
+                    .px(glass::pad(14.))
+                    .py(glass::pad(6.))
                     .text_size(px(12.))
+                    .line_height(px(15.))
                     .text_color(t.accent_text.hsla())
                     .child(message),
             )

@@ -264,6 +264,18 @@ The `share` column of `mine profile ls` reads `linked:N own:a,b split:c` (`elsew
 
 mine never reads or stores credentials. Whether a profile is logged in is decided by existence only: an `oauthAccount` field in `.claude.json`, or Codex's `auth.json` being there (it is never opened). For automatic names it reads one more field, the login email in `.claude.json`, and never logs it. Labels are display-only: `mine ls`, `mine new --profile`, and the launcher's `n` prompt use the profile ids.
 
+### Appearance
+
+The desktop app draws its panels as glass over a blurred window, in dark or light. By default it follows the system appearance, and when **Reduce transparency** is on (System Settings → Accessibility → Display) it draws the same palette opaque. To pin the look, add an `[appearance]` table to `~/.mine/config.toml`:
+
+```toml
+[appearance]
+mode = "system"   # "system" (the default), "dark", or "light"
+glass = true      # false draws the same palette opaque
+```
+
+The app reads this table itself, at start and each time its window comes to the front, so an edit applies the next time you switch to the window. A broken value falls back to the default with one warning in the app's log, and the daemon ignores the table. A pinned mode restyles mine's own surfaces only: the close dialog, the folder picker, and menus follow the system. The terminal pane stays dark in both modes.
+
 ### State directory
 
 State lives in `~/.mine` (override with `MINE_STATE_DIR`).
@@ -272,7 +284,7 @@ State lives in `~/.mine` (override with `MINE_STATE_DIR`).
 ~/.mine/
   daemon.sock           Unix socket clients attach to
   daemon.pid            lock file that keeps a single daemon running
-  config.toml           profiles and labels (optional)
+  config.toml           profiles, labels, and appearance (optional)
   projects/<key>.json   registered project paths
   sessions/<id>/        meta.json, events.jsonl (hook events), exit
   run/                  holder process sockets
