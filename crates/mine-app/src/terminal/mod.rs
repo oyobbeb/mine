@@ -40,7 +40,8 @@ use mine_core::keys::KeyModes;
 use mine_core::select::{MouseEv, MouseKind};
 
 use crate::actions::{self, CloseFind, Find, FindPrev, Paste};
-use crate::theme::{FAINT, TERM_BG, TERM_CURSOR, TERM_FG, TERM_SELECTION};
+use crate::glass;
+use crate::theme::{self, TERM_BG, TERM_CURSOR, TERM_FG, TERM_SELECTION};
 use crate::workspace::Workspace;
 use find::FindState;
 use ime::Ime;
@@ -56,7 +57,10 @@ pub const FIND_CONTEXT: &str = "TerminalFind";
 const FONT_FAMILY: &str = "Menlo";
 const FONT_SIZE: Pixels = px(13.);
 /// Margin around the pane's edge.
-const PADDING: Pixels = px(6.);
+/// The mockup's terminal pane padding, 22 × 26 from the pane's outer edge, inside its 1 px edge. It is the pane's own padding,
+/// so a click in it still focuses the pane.
+const PAD_Y: Pixels = glass::pad(22.);
+const PAD_X: Pixels = glass::pad(26.);
 /// Opacity of dim text (SGR 2).
 const DIM: f32 = 0.6;
 /// Thickness of the bar and underline cursors.
@@ -442,8 +446,8 @@ pub fn render(ws: &Workspace, window: &Window, cx: &mut Context<Workspace>) -> i
     let focused = ws.term.focus.is_focused(window);
     let pane = div()
         .size_full()
-        .p(PADDING)
-        .bg(rgb(TERM_BG))
+        .py(PAD_Y)
+        .px(PAD_X)
         .track_focus(&ws.term.focus)
         .key_context(CONTEXT)
         .on_key_down(cx.listener(|ws, ev: &KeyDownEvent, _, cx| ws.term_key(ev, cx)))
@@ -512,15 +516,14 @@ fn track_mouse(ws: &Entity<Workspace>, window: &mut Window) {
 /// `PressEnter`; Shift+Enter and Esc are bindings in [`FIND_CONTEXT`]. It occludes the pane, so clicks and drags in
 /// it don't select terminal text.
 fn find_box(find: &FindBox, cx: &mut Context<Workspace>) -> impl IntoElement {
-    let status = find.state.status().map(|status| {
-        div()
-            .text_size(px(11.))
-            .text_color(rgb(FAINT))
-            .child(status)
-    });
+    let faint = theme::current(cx).text_tertiary.hsla();
+    let status = find
+        .state
+        .status()
+        .map(|status| div().text_size(px(11.)).text_color(faint).child(status));
     div()
         .absolute()
-        .top(PADDING)
+        .top(PAD_Y)
         .right(px(16.))
         .w(px(260.))
         .key_context(FIND_CONTEXT)

@@ -3,8 +3,8 @@
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AnyElement, Axis, Context, ElementId, FontWeight, InteractiveElement, IntoElement, MouseButton,
-    ParentElement, StatefulInteractiveElement, Styled, div, px, rgb,
+    AnyElement, Axis, Context, ElementId, FontWeight, Hsla, InteractiveElement, IntoElement,
+    MouseButton, ParentElement, StatefulInteractiveElement, Styled, div, px, rgb,
 };
 use gpui_component::{StyledExt, h_flex, v_flex};
 use mine_core::launch;
@@ -12,15 +12,17 @@ use mine_core::profiles::ProfileInfo;
 use mine_core::session::{SessionInfo, SessionState};
 use mine_core::view::{Group, folder_name};
 
+use crate::glass;
 use crate::model::{self, Model, ProjectItem};
-use crate::theme::*;
+use crate::theme::{self, CHIP_FG, Theme};
 use crate::workspace::Workspace;
 
-/// List width.
-pub const WIDTH: f32 = 260.;
+/// List width, the mockup's 286.
+pub const WIDTH: f32 = 286.;
 
 pub fn render(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
     let m = &ws.model;
+    let t = theme::current(cx).clone();
     let groups = m.visible_groups();
     let mut list: Vec<AnyElement> = Vec::new();
     if groups.is_empty() && m.connected {
@@ -29,87 +31,105 @@ pub fn render(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
                 .px_3()
                 .pt_3()
                 .text_size(px(12.))
-                .text_color(rgb(FAINT))
+                .text_color(t.text_tertiary.hsla())
                 .child("No sessions")
                 .into_any_element(),
         );
     }
     for (gi, g) in groups.iter().enumerate() {
-        list.push(group_head(gi, g, cx).into_any_element());
+        list.push(group_head(gi, g, &t, cx).into_any_element());
         if !g.collapsed {
             list.extend(
                 g.rows
                     .iter()
-                    .map(|&i| session_row(m, i, cx).into_any_element()),
+                    .map(|&i| session_row(m, i, &t, cx).into_any_element()),
             );
         }
     }
-    v_flex()
-        .id("sidebar")
+    // The panel carries its own shadow outside it, so the clipping is on the content inside.
+    glass::panel(&t)
         .w(px(WIDTH))
         .flex_shrink_0()
         .h_full()
-        .overflow_hidden()
-        .bg(rgb(LIST_BG))
-        .border_r_1()
-        .border_color(rgb(BORDER))
-        .when_some(m.offline.as_deref(), |this, reason| {
-            this.child(offline_banner(reason))
-        })
-        .child(new_task(cx))
-        .child(project_picker(m, ws.picker_open, cx))
         .child(
             v_flex()
-                .id("groups")
-                .flex_1()
-                .min_h_0()
-                .child(div().pb_2().children(list).scrollable(Axis::Vertical)),
+                .id("sidebar")
+                .size_full()
+                .overflow_hidden()
+                // The mockup's panel: padding 14 × 12 and 12 between its blocks.
+                .py(glass::pad(14.))
+                .px(glass::pad(12.))
+                .gap(px(12.))
+                .when_some(m.offline.as_deref(), |this, reason| {
+                    this.child(offline_banner(reason, &t))
+                })
+                .child(new_task(&t, cx))
+                .child(project_picker(m, ws.picker_open, &t, cx))
+                .child(
+                    v_flex()
+                        .id("groups")
+                        .flex_1()
+                        .min_h_0()
+                        .child(div().pb_2().children(list).scrollable(Axis::Vertical)),
+                )
+                .child(add_project(&t, cx)),
         )
-        .child(add_project(cx))
 }
 
 /// The strip above the list while the connection is down. The reason it dropped (if the version differs, how to restart the daemon) is written small below.
-fn offline_banner(reason: &str) -> impl IntoElement {
+fn offline_banner(reason: &str, t: &Theme) -> impl IntoElement {
     v_flex()
         .px_3()
         .py_2()
         .gap_0p5()
-        .bg(rgb(BAR_BG))
         .border_b_1()
-        .border_color(rgb(BORDER))
+        .border_color(t.edge.hsla())
         .child(
             div()
                 .text_size(px(12.))
-                .text_color(rgb(WAITING))
+                .text_color(t.accent_text.hsla())
                 .child("Disconnected from the daemon · reconnecting…"),
         )
         .child(
             div()
                 .text_size(px(11.))
-                .text_color(rgb(FAINT))
+                .text_color(t.text_tertiary.hsla())
                 .child(reason.to_string()),
         )
 }
 
 /// "＋ New task". Clicking opens the launcher (same as ⌘N).
-fn new_task(cx: &mut Context<Workspace>) -> impl IntoElement {
+fn new_task(t: &Theme, cx: &mut Context<Workspace>) -> impl IntoElement {
     h_flex()
         .id("new-task")
-        .mx_2()
-        .mt_2()
         .px_2()
         .h(px(30.))
         .rounded(px(6.))
         .text_size(px(13.))
         .cursor_pointer()
-        .hover(|s| s.bg(rgb(SELECTED_BG)))
-        .child(div().flex_1().text_color(rgb(TITLE)).child("＋ New task"))
-        .child(div().text_size(px(12.)).text_color(rgb(FAINT)).child("⌘N"))
+        .hover(|s| s.bg(t.panel_strong.hsla()))
+        .child(
+            div()
+                .flex_1()
+                .text_color(t.text.hsla())
+                .child("＋ New task"),
+        )
+        .child(
+            div()
+                .text_size(px(12.))
+                .text_color(t.text_tertiary.hsla())
+                .child("⌘N"),
+        )
         .on_click(cx.listener(|ws, _, window, cx| ws.new_task(window, cx)))
 }
 
 /// Project picker. Clicking expands it downward to show "All projects" and the projects; choosing one collapses it.
-fn project_picker(m: &Model, open: bool, cx: &mut Context<Workspace>) -> impl IntoElement {
+fn project_picker(
+    m: &Model,
+    open: bool,
+    t: &Theme,
+    cx: &mut Context<Workspace>,
+) -> impl IntoElement {
     let items = m.projects();
     let current = items
         .iter()
@@ -130,13 +150,13 @@ fn project_picker(m: &Model, open: bool, cx: &mut Context<Workspace>) -> impl In
                 .flex_1()
                 .min_w_0()
                 .truncate()
-                .text_color(rgb(TEXT))
+                .text_color(t.text.hsla())
                 .child(project_name(&current)),
         )
-        .when(current.approval, |this| this.child(approval_mark()))
+        .when(current.approval, |this| this.child(approval_mark(t)))
         .child(
             div()
-                .text_color(rgb(FAINT))
+                .text_color(t.text_tertiary.hsla())
                 .child(if open { "▴" } else { "▾" }),
         )
         .on_click(cx.listener(|ws, _, _, cx| ws.toggle_picker(cx)));
@@ -152,21 +172,18 @@ fn project_picker(m: &Model, open: bool, cx: &mut Context<Workspace>) -> impl In
                 .gap_1p5()
                 .cursor_pointer()
                 .border_t_1()
-                .border_color(rgb(BORDER))
-                .when(selected, |this| this.bg(rgb(SELECTED_BG)))
-                .hover(|s| s.bg(rgb(SELECTED_BG)))
+                .border_color(t.edge.hsla())
+                .when(selected, |this| this.bg(t.panel_strong.hsla()))
+                .hover(|s| s.bg(t.panel_strong.hsla()))
                 .child(div().flex_1().min_w_0().truncate().child(name))
-                .when(approval, |this| this.child(approval_mark()))
+                .when(approval, |this| this.child(approval_mark(t)))
                 .on_click(cx.listener(move |ws, _, _, cx| ws.pick_project(item.root.clone(), cx)))
         })
     });
     v_flex()
-        .mx_2()
-        .mt_1()
-        .mb_1()
         .rounded(px(6.))
         .border_1()
-        .border_color(rgb(BORDER))
+        .border_color(t.edge.hsla())
         .overflow_hidden()
         .text_size(px(13.))
         .child(head)
@@ -179,12 +196,12 @@ fn project_name(item: &ProjectItem) -> String {
         .map_or_else(|| "All projects".to_string(), folder_name)
 }
 
-fn approval_mark() -> impl IntoElement {
-    div().text_color(rgb(APPROVAL)).child("◆")
+fn approval_mark(t: &Theme) -> impl IntoElement {
+    div().text_color(t.approval.hsla()).child("◆")
 }
 
 /// Group header: `▾ ◆ Needs approval  1`. Clicking collapses or expands it.
-fn group_head(gi: usize, g: &Group, cx: &mut Context<Workspace>) -> impl IntoElement {
+fn group_head(gi: usize, g: &Group, t: &Theme, cx: &mut Context<Workspace>) -> impl IntoElement {
     h_flex()
         .id(("group", gi))
         .px_3()
@@ -196,21 +213,25 @@ fn group_head(gi: usize, g: &Group, cx: &mut Context<Workspace>) -> impl IntoEle
         .child(
             div()
                 .w(px(10.))
-                .text_color(rgb(FAINT))
+                .text_color(t.text_tertiary.hsla())
                 .child(if g.collapsed { "▸" } else { "▾" }),
         )
         .child(
             div()
-                .text_color(rgb(state_color(&g.state)))
+                .text_color(state_color(t, &g.state))
                 .child(model::glyph(&g.state)),
         )
         .child(
             div()
                 .flex_1()
-                .text_color(rgb(MUTED))
+                .text_color(t.text_secondary.hsla())
                 .child(model::group_label(&g.state)),
         )
-        .child(div().text_color(rgb(FAINT)).child(g.rows.len().to_string()))
+        .child(
+            div()
+                .text_color(t.text_tertiary.hsla())
+                .child(g.rows.len().to_string()),
+        )
         .on_click({
             // Holds the state, not the position. Even if a new list arrives after drawing and the groups shift, the clicked group is the one that changes.
             let state = g.state.clone();
@@ -219,17 +240,18 @@ fn group_head(gi: usize, g: &Group, cx: &mut Context<Workspace>) -> impl IntoEle
 }
 
 /// The color of a status symbol. Tabs use the same color.
-pub fn state_color(state: &SessionState) -> u32 {
+pub fn state_color(t: &Theme, state: &SessionState) -> Hsla {
     match state {
-        SessionState::Approval => APPROVAL,
-        SessionState::Working => WORKING,
-        SessionState::Done | SessionState::Ended => DONE,
-        SessionState::Idle => FAINT,
+        SessionState::Approval => t.approval,
+        SessionState::Working => t.working,
+        SessionState::Done | SessionState::Ended => t.done,
+        SessionState::Idle => t.idle,
     }
+    .hsla()
 }
 
 /// A session row. The first line is the name and chip, the second is `project · waiting text or status`. Clicking attaches to that session.
-fn session_row(m: &Model, i: usize, cx: &mut Context<Workspace>) -> impl IntoElement {
+fn session_row(m: &Model, i: usize, t: &Theme, cx: &mut Context<Workspace>) -> impl IntoElement {
     let s: &SessionInfo = &m.sessions[i];
     // Holds the id, not the position. Even if a new list arrives after drawing and the rows shift, it attaches to the clicked session.
     let id = s.meta.id.clone();
@@ -243,8 +265,8 @@ fn session_row(m: &Model, i: usize, cx: &mut Context<Workspace>) -> impl IntoEle
         .gap_0p5()
         .rounded(px(6.))
         .cursor_pointer()
-        .when(selected, |this| this.bg(rgb(SELECTED_BG)))
-        .hover(|s| s.bg(rgb(SELECTED_BG)))
+        .when(selected, |this| this.bg(t.panel_strong.hsla()))
+        .hover(|s| s.bg(t.panel_strong.hsla()))
         .on_click(cx.listener(move |ws, _, window, cx| ws.attach(&id, window, cx)))
         .child(
             h_flex()
@@ -255,7 +277,7 @@ fn session_row(m: &Model, i: usize, cx: &mut Context<Workspace>) -> impl IntoEle
                         .flex_1()
                         .min_w_0()
                         .truncate()
-                        .text_color(rgb(if selected { TITLE } else { TEXT }))
+                        .text_color(t.text.hsla())
                         .child(s.meta.name.clone()),
                 )
                 .children(account_chip(s.meta.account.as_deref(), &m.profiles)),
@@ -265,20 +287,25 @@ fn session_row(m: &Model, i: usize, cx: &mut Context<Workspace>) -> impl IntoEle
                 .gap_1()
                 .min_w_0()
                 .text_size(px(12.))
-                .text_color(rgb(MUTED))
+                .text_color(t.text_secondary.hsla())
                 .child(div().flex_shrink_0().child(folder_name(&s.meta.project)))
-                .child(div().flex_shrink_0().text_color(rgb(FAINT)).child("·"))
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .text_color(t.text_tertiary.hsla())
+                        .child("·"),
+                )
                 .child(
                     div()
                         .min_w_0()
                         .truncate()
-                        .when(waiting, |this| this.text_color(rgb(WAITING)))
+                        .when(waiting, |this| this.text_color(t.accent_text.hsla()))
                         .child(status.to_string()),
                 ),
         )
         .children(
             m.answerable(s)
-                .map(|request| answer_buttons(&s.meta.id, request, cx)),
+                .map(|request| answer_buttons(&s.meta.id, request, t, cx)),
         )
 }
 
@@ -297,7 +324,12 @@ fn button_id(label: &str, session: &str, request: u64) -> ElementId {
 
 /// Allow and Deny for held request `request` of session `id`. Each answers exactly that request, the one the row or tab showed when it
 /// was drawn. A press on them stays on them: it doesn't also select the row or tab underneath. Tabs use it too.
-pub fn answer_buttons(id: &str, request: u64, cx: &Context<Workspace>) -> impl IntoElement {
+pub fn answer_buttons(
+    id: &str,
+    request: u64,
+    t: &Theme,
+    cx: &Context<Workspace>,
+) -> impl IntoElement {
     let button = |label: &'static str, allow: bool| {
         let session = id.to_string();
         div()
@@ -315,14 +347,14 @@ pub fn answer_buttons(id: &str, request: u64, cx: &Context<Workspace>) -> impl I
             .on_click(cx.listener(move |ws, _, _, _| ws.answer(&session, request, allow)))
             .map(|this| {
                 if allow {
-                    this.bg(rgb(APPROVAL))
-                        .text_color(rgb(CHIP_FG))
+                    this.bg(t.accent.hsla())
+                        .text_color(t.on_accent.hsla())
                         .font_weight(FontWeight::BOLD)
                 } else {
                     this.border_1()
-                        .border_color(rgb(BORDER))
-                        .text_color(rgb(MUTED))
-                        .hover(|s| s.bg(rgb(SELECTED_BG)))
+                        .border_color(t.edge.hsla())
+                        .text_color(t.text_secondary.hsla())
+                        .hover(|s| s.bg(t.panel_strong.hsla()))
                 }
             })
             .child(label)
@@ -358,18 +390,18 @@ pub fn chip(letter: String, color: u32) -> impl IntoElement {
 }
 
 /// "＋ Add project". Clicking picks a folder and registers it as a project.
-fn add_project(cx: &mut Context<Workspace>) -> impl IntoElement {
+fn add_project(t: &Theme, cx: &mut Context<Workspace>) -> impl IntoElement {
     h_flex()
         .id("add-project")
         .flex_shrink_0()
         .px_3()
         .h(px(36.))
         .border_t_1()
-        .border_color(rgb(BORDER))
+        .border_color(t.edge.hsla())
         .text_size(px(12.))
-        .text_color(rgb(FAINT))
+        .text_color(t.text_tertiary.hsla())
         .cursor_pointer()
-        .hover(|s| s.text_color(rgb(TEXT)))
+        .hover(|s| s.text_color(t.text.hsla()))
         .child("＋ Add project")
         .on_click(cx.listener(|ws, _, _, cx| ws.add_project(cx)))
 }

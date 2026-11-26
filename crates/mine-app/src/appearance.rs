@@ -1,12 +1,12 @@
 //! The `[appearance]` table of `<state>/config.toml`: which palette the app draws and whether surfaces are glass.
 //!
 //! This is a client-side setting. The app reads the file itself; the daemon's profile parser ignores the table.
-// ponytail: only the tests use most of this until the window wiring lands, so the dead-code lint is off for now.
-#![allow(dead_code)]
 
 use std::fs;
-use std::io;
-use std::process::Command;
+use std::io::{self, Read};
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use mine_core::paths::State;
 
@@ -101,12 +101,38 @@ pub fn load(state: &State) -> (Appearance, Vec<String>) {
     }
 }
 
-/// Whether macOS **Reduce transparency** is on. `false` when it can't be read, so a failure never makes the app opaque.
+/// The longest [`reduce_transparency`] waits for `defaults`.
+const DEFAULTS_WAIT: Duration = Duration::from_secs(1);
+
+/// Whether macOS **Reduce transparency** is on. `false` when it can't be read in [`DEFAULTS_WAIT`], so a failure never makes the app
+/// opaque. It runs a process and waits for it, so call it off the UI thread.
 pub fn reduce_transparency() -> bool {
-    Command::new("defaults")
+    let Ok(mut child) = Command::new("/usr/bin/defaults")
         .args(["read", "com.apple.universalaccess", "reduceTransparency"])
-        .output()
-        .is_ok_and(|out| out.status.success() && is_on(&out.stdout))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let deadline = Instant::now() + DEFAULTS_WAIT;
+    // ponytail: polls every 10 ms; the answer is one short line, so the pipe can't fill while it waits.
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let mut out = Vec::new();
+                let read = child.stdout.take().map(|mut s| s.read_to_end(&mut out));
+                return status.success() && matches!(read, Some(Ok(_))) && is_on(&out);
+            }
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
 }
 
 /// The output of `defaults read com.apple.universalaccess reduceTransparency` that means on: `1`.

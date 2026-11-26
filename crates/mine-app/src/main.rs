@@ -5,6 +5,7 @@
 
 mod actions;
 mod appearance;
+mod glass;
 mod launcher;
 mod model;
 mod sidebar;
@@ -18,19 +19,22 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use gpui::{
-    AnyView, App, AppContext, Application, Bounds, Global, Menu, MenuItem, WindowBounds,
-    WindowOptions, px, size,
+    AnyView, App, AppContext, Application, Bounds, Global, Menu, MenuItem, Pixels, Point,
+    TitlebarOptions, WindowBounds, WindowOptions, point, px, size,
 };
-use gpui_component::{Root, TitleBar};
+use gpui_component::Root;
 use mine_core::env::login_env;
 use mine_core::link;
 use mine_core::paths::State;
 use mine_core::{project, session};
 
 use actions::Quit;
+use appearance::Mode;
 use model::Model;
 use workspace::{Problem, Workspace};
 
+/// Where the traffic lights go: 20 px in, and the 14 px buttons centered in the title-bar row (`workspace::TITLE_ROW`).
+const TRAFFIC_LIGHTS: Point<Pixels> = point(px(20.), px((workspace::TITLE_ROW - 14.) / 2.));
 /// The longest the app waits at startup for the login shell to print its environment.
 const LOGIN_ENV_WAIT: Duration = Duration::from_secs(3);
 
@@ -53,7 +57,6 @@ fn main() {
     });
     app.run(|cx| {
         gpui_component::init(cx);
-        theme::install(cx, &theme::Theme::dark_glass());
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.bind_keys(actions::bindings());
         cx.set_menus(vec![Menu {
@@ -69,10 +72,16 @@ fn main() {
 
 /// The view that looks up the state folder and `mine` and starts the daemon link. If it can't find them, the view shows the reason.
 fn root_view(cx: &mut App) -> AnyView {
+    let dark = workspace::is_dark(cx.window_appearance());
     let state = match State::from_env() {
         Ok(state) => state,
-        Err(e) => return cx.new(|_| Problem(format!("{e:#}"))).into(),
+        Err(e) => {
+            theme::install(cx, &theme::resolve(Mode::System, dark, true, false));
+            return cx.new(|_| Problem(format!("{e:#}"))).into();
+        }
     };
+    // The window opens with this look. Reduce transparency is read off the UI thread once it is up (`Workspace::refresh_look`).
+    theme::install(cx, &workspace::theme_with(dark, &state, || false));
     // On macOS, current_exe() returns the symlink path as is. Look next to the real file, not next to the link (~/bin/mine-app).
     let exe_dir = std::env::current_exe()
         .and_then(|exe| exe.canonicalize())
@@ -117,17 +126,20 @@ fn current_project(state: &State) -> (PathBuf, bool) {
     (root, home_fallback)
 }
 
-/// Opens the 1200×800 window in the center of the screen. The title bar is drawn by hand in the mockup colors.
+/// Opens the 1280×800 window (the mockup's artboard size) in the center of the screen, with the current theme's background
+/// (blurred glass or opaque). The title bar is drawn by the app, clear over the window tint.
 fn open_window(cx: &mut App) {
     let view = cx.global::<MainView>().0.clone();
-    let bounds = Bounds::centered(None, size(px(1200.), px(800.)), cx);
+    let bounds = Bounds::centered(None, size(px(1280.), px(800.)), cx);
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
-        titlebar: Some(gpui::TitlebarOptions {
+        titlebar: Some(TitlebarOptions {
             title: Some("mine".into()),
-            ..TitleBar::title_bar_options()
+            appears_transparent: true,
+            traffic_light_position: Some(TRAFFIC_LIGHTS),
         }),
         window_min_size: Some(size(px(640.), px(400.))),
+        window_background: theme::current(cx).window_background(),
         ..Default::default()
     };
     let opened = cx.open_window(options, |window, cx| {

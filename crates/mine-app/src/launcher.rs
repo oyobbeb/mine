@@ -4,7 +4,7 @@
 use gpui::prelude::FluentBuilder;
 use gpui::{
     Context, FontWeight, InteractiveElement, IntoElement, Keystroke, ParentElement,
-    StatefulInteractiveElement, Styled, div, px, rgb,
+    StatefulInteractiveElement, Styled, div, px,
 };
 use gpui_component::input::Input;
 use gpui_component::{h_flex, v_flex};
@@ -13,7 +13,7 @@ use mine_core::profiles::ProfileInfo;
 use mine_core::view::folder_name;
 
 use crate::sidebar::chip;
-use crate::theme::*;
+use crate::theme::{self, Theme};
 use crate::workspace::Workspace;
 
 /// Minimum menu width, and the name column's minimum width. The chip lines up after the name column, and a longer row widens the menu.
@@ -84,6 +84,7 @@ pub fn is_escape(k: &Keystroke) -> bool {
 /// The launcher that fills the center. Order: header (project name and `~` path), "New session", menu rows, input box, hint.
 pub fn render(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
     let m = &ws.model;
+    let t = theme::current(cx).clone();
     let project = m.project();
     let home = std::env::home_dir();
     let head = h_flex()
@@ -95,7 +96,7 @@ pub fn render(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
                 .flex_shrink_0()
                 .text_size(px(15.))
                 .font_weight(FontWeight::BOLD)
-                .text_color(rgb(TITLE))
+                .text_color(t.text.hsla())
                 .child(folder_name(project)),
         )
         // Zero width plus grow: a long path fills what the rows leave and truncates, instead of widening the menu.
@@ -105,7 +106,7 @@ pub fn render(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
                 .flex_1()
                 .truncate()
                 .text_size(px(13.))
-                .text_color(rgb(FAINT))
+                .text_color(t.text_tertiary.hsla())
                 .child(tilde(project, home.as_deref())),
         );
     let rows = row_texts(&m.profiles)
@@ -113,7 +114,7 @@ pub fn render(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
         .enumerate()
         .map(|(k, r)| {
             let selected = m.typing && r.choice == Choice::Typed;
-            row(k, r, selected, cx)
+            row(k, r, selected, &t, cx)
         })
         .collect::<Vec<_>>();
     let typed = ws.typed_input().filter(|_| m.typing).map(|input| {
@@ -126,7 +127,7 @@ pub fn render(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
             .child(
                 div()
                     .text_size(px(11.))
-                    .text_color(rgb(FAINT))
+                    .text_color(t.text_tertiary.hsla())
                     .child("Enter create · Esc back"),
             )
     });
@@ -137,7 +138,6 @@ pub fn render(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
         .flex()
         .items_center()
         .justify_center()
-        .bg(rgb(WINDOW_BG))
         .child(
             v_flex()
                 .min_w(px(MENU_W))
@@ -148,7 +148,7 @@ pub fn render(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
                         .mb_2()
                         .text_size(px(13.))
                         .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(TITLE))
+                        .text_color(t.text.hsla())
                         .child("New session"),
                 )
                 .children(rows)
@@ -157,14 +157,20 @@ pub fn render(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
                     div()
                         .mt_5()
                         .text_size(px(12.))
-                        .text_color(rgb(FAINT))
+                        .text_color(t.text_tertiary.hsla())
                         .child(footer(&m.profiles)),
                 ),
         )
 }
 
 /// One menu row: `1  personal   [P]`, and the dim login note for a profile that isn't logged in. Clicking picks that row.
-fn row(k: usize, r: Row, selected: bool, cx: &mut Context<Workspace>) -> impl IntoElement + use<> {
+fn row(
+    k: usize,
+    r: Row,
+    selected: bool,
+    t: &Theme,
+    cx: &mut Context<Workspace>,
+) -> impl IntoElement + use<> {
     let choice = r.choice;
     h_flex()
         .id(("launch", k))
@@ -174,14 +180,14 @@ fn row(k: usize, r: Row, selected: bool, cx: &mut Context<Workspace>) -> impl In
         .rounded(px(6.))
         .cursor_pointer()
         .text_size(px(13.))
-        .when(selected, |this| this.bg(rgb(SELECTED_BG)))
-        .hover(|s| s.bg(rgb(SELECTED_BG)))
+        .when(selected, |this| this.bg(t.panel_strong.hsla()))
+        .hover(|s| s.bg(t.panel_strong.hsla()))
         .child(
             div()
                 .w(px(16.))
                 .flex_shrink_0()
                 .font_weight(FontWeight::BOLD)
-                .text_color(rgb(TITLE))
+                .text_color(t.text.hsla())
                 .child(r.key),
         )
         .child(
@@ -189,7 +195,7 @@ fn row(k: usize, r: Row, selected: bool, cx: &mut Context<Workspace>) -> impl In
                 .min_w(px(LABEL_W))
                 .flex_shrink_0()
                 .whitespace_nowrap()
-                .text_color(rgb(TEXT))
+                .text_color(t.text.hsla())
                 .child(r.label),
         )
         .children(r.chip.map(|(letter, color)| chip(letter, color)))
@@ -197,7 +203,7 @@ fn row(k: usize, r: Row, selected: bool, cx: &mut Context<Workspace>) -> impl In
             div()
                 .flex_shrink_0()
                 .whitespace_nowrap()
-                .text_color(rgb(FAINT))
+                .text_color(t.text_tertiary.hsla())
                 .child(hint)
         }))
         .on_click(cx.listener(move |ws, _, window, cx| ws.launch(choice.clone(), window, cx)))

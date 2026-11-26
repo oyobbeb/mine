@@ -1,10 +1,10 @@
 //! Colors. Two layers live here:
 //!
 //! - The token layer ([`Theme`]): the dark and light glass palettes as data, a model of GPUI's blend ([`composite`]), and the
-//!   contrast rule the palettes are tested against. Views read the current [`Theme`] from the [`CurrentTheme`] global.
-//! - The fixed dark colors the views still draw with, and the terminal colors. Values are the `0xrrggbb` passed to GPUI `rgb()`.
-//!   The view constants go away as each view moves to the tokens; `TERM_*`, [`ANSI`] and [`indexed`] stay.
-// ponytail: most of the token layer is only used by its tests until the views and the window wiring move over, so the lint is off.
+//!   contrast rule the palettes are tested against. Views read the current [`Theme`] with [`current`].
+//! - The terminal colors, and the chip letter the views still draw with. Values are the `0xrrggbb` passed to GPUI `rgb()`.
+//!   `TERM_*`, [`ANSI`] and [`indexed`] stay; [`CHIP_FG`] goes when chips move to [`chip_text`].
+// ponytail: parts of the token layer (`chip_text`, the pending-row tokens) wait for the task list restyle, so the lint is off.
 #![allow(dead_code)]
 
 use gpui::{App, Global, Hsla, WindowBackgroundAppearance, rgb};
@@ -12,28 +12,6 @@ use gpui_component::{Theme as UiTheme, ThemeMode};
 
 use crate::appearance::Mode;
 
-/// Window background.
-pub const WINDOW_BG: u32 = 0x1e2128;
-/// Left list background.
-pub const LIST_BG: u32 = 0x23252b;
-/// Title bar and strips.
-pub const BAR_BG: u32 = 0x1b1d23;
-/// Selected row, and a clickable row while the mouse is over it.
-pub const SELECTED_BG: u32 = 0x2f323a;
-pub const BORDER: u32 = 0x2c2f36;
-pub const TEXT: u32 = 0xd0d3da;
-pub const TITLE: u32 = 0xe6e6e6;
-/// Dim text (group names, second line).
-pub const MUTED: u32 = 0x8a8f99;
-/// Dimmer text (counts, shortcuts, hints).
-pub const FAINT: u32 = 0x6b707a;
-/// The waiting text of a session that needs approval.
-pub const WAITING: u32 = 0xc9a85c;
-/// The Needs approval symbol ◆.
-pub const APPROVAL: u32 = 0xe5c07b;
-/// The Working symbol ◐ and the Done symbol ✓. Same colors as the TUI list.
-pub const WORKING: u32 = 0x56b6c2;
-pub const DONE: u32 = 0x98c379;
 /// Chip text color.
 pub const CHIP_FG: u32 = 0x1e2128;
 
@@ -103,8 +81,9 @@ const fn tint(rgb: u32, alpha: f32) -> Tint {
 /// Every color the views draw with, for one look: dark or light, glass or opaque.
 ///
 /// Surfaces are drawn bottom to top, and each one only adds to what is below it: the window tint over the blurred wallpaper, then a
-/// `panel` (the task list, the tab bar), then a `panel_strong` (the selected row, the active tab) or a `row_pending`; a `sheet` or the
-/// `terminal` pane sits straight on the window tint. See [`composite`] for how GPUI blends such a stack.
+/// `panel` (the task list, the tab bar, the center pane), then a `panel_strong` (the selected row, the active tab), a `row_pending`, or
+/// the launcher's `sheet`; the `terminal` fill replaces `panel` in the center pane. No text sits on the bare window tint: the title
+/// row holds only the tab capsule. See [`composite`] for how GPUI blends such a stack.
 /// Text and status colors are solid: a translucent glyph would let the wallpaper through it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Theme {
@@ -147,18 +126,19 @@ pub struct Theme {
 }
 
 impl Theme {
-    /// Dark glass. The window tint carries most of the alpha: over a white wallpaper the leftover (1 − Σα) of the backdrop is what
-    /// the light text has to beat, so the panels on top only get what the 0.92 cap leaves.
+    /// Dark glass. Over a white wallpaper the leftover (1 − Σα) of the backdrop is what the light text has to beat, so a panel stack
+    /// sums to 0.84. Half of that is the panels' own slate fill, not the window tint: the gaps between the panels show half the
+    /// blurred wallpaper, and the panels read as darker glass over it (over white, gap 141 and panel 67; over black, 13 and 26).
     pub fn dark_glass() -> Theme {
         Theme {
             dark: true,
             glass: true,
-            window_tint: tint(0x1c1e26, 0.78),
-            panel: tint(0xffffff, 0.06),
+            window_tint: tint(0x1a1d27, 0.50),
+            panel: tint(0x343844, 0.34),
             panel_strong: tint(0xffffff, 0.08),
-            sheet: tint(0xffffff, 0.12),
-            edge: tint(0xffffff, 0.10),
-            highlight: tint(0xffffff, 0.22),
+            sheet: tint(0xffffff, 0.08),
+            edge: tint(0xffffff, 0.14),
+            highlight: tint(0xffffff, 0.36),
             shadow: tint(0x000000, 0.28),
             terminal: tint(0x0b0c10, 0.97),
             text: Tint::solid(0xf5f6f8),
@@ -185,7 +165,7 @@ impl Theme {
             window_tint: tint(0xffffff, 0.70),
             panel: tint(0xffffff, 0.12),
             panel_strong: tint(0xffffff, 0.10),
-            sheet: tint(0xffffff, 0.22),
+            sheet: tint(0xffffff, 0.10),
             edge: tint(0x000000, 0.06),
             highlight: tint(0xffffff, 0.95),
             shadow: tint(0x3c465a, 0.16),
@@ -206,10 +186,10 @@ impl Theme {
     }
 
     /// The same palette with every surface turned solid. Each surface token becomes what its stack looks like over a neutral backdrop
-    /// (the dark charcoal or a light gray), so it keeps the glass look without needing a wallpaper. `shadow` stays translucent: a
-    /// shadow needs its alpha to fade out.
+    /// (a near-black, so the panels stand off the window as they do in glass, or a light gray), so it keeps the glass look without
+    /// needing a wallpaper. `shadow` stays translucent: a shadow needs its alpha to fade out.
     pub fn opaque(&self) -> Theme {
-        let base = if self.dark { 0x1c1e26 } else { 0xe8e8ed };
+        let base = if self.dark { 0x0e1016 } else { 0xe8e8ed };
         let solid = |stack: &[Tint]| Tint::solid(composite(stack, base));
         let (w, p) = (self.window_tint, self.panel);
         Theme {
@@ -217,7 +197,7 @@ impl Theme {
             window_tint: solid(&[w]),
             panel: solid(&[w, p]),
             panel_strong: solid(&[w, p, self.panel_strong]),
-            sheet: solid(&[w, self.sheet]),
+            sheet: solid(&[w, p, self.sheet]),
             terminal: solid(&[w, self.terminal]),
             edge: solid(&[w, p, self.edge]),
             highlight: solid(&[w, p, self.highlight]),
@@ -315,6 +295,11 @@ pub fn chip_text(chip_rgb: u32) -> u32 {
 pub struct CurrentTheme(pub Theme);
 
 impl Global for CurrentTheme {}
+
+/// The theme the views draw with. Every view reads it while drawing, so installing another one and refreshing repaints them all.
+pub fn current(cx: &App) -> &Theme {
+    &cx.global::<CurrentTheme>().0
+}
 
 /// Makes `theme` the current theme and mirrors it into gpui-component's (its mode, and the colors of the widgets mine still uses).
 ///
@@ -416,11 +401,11 @@ mod tests {
         ]
     }
 
-    /// The surfaces text is drawn on, bottom to top. The terminal pane has its own rule.
-    fn surface_stacks(th: &Theme) -> [(&'static str, Vec<Tint>); 5] {
+    /// The surfaces text is drawn on, bottom to top. The terminal pane has its own rule. The bare window tint is not one: the title
+    /// row holds only the tab capsule, and the launcher's sheet sits in the center pane (Ruling G-R3).
+    fn surface_stacks(th: &Theme) -> [(&'static str, Vec<Tint>); 4] {
         let w = th.window_tint;
         [
-            ("[window_tint]", vec![w]),
             ("[window_tint, panel]", vec![w, th.panel]),
             (
                 "[window_tint, panel, panel_strong]",
@@ -430,7 +415,7 @@ mod tests {
                 "[window_tint, panel, row_pending]",
                 vec![w, th.panel, th.row_pending],
             ),
-            ("[window_tint, sheet]", vec![w, th.sheet]),
+            ("[window_tint, panel, sheet]", vec![w, th.panel, th.sheet]),
         ]
     }
 
