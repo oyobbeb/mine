@@ -525,6 +525,7 @@ fn find_box(find: &FindBox, cx: &mut Context<Workspace>) -> impl IntoElement {
         div()
             .text_size(px(11.))
             .text_color(t.text_secondary.hsla())
+            .font_weight(t.secondary_weight)
             .child(status)
     });
     glass::capsule(&t, false)

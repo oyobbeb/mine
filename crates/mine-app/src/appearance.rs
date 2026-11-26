@@ -20,20 +20,22 @@ pub enum Mode {
     Light,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Appearance {
-    pub mode: Mode,
-    /// `false` draws every surface opaque, with the same palette.
-    pub glass: bool,
+/// `glass` in `[appearance]`: how much of the blurred wallpaper the surfaces let through.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Glass {
+    /// The mockup's translucency, with brighter, heavier secondary text.
+    #[default]
+    Clear,
+    /// Less translucent: readable over a pure white wallpaper at the full contrast floors.
+    Balanced,
+    /// Every surface opaque, with the balanced palette.
+    Solid,
 }
 
-impl Default for Appearance {
-    fn default() -> Self {
-        Appearance {
-            mode: Mode::System,
-            glass: true,
-        }
-    }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct Appearance {
+    pub mode: Mode,
+    pub glass: Glass,
 }
 
 /// Reads `[appearance]` from the text of `config.toml` (`None` for no file). Always returns a usable value: a bad key falls back to its
@@ -72,11 +74,16 @@ pub fn parse(text: Option<&str>) -> (Appearance, Vec<String>) {
                         "[appearance] mode must be \"system\", \"dark\" or \"light\"; using system"
                             .into(),
                     ),
-                    ("glass", toml::Value::Boolean(glass)) => appearance.glass = *glass,
-                    ("glass", _) => {
-                        warnings
-                            .push("[appearance] glass must be true or false; using true".into());
-                    }
+                    // `true` and `false` are the old settings: glass, which is now `clear`, or opaque.
+                    ("glass", value) => match (value.as_str(), value.as_bool()) {
+                        (Some("clear"), _) | (_, Some(true)) => appearance.glass = Glass::Clear,
+                        (Some("balanced"), _) => appearance.glass = Glass::Balanced,
+                        (Some("solid"), _) | (_, Some(false)) => appearance.glass = Glass::Solid,
+                        _ => warnings.push(
+                            "[appearance] glass must be \"clear\", \"balanced\" or \"solid\"; using clear"
+                                .into(),
+                        ),
+                    },
                     _ => warnings.push(format!("[appearance] unknown key {key:?}, ignored")),
                 }
             }
@@ -155,7 +162,7 @@ mod tests {
             Appearance::default(),
             Appearance {
                 mode: Mode::System,
-                glass: true
+                glass: Glass::Clear
             }
         );
     }
@@ -167,7 +174,7 @@ mod tests {
             a,
             Appearance {
                 mode: Mode::Light,
-                glass: false
+                glass: Glass::Solid
             }
         );
         assert!(warnings.is_empty(), "{warnings:?}");
@@ -177,9 +184,32 @@ mod tests {
             ("light", Mode::Light),
         ] {
             let (a, warnings) = parse(Some(&format!("[appearance]\nmode = \"{word}\"\n")));
-            assert_eq!((a.mode, a.glass), (mode, true));
+            assert_eq!((a.mode, a.glass), (mode, Glass::Clear));
             assert!(warnings.is_empty(), "{warnings:?}");
         }
+    }
+
+    /// The three levels by name, the old booleans (`true` was the glass that is now `clear`), and the default. A level it doesn't
+    /// know is the default, with one warning.
+    #[test]
+    fn glass_levels_parse() {
+        let glass = |line: &str| parse(Some(&format!("[appearance]\n{line}\n")));
+        for (line, level) in [
+            ("glass = \"clear\"", Glass::Clear),
+            ("glass = \"balanced\"", Glass::Balanced),
+            ("glass = \"solid\"", Glass::Solid),
+            ("glass = true", Glass::Clear),
+            ("glass = false", Glass::Solid),
+            ("mode = \"dark\"", Glass::Clear),
+        ] {
+            let (a, warnings) = glass(line);
+            assert_eq!(a.glass, level, "{line}");
+            assert!(warnings.is_empty(), "{line}: {warnings:?}");
+        }
+        let (a, warnings) = glass("glass = \"foggy\"");
+        assert_eq!(a.glass, Glass::Clear);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(!warnings[0].contains("foggy"), "{}", warnings[0]);
     }
 
     #[test]
@@ -206,7 +236,7 @@ mod tests {
             a,
             Appearance {
                 mode: Mode::Dark,
-                glass: true
+                glass: Glass::Clear
             }
         );
         assert_eq!(warnings.len(), 1, "{warnings:?}");

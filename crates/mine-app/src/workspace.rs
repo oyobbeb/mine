@@ -182,24 +182,13 @@ impl Workspace {
         let appearance =
             cx.observe_window_appearance(window, |ws, window, cx| ws.refresh_look(window, cx));
         self.activation = Some((id, [activation, appearance]));
-        // The window may have become active before this hook existed. The look installed at startup assumed Reduce transparency
-        // was off; this reads it.
+        // The window may have become active before this hook existed, or changed since the look was installed at startup.
         self.set_focused(window.is_window_active());
         self.refresh_look(window, cx);
     }
 
-    /// Re-reads the look for the window's current appearance on a background thread (the config file and `defaults`), then applies it
-    /// to the window if it changed.
     fn refresh_look(&mut self, window: &Window, cx: &mut Context<Self>) {
-        let dark = is_dark(window.appearance());
-        let state = self.state.clone();
-        let read = cx
-            .background_executor()
-            .spawn(async move { appearance_theme(dark, &state) });
-        self.look = Some(cx.spawn_in(window, async move |_, cx| {
-            let theme = read.await;
-            let _ = cx.update(|window, cx| apply_theme(&theme, window, cx));
-        }));
+        self.look = Some(refresh_look(Some(self.state.clone()), window, cx));
     }
 
     fn set_focused(&mut self, focused: bool) {
@@ -576,11 +565,48 @@ fn frame(t: &Theme, title: impl IntoElement) -> gpui::Div {
     )
 }
 
-/// The view shown in the window when the app can't be used (such as when there is no `mine` to start the daemon).
-pub struct Problem(pub String);
+/// The view shown in the window when the app can't be used (such as when there is no `mine` to start the daemon). Like
+/// [`Workspace`], it re-reads the look when its window becomes active or switches between light and dark.
+pub struct Problem {
+    message: String,
+    /// Where `[appearance]` is read from. `None` when there is no state folder: the default look.
+    state: Option<State>,
+    /// The subscriptions set for the window it was last drawn in, and that window (see [`Workspace::watch_activation`]).
+    hooks: Option<(WindowId, [Subscription; 2])>,
+    /// The re-read of the look in flight.
+    look: Option<Task<()>>,
+}
+
+impl Problem {
+    pub fn new(message: String, state: Option<State>) -> Self {
+        Problem {
+            message,
+            state,
+            hooks: None,
+            look: None,
+        }
+    }
+
+    fn refresh_look(&mut self, window: &Window, cx: &mut Context<Self>) {
+        self.look = Some(refresh_look(self.state.clone(), window, cx));
+    }
+}
 
 impl Render for Problem {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let id = window.window_handle().window_id();
+        if self.hooks.as_ref().is_none_or(|(seen, _)| *seen != id) {
+            let activation = cx.observe_window_activation(window, |problem, window, cx| {
+                if window.is_window_active() {
+                    problem.refresh_look(window, cx);
+                }
+            });
+            let appearance = cx.observe_window_appearance(window, |problem, window, cx| {
+                problem.refresh_look(window, cx)
+            });
+            self.hooks = Some((id, [activation, appearance]));
+            self.refresh_look(window, cx);
+        }
         // Text never sits on the bare window tint (the contrast test doesn't cover it), so the reason is in a panel.
         let t = theme::current(cx);
         frame(t, div()).child(
@@ -595,7 +621,7 @@ impl Render for Problem {
                         .px_8()
                         .py_6()
                         .text_size(px(14.))
-                        .child(self.0.clone()),
+                        .child(self.message.clone()),
                 ),
         )
     }
@@ -611,15 +637,38 @@ pub fn is_dark(appearance: WindowAppearance) -> bool {
 
 /// The theme the window should draw with now: `[appearance]` re-read from `<state>/config.toml`, macOS Reduce transparency, and the
 /// window's light or dark appearance. It reads a file and runs `defaults`, so call it off the UI thread.
-pub fn appearance_theme(system_dark: bool, state: &State) -> Theme {
+pub fn appearance_theme(system_dark: bool, state: Option<&State>) -> Theme {
     theme_with(system_dark, state, appearance::reduce_transparency)
 }
 
-/// [`appearance_theme`] with the Reduce transparency check passed in. The check only runs when the config asks for glass.
-pub fn theme_with(system_dark: bool, state: &State, reduced: impl FnOnce() -> bool) -> Theme {
-    let (look, warnings) = appearance::load(state);
+/// [`appearance_theme`] with the Reduce transparency check passed in. The check only runs when the config asks for glass. With no
+/// state folder (`None`) the config is the default.
+pub fn theme_with(
+    system_dark: bool,
+    state: Option<&State>,
+    reduced: impl FnOnce() -> bool,
+) -> Theme {
+    let (look, warnings) = state.map_or_else(Default::default, appearance::load);
     warn_once(warnings);
-    theme::resolve(look.mode, system_dark, look.glass, look.glass && reduced())
+    let solid = look.glass == appearance::Glass::Solid;
+    theme::resolve(look.mode, system_dark, look.glass, !solid && reduced())
+}
+
+/// Re-reads the look for the window's current appearance on a background thread (the config file and `defaults`), then applies it
+/// to the window if it changed. Dropping the task cancels it.
+fn refresh_look<V: 'static>(
+    state: Option<State>,
+    window: &Window,
+    cx: &mut Context<V>,
+) -> Task<()> {
+    let dark = is_dark(window.appearance());
+    let read = cx
+        .background_executor()
+        .spawn(async move { appearance_theme(dark, state.as_ref()) });
+    cx.spawn_in(window, async move |_, cx| {
+        let theme = read.await;
+        let _ = cx.update(|window, cx| apply_theme(&theme, window, cx));
+    })
 }
 
 /// Prints the config's warnings when they differ from the last ones printed, so a broken `[appearance]` is reported once, not at
@@ -667,8 +716,14 @@ mod tests {
     fn appearance_theme_follows_system() {
         let state = temp_state("system");
         set_mode(&state, "system");
-        assert_eq!(theme_with(false, &state, || false), Theme::light_glass());
-        assert_eq!(theme_with(true, &state, || false), Theme::dark_glass());
+        assert_eq!(
+            theme_with(false, Some(&state), || false),
+            Theme::light_clear()
+        );
+        assert_eq!(
+            theme_with(true, Some(&state), || false),
+            Theme::dark_clear()
+        );
         fs::remove_dir_all(&state.root).unwrap();
     }
 
@@ -677,9 +732,9 @@ mod tests {
     fn activation_rereads_reduce_transparency_and_config() {
         let state = temp_state("activation");
         let reduce = Cell::new(false);
-        let activate = || theme_with(true, &state, || reduce.get());
+        let activate = || theme_with(true, Some(&state), || reduce.get());
         let first = activate();
-        assert_eq!(first, Theme::dark_glass());
+        assert_eq!(first, Theme::dark_clear());
         assert_eq!(
             first.window_background(),
             WindowBackgroundAppearance::Blurred
@@ -694,8 +749,19 @@ mod tests {
         set_mode(&state, "light");
         assert_eq!(activate(), Theme::light_glass().opaque());
         reduce.set(false);
-        assert_eq!(activate(), Theme::light_glass());
+        assert_eq!(activate(), Theme::light_clear());
         fs::remove_dir_all(&state.root).unwrap();
+    }
+
+    /// Without a state folder (the problem view when `State::from_env` fails) the look is the default, and Reduce transparency still
+    /// makes it opaque.
+    #[test]
+    fn no_state_folder_uses_default_look() {
+        assert_eq!(theme_with(true, None, || false), Theme::dark_clear());
+        assert_eq!(
+            theme_with(false, None, || true),
+            Theme::light_glass().opaque()
+        );
     }
 
     #[test]

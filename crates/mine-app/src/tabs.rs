@@ -43,6 +43,7 @@ pub fn render(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
             .gap_1p5()
             .text_size(px(13.))
             .text_color(if selected { t.text } else { t.text_secondary }.hsla())
+            .when(!selected, |tab| tab.font_weight(t.secondary_weight))
             .child(
                 div()
                     .text_color(state_color(&t, &s.state))
@@ -52,6 +53,7 @@ pub fn render(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
                 this.child(
                     div()
                         .text_color(t.text_tertiary.hsla())
+                        .font_weight(t.secondary_weight)
                         .child(format!("{} ·", folder_name(&s.meta.project))),
                 )
             })
@@ -77,6 +79,7 @@ pub fn render(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
         .size(px(HEIGHT))
         .text_size(px(16.))
         .text_color(if launcher { t.text } else { t.text_secondary }.hsla())
+        .when(!launcher, |plus| plus.font_weight(t.secondary_weight))
         .child("+")
         .on_click(cx.listener(|ws, _, window, cx| ws.new_task(window, cx)));
     let plus = if launcher {

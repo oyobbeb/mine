@@ -29,7 +29,6 @@ use mine_core::paths::State;
 use mine_core::{project, session};
 
 use actions::Quit;
-use appearance::Mode;
 use model::Model;
 use workspace::{Problem, Workspace};
 
@@ -66,22 +65,27 @@ fn main() {
         let view = root_view(cx);
         cx.set_global(MainView(view));
         open_window(cx);
-        cx.activate(true);
+        // Screenshot runs set MINE_APP_NO_ACTIVATE, so the app opens behind and never takes the user's keystrokes (Ruling G-R13).
+        if std::env::var_os("MINE_APP_NO_ACTIVATE").is_none() {
+            cx.activate(true);
+        }
     });
 }
 
 /// The view that looks up the state folder and `mine` and starts the daemon link. If it can't find them, the view shows the reason.
 fn root_view(cx: &mut App) -> AnyView {
     let dark = workspace::is_dark(cx.window_appearance());
+    // The window opens with the look these give, so Reduce transparency is read before it opens: on its own thread, while the login
+    // shell below runs, so it adds no wait.
+    let reduced = std::thread::spawn(appearance::reduce_transparency);
+    let reduced = || reduced.join().unwrap_or(false);
     let state = match State::from_env() {
         Ok(state) => state,
         Err(e) => {
-            theme::install(cx, &theme::resolve(Mode::System, dark, true, false));
-            return cx.new(|_| Problem(format!("{e:#}"))).into();
+            theme::install(cx, &workspace::theme_with(dark, None, reduced));
+            return cx.new(|_| Problem::new(format!("{e:#}"), None)).into();
         }
     };
-    // The window opens with this look. Reduce transparency is read off the UI thread once it is up (`Workspace::refresh_look`).
-    theme::install(cx, &workspace::theme_with(dark, &state, || false));
     // On macOS, current_exe() returns the symlink path as is. Look next to the real file, not next to the link (~/bin/mine-app).
     let exe_dir = std::env::current_exe()
         .and_then(|exe| exe.canonicalize())
@@ -91,6 +95,7 @@ fn root_view(cx: &mut App) -> AnyView {
     // environment instead, or the app's own if that fails. `mine` is looked up in the login shell's PATH first, then the app's.
     // ponytail: read on the main thread before the window opens, so a slow profile delays startup by up to LOGIN_ENV_WAIT.
     let login = login_env(&session::login_shell(), LOGIN_ENV_WAIT);
+    theme::install(cx, &workspace::theme_with(dark, Some(&state), reduced));
     let login_path = login.iter().flatten().find(|(k, _)| k == "PATH");
     let path = login_path
         .map(|(_, v)| OsString::from(v))
@@ -103,7 +108,7 @@ fn root_view(cx: &mut App) -> AnyView {
         });
     let Some(mine) = link::find_mine(std::env::var_os("MINE_BIN"), exe_dir.as_deref(), path) else {
         let message = "Couldn't find the mine executable · install it with cargo install --path crates/mine-cli";
-        return cx.new(|_| Problem(message.into())).into();
+        return cx.new(|_| Problem::new(message.into(), Some(state))).into();
     };
     let (current, home_fallback) = current_project(&state);
     let mut model = Model::new(current);

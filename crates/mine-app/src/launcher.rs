@@ -13,11 +13,11 @@ use gpui::{
 use gpui_component::input::Input;
 use gpui_component::{h_flex, v_flex};
 use mine_core::launch::{self, Choice, enter_choice, tilde};
-use mine_core::profiles::ProfileInfo;
+use mine_core::profiles::{ProfileInfo, ProfileKind};
 use mine_core::view::folder_name;
 
-use crate::glass;
-use crate::sidebar::{chip, tracked};
+use crate::glass::{self, INSET};
+use crate::sidebar::{HEAD_SIZE, chip, tracked};
 use crate::terminal::FONT_FAMILY;
 use crate::theme::{self, Theme};
 use crate::workspace::Workspace;
@@ -31,13 +31,14 @@ const KEY: f32 = 26.;
 const CHIP: f32 = 20.;
 const PART_GAP: f32 = 12.;
 
-/// A menu row as drawn: what it picks, its key (blank past the ninth profile), its name, for a profile its chip (letter, color) and,
-/// if it isn't logged in, the login note, and whether Enter picks it. Drawing and tests use the same values.
+/// A menu row as drawn: what it picks, its key (blank past the ninth profile), its name, for a profile its chip (letter, color), its
+/// agent and, if it isn't logged in, the login note, and whether Enter picks it. Drawing and tests use the same values.
 struct Row {
     choice: Choice,
     key: String,
     label: String,
     chip: Option<(String, u32)>,
+    agent: Option<&'static str>,
     hint: Option<String>,
     enter: bool,
 }
@@ -55,6 +56,10 @@ fn row_texts(profiles: &[ProfileInfo]) -> Vec<Row> {
                 key: key.map(String::from).unwrap_or_default(),
                 label: choice.label(profiles).to_string(),
                 chip: info.map(|p| (p.chip.clone(), p.rgb())),
+                agent: info.map(|p| match p.kind {
+                    ProfileKind::Claude => "Claude",
+                    ProfileKind::Codex => "Codex",
+                }),
                 hint: info.and_then(launch::login_hint),
                 enter: enter.as_ref() == Some(&choice),
                 choice,
@@ -70,6 +75,20 @@ fn lit(row: &Row, typing: bool) -> bool {
     } else {
         row.enter
     }
+}
+
+/// The text at a row's right, as in the mockup: a profile's agent, with "↵" on the row Enter picks, or the login note of a profile
+/// that isn't logged in. In the typed form Enter creates the typed session, so no profile row carries "↵" then.
+fn meta(row: &Row, typing: bool) -> Option<String> {
+    if row.hint.is_some() {
+        return row.hint.clone();
+    }
+    let agent = row.agent?;
+    Some(if row.enter && !typing {
+        format!("{agent} · ↵")
+    } else {
+        agent.to_string()
+    })
 }
 
 /// The hints under the menu, one part each: what Enter starts, or in the typed form what Enter and Esc do, then ⌘W.
@@ -133,22 +152,29 @@ pub fn render(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
                 .text_size(px(12.))
                 .line_height(px(14.))
                 .text_color(t.text_secondary.hsla())
+                .font_weight(t.secondary_weight)
                 .child(tilde(project, home.as_deref())),
         );
     let label = h_flex()
         .px(px(8.))
-        .text_size(px(11.))
+        .text_size(px(HEAD_SIZE))
         .line_height(px(13.))
         .text_color(t.text_secondary.hsla())
-        .children(tracked(&"New session".to_uppercase(), cx));
-    let mut rows = v_flex().gap(px(ROW_GAP));
+        .font_weight(t.secondary_weight)
+        .children(tracked(
+            &"New session".to_uppercase(),
+            t.secondary_weight,
+            cx,
+        ));
+    // The rows are what gives when the sheet is capped to the pane: they clip at its bottom.
+    let mut rows = v_flex().min_h_0().overflow_hidden().gap(px(ROW_GAP));
     for (k, r) in row_texts(&m.profiles).into_iter().enumerate() {
         // A line between the profiles and shell, 4 × 12 inside the rows' gaps.
         if k > 0 && r.choice == Choice::Shell {
             rows = rows.child(div().h(px(1.)).mx(px(12.)).my(px(4.)).bg(t.edge.hsla()));
         }
-        let lit = lit(&r, m.typing);
-        rows = rows.child(row(k, r, lit, &t, cx));
+        let (lit, meta) = (lit(&r, m.typing), meta(&r, m.typing));
+        rows = rows.child(row(k, r, lit, meta, &t, cx));
     }
     // The input is clear like the rows; it follows the parent's text size, 14 px like a row name.
     let typed = ws.typed_input().filter(|_| m.typing).map(|input| {
@@ -165,17 +191,23 @@ pub fn render(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
         .text_size(px(12.))
         .line_height(px(15.))
         .text_color(t.text_secondary.hsla())
+        .font_weight(t.secondary_weight)
         .children(footer(&m.profiles, m.typing));
+    // The sheet stays 12 px inside the pane however small the window is. The clip keeps its deep shadow inside the pane too.
     div()
         .id("launcher")
         .flex_1()
         .min_h_0()
+        .p(px(INSET))
+        .overflow_hidden()
         .flex()
         .items_center()
         .justify_center()
         .child(
             glass::sheet(&t)
                 .w(px(SHEET_W))
+                .max_w_full()
+                .max_h_full()
                 .flex()
                 .flex_col()
                 .gap(px(BLOCK_GAP))
@@ -190,24 +222,23 @@ pub fn render(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
         )
 }
 
-/// One menu row: the key capsule, the chip (or its empty slot), the name, and at the right the login note of a profile that isn't
-/// logged in, whose row reads dim. Clicking picks that row.
+/// One menu row: the key capsule, the chip (or its empty slot), the name, and at the right its [`meta`]. A profile that isn't
+/// logged in reads dim. Clicking picks that row.
 ///
-/// The sheet's stack is at the 0.92 alpha cap, so nothing on it adds a translucent fill: the lit row shows by its edge and highlight,
-/// hover lights a row's edge, and the key capsules are clear, except the lit row's, which is the solid accent.
+/// Where the sheet's stack has room for it (`clear`), the lit row has the mockup's fill and hover adds it; otherwise the lit row shows
+/// by its edge and highlight, and hover lights a row's edge (see [`Theme::sheet_row_fill`]). The key capsules are clear, except the
+/// lit row's, which is the solid accent.
 fn row(
     k: usize,
     r: Row,
     lit: bool,
+    meta: Option<String>,
     t: &Theme,
     cx: &mut Context<Workspace>,
 ) -> impl IntoElement + use<> {
     let choice = r.choice;
-    let ink = if r.hint.is_some() {
-        t.text_tertiary
-    } else {
-        t.text
-    };
+    let dim = r.hint.is_some();
+    let ink = if dim { t.text_tertiary } else { t.text };
     let key = if lit {
         div().bg(t.accent.hsla()).text_color(t.on_accent.hsla())
     } else {
@@ -231,7 +262,7 @@ fn row(
         Some((letter, color)) => chip(letter, color).size(px(CHIP)).line_height(px(CHIP)),
         None => div().flex_shrink_0().w(px(CHIP)),
     };
-    let row = glass::clear_row(t, lit)
+    let row = glass::sheet_row(t, lit)
         .id(("launch", k))
         .flex()
         .items_center()
@@ -239,6 +270,7 @@ fn row(
         .py(glass::pad(10.))
         .px(glass::pad(12.))
         .text_color(ink.hsla())
+        .when(dim, |row| row.font_weight(t.secondary_weight))
         .child(key)
         .child(chip)
         .child(
@@ -251,15 +283,17 @@ fn row(
                 .when(lit, |name| name.font_weight(FontWeight::SEMIBOLD))
                 .child(r.label),
         )
-        .children(r.hint.map(|hint| {
+        .children(meta.map(|meta| {
             div()
                 .flex_shrink_0()
                 .whitespace_nowrap()
                 .text_size(px(12.))
                 .line_height(px(15.))
-                .child(hint)
+                .font_weight(t.secondary_weight)
+                .when(!dim, |meta| meta.text_color(t.text_secondary.hsla()))
+                .child(meta)
         }));
-    glass::hover_edge(row, if lit { t.highlight } else { t.edge })
+    glass::hover_sheet_row(row, t, lit)
         .on_click(cx.listener(move |ws, _, window, cx| ws.launch(choice.clone(), window, cx)))
 }
 
@@ -375,6 +409,23 @@ mod tests {
         );
         // The value that picks a row is the profile id, regardless of its label.
         assert_eq!(rows[1].choice, Choice::Profile("claude-b".into()));
+        // At the right, the mockup's meta: the agent, with "↵" on the Enter row; a profile that isn't logged in keeps its login note.
+        let metas =
+            |typing| -> Vec<Option<String>> { rows.iter().map(|row| meta(row, typing)).collect() };
+        let some = |s: &str| Some(s.to_string());
+        assert_eq!(
+            metas(false),
+            [
+                some("Claude · ↵"),
+                some("Claude"),
+                some("Codex"),
+                some("Not logged in · mine profile login team"),
+                None,
+                None
+            ]
+        );
+        // In the typed form Enter creates the typed session, so no profile row carries "↵".
+        assert_eq!(metas(true)[0], some("Claude"));
         // The footer names the Enter row.
         assert_eq!(footer(&m.profiles, false), ["↵ personal", "⌘W close"]);
         assert_eq!(footer(&[], false), ["⌘W close"]);

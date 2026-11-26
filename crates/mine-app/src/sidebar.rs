@@ -39,6 +39,7 @@ pub fn render(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
                 .px(px(6.))
                 .text_size(px(12.))
                 .text_color(t.text_tertiary.hsla())
+                .font_weight(t.secondary_weight)
                 .child("No sessions")
                 .into_any_element(),
         );
@@ -102,6 +103,7 @@ fn offline_banner(reason: &str, t: &Theme) -> impl IntoElement {
             div()
                 .text_size(px(11.))
                 .text_color(t.text_tertiary.hsla())
+                .font_weight(t.secondary_weight)
                 .child(reason.to_string()),
         )
 }
@@ -123,8 +125,8 @@ fn new_task(t: &Theme, cx: &mut Context<Workspace>) -> impl IntoElement {
         .child(
             div()
                 .text_size(px(12.))
-                .font_weight(FontWeight::NORMAL)
                 .text_color(t.text_secondary.hsla())
+                .font_weight(t.secondary_weight)
                 .child("⌘N"),
         )
         .on_click(cx.listener(|ws, _, window, cx| ws.new_task(window, cx)));
@@ -168,7 +170,12 @@ fn project_picker(
                 .truncate()
                 .child(project_name(&current)),
         )
-        .child(div().text_color(mark_color.hsla()).child(mark))
+        .child(
+            div()
+                .text_color(mark_color.hsla())
+                .font_weight(t.secondary_weight)
+                .child(mark),
+        )
         .on_click(cx.listener(|ws, _, _, cx| ws.toggle_picker(cx)));
     let head = glass::hover_fill(head, t);
     let rows = open.then(|| {
@@ -213,7 +220,7 @@ fn approval_mark(t: &Theme) -> impl IntoElement {
 }
 
 /// The group headers' letter spacing, the mockup's 0.06 em at 11 px.
-const HEAD_SIZE: f32 = 11.;
+pub(crate) const HEAD_SIZE: f32 = 11.;
 const TRACKING: f32 = 0.06 * HEAD_SIZE;
 
 /// `text` at [`HEAD_SIZE`] with [`TRACKING`] after each letter, as CSS letter spacing adds it.
@@ -221,9 +228,12 @@ const TRACKING: f32 = 0.06 * HEAD_SIZE;
 /// GPUI 0.2.2 has no letter spacing, so each letter is its own text in a box as wide as the letter's advance plus the tracking. (A
 /// text sizes itself to its width rounded up to a whole pixel, which would add about half a pixel per letter.)
 // ponytail: this loses kerning between the letters. Use GPUI's own letter spacing if it gets one.
-pub(crate) fn tracked(text: &str, cx: &App) -> Vec<Div> {
+pub(crate) fn tracked(text: &str, weight: FontWeight, cx: &App) -> Vec<Div> {
     let system = cx.text_system();
-    let font = system.resolve_font(&gpui::font(UiTheme::global(cx).font_family.clone()));
+    let font = system.resolve_font(&gpui::Font {
+        weight,
+        ..gpui::font(UiTheme::global(cx).font_family.clone())
+    });
     text.chars()
         .map(|c| {
             // A lone space would be an empty line; a no-break space keeps its width.
@@ -253,6 +263,7 @@ fn group_head(gi: usize, g: &Group, t: &Theme, cx: &mut Context<Workspace>) -> i
         .line_height(px(line))
         .text_size(px(HEAD_SIZE))
         .text_color(t.text_secondary.hsla())
+        .font_weight(t.secondary_weight)
         .cursor_pointer()
         .child(
             h_flex()
@@ -262,9 +273,9 @@ fn group_head(gi: usize, g: &Group, t: &Theme, cx: &mut Context<Workspace>) -> i
                         .text_color(state_color(t, &g.state))
                         .child(model::glyph(&g.state)),
                 )
-                .children(tracked(&label, cx)),
+                .children(tracked(&label, t.secondary_weight, cx)),
         )
-        .child(h_flex().children(tracked(&g.rows.len().to_string(), cx)))
+        .child(h_flex().children(tracked(&g.rows.len().to_string(), t.secondary_weight, cx)))
         .on_click({
             // Holds the state, not the position. Even if a new list arrives after drawing and the groups shift, the clicked group is the one that changes.
             let state = g.state.clone();
@@ -328,6 +339,7 @@ fn session_row(m: &Model, i: usize, t: &Theme, cx: &Context<Workspace>) -> impl 
             .text_size(px(12.))
             .line_height(px(15.))
             .text_color(t.text_secondary.hsla())
+            .font_weight(t.secondary_weight)
             // A no-break space, so the space before the status keeps its width.
             .child(
                 div()
@@ -455,6 +467,7 @@ fn add_project(t: &Theme, cx: &mut Context<Workspace>) -> impl IntoElement {
         .text_size(px(13.))
         .line_height(px(17.))
         .text_color(t.text_secondary.hsla())
+        .font_weight(t.secondary_weight)
         .child("＋ Add project")
         .on_click(cx.listener(|ws, _, _, cx| ws.add_project(cx)));
     glass::hover_fill(capsule, t)

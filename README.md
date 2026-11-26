@@ -266,13 +266,19 @@ mine never reads or stores credentials. Whether a profile is logged in is decide
 
 ### Appearance
 
-The desktop app draws its panels as glass over a blurred window, in dark or light. By default it follows the system appearance, and when **Reduce transparency** is on (System Settings → Accessibility → Display) it draws the same palette opaque. To pin the look, add an `[appearance]` table to `~/.mine/config.toml`:
+The desktop app draws its panels as glass over a blurred window, in dark or light. By default it follows the system appearance. To pin the look or change how much glass it uses, add an `[appearance]` table to `~/.mine/config.toml`:
 
 ```toml
 [appearance]
 mode = "system"   # "system" (the default), "dark", or "light"
-glass = true      # false draws the same palette opaque
+glass = "clear"   # "clear" (the default), "balanced", or "solid"
 ```
+
+- `clear` shows the most of the blurred desktop through the panels. Secondary text is one weight heavier, and brighter in dark or darker in light, so it stays readable. Text is clearly weaker than in `balanced` over a very bright window behind it in dark, or a very dark one in light. Pick `balanced` if that bothers you.
+- `balanced` is less translucent and keeps every text at full contrast over any window behind it.
+- `solid` draws the balanced palette opaque. The app also draws it when **Reduce transparency** is on (System Settings → Accessibility → Display), whatever the level.
+
+Older configs keep working: `glass = true` is `clear`, and `glass = false` is `solid`.
 
 The app reads this table itself, at start and each time its window comes to the front, so an edit applies the next time you switch to the window. A broken value falls back to the default with one warning in the app's log, and the daemon ignores the table. A pinned mode restyles mine's own surfaces only: the close dialog, the folder picker, and menus follow the system. The terminal pane stays dark in both modes.
 

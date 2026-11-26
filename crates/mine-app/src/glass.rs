@@ -68,13 +68,23 @@ pub fn row(theme: &Theme, selected: bool) -> Div {
     }
 }
 
-/// A row with no fill of its own, for a stack at the 0.92 alpha cap (a [`sheet`]'s rows) or a box in a panel (the offline banner).
+/// A row with no fill of its own: a box in a panel (the offline banner), or the base of a [`sheet_row`].
 /// Lit, it shows by the edge outline and the highlight line; unlit, the outline is clear.
 pub fn clear_row(theme: &Theme, on: bool) -> Div {
     if on {
         lit(theme, None, theme.edge, ROW_RADIUS)
     } else {
         plain(ROW_RADIUS)
+    }
+}
+
+/// A launcher row on a [`sheet`]: a [`clear_row`] that, lit, also takes the mockup's fill where the theme has room for it
+/// ([`Theme::sheet_row_fill`]).
+pub fn sheet_row(theme: &Theme, lit: bool) -> Div {
+    let row = clear_row(theme, lit);
+    match theme.sheet_row_fill().filter(|_| lit) {
+        Some(fill) => row.bg(fill.hsla()),
+        None => row,
     }
 }
 
@@ -126,13 +136,30 @@ pub fn hover_fill(control: Stateful<Div>, theme: &Theme) -> Stateful<Div> {
         .active(|s| s.opacity(PRESSED))
 }
 
-/// Hover and press for a control that has a fill already (selected, strong, pending or accent), or that sits on a sheet. Its stack is
-/// at the 0.92 alpha cap already, so hover lights its edge up to `rim` instead of adding fill. Press dims it.
+/// Hover and press for a control that has a fill already (selected, strong, pending or accent). In `balanced` its
+/// stack is at the 0.92 alpha cap already, so hover lights its edge up to `rim` instead of adding fill. Press dims it.
 pub fn hover_edge(control: Stateful<Div>, rim: Tint) -> Stateful<Div> {
     let rim = rim.hsla();
     control
         .cursor_pointer()
         .hover(move |s| s.border_color(rim))
+        .active(|s| s.opacity(PRESSED))
+}
+
+/// Hover and press for a [`sheet_row`]: hover lights its edge (to `highlight` on the lit row) and gives it the lit row's fill where
+/// the theme has room for one. Press dims it.
+pub fn hover_sheet_row(control: Stateful<Div>, theme: &Theme, lit: bool) -> Stateful<Div> {
+    let rim = if lit { theme.highlight } else { theme.edge }.hsla();
+    let fill = theme.sheet_row_fill().map(Tint::hsla);
+    control
+        .cursor_pointer()
+        .hover(move |s| {
+            let s = s.border_color(rim);
+            match fill {
+                Some(fill) => s.bg(fill),
+                None => s,
+            }
+        })
         .active(|s| s.opacity(PRESSED))
 }
 
@@ -261,8 +288,14 @@ mod tests {
         assert_eq!(fill(capsule(&dark, true)), token(dark.panel_strong));
         assert_eq!(fill(row(&dark, true)), token(dark.panel_strong));
         assert_eq!(fill(row(&dark, false)), None);
-        // Nothing translucent goes on a sheet: a lit launcher row shows by its edge.
+        // A clear row has no fill: it shows by its edge.
         assert_eq!(fill(clear_row(&dark, true)), None);
+        // A lit launcher row takes the mockup's fill where the sheet's stack has room for it (`clear`); in `balanced` it doesn't.
+        let clear = Theme::dark_clear();
+        assert_eq!(fill(sheet_row(&clear, true)), token(clear.panel_strong));
+        assert_eq!(border(sheet_row(&clear, true)), Some(clear.edge.hsla()));
+        assert_eq!(fill(sheet_row(&clear, false)), None);
+        assert_eq!(fill(sheet_row(&dark, true)), None);
         assert_eq!(border(clear_row(&light, true)), Some(light.edge.hsla()));
         assert_eq!(
             border(clear_row(&light, false)),

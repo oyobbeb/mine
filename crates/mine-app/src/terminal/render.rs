@@ -37,10 +37,14 @@ impl CellRun {
     fn of(cell: &Cell, col: usize, cells: u16) -> CellRun {
         let flags = cell.flags;
         let mut fg = color(cell.fg);
-        let mut bg = (cell.bg != Color::Named(NamedColor::Background)).then(|| color(cell.bg));
+        // ANSI black was the default background before glass, so a cell set to it shows the pane, as it did then (Ruling G-R12). That
+        // holds for an ANSI black foreground that inverse video swaps in too.
+        let mut bg = (cell.bg != Color::Named(NamedColor::Background))
+            .then(|| color(cell.bg))
+            .filter(|&bg| bg != ANSI[0]);
         if flags.contains(Flags::INVERSE) {
             let back = bg.unwrap_or(TERM_BG);
-            bg = Some(fg);
+            bg = Some(fg).filter(|&fg| fg != ANSI[0]);
             fg = back;
         }
         if flags.contains(Flags::HIDDEN) {
@@ -345,10 +349,15 @@ mod tests {
     }
 
     /// The pane's own fill shows through every default-background cell (spec 4.3). Only a cell with a background of its own and a
-    /// marked (selected or found) cell paint, so a full-screen app keeps its colors and nothing else covers the pane.
+    /// marked (selected or found) cell paint, so a full-screen app keeps its colors and nothing else covers the pane. ANSI black
+    /// (`ANSI[0]`, which was the default background before glass) is the pane too, however it is set (Ruling G-R12).
     #[test]
     fn default_bg_cells_skip_paint_explicit_bg_cells_paint() {
-        let s = screen(20, 3, b"ab\x1b[44mc\x1b[0mdef\r\nplain");
+        let s = screen(
+            20,
+            3,
+            b"ab\x1b[44mc\x1b[0mdef\r\nplain\r\n\x1b[40mx\x1b[48;5;0my\x1b[48;2;30;33;40mz\x1b[7;40mi\x1b[0;30;7mj",
+        );
         let row = |r: u16| -> Vec<(u16, CellRun)> {
             row_runs(&s, usize::from(r))
                 .into_iter()
@@ -361,6 +370,15 @@ mod tests {
             [(0, 2, 1, 0x61afef), (0, 4, 1, TERM_SELECTION)]
         );
         assert!(backgrounds(&row(1), &[]).is_empty());
+        // SGR 40, indexed 0 and its RGB paint nothing; their text keeps its color. Inverse video still paints the text color, unless
+        // that color is ANSI black ("j", `\e[30;7m`).
+        let black = row(2);
+        assert_eq!(backgrounds(&black, &[]), [(2, 3, 1, TERM_FG)]);
+        assert!(
+            black
+                .iter()
+                .all(|(_, run)| run.fg == TERM_FG || run.fg == TERM_BG)
+        );
     }
 
     #[test]

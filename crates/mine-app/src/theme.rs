@@ -4,10 +4,10 @@
 //!   contrast rule the palettes are tested against. Views read the current [`Theme`] with [`current`].
 //! - The terminal colors. Values are the `0xrrggbb` passed to GPUI `rgb()`.
 
-use gpui::{App, Global, Hsla, WindowBackgroundAppearance, rgb};
+use gpui::{App, FontWeight, Global, Hsla, WindowBackgroundAppearance, rgb};
 use gpui_component::{Theme as UiTheme, ThemeMode};
 
-use crate::appearance::Mode;
+use crate::appearance::{Glass, Mode};
 
 /// Default terminal text and background. On connect, the app sends these two colors to the daemon with `ToDaemon::Colors`, which
 /// answers OSC 10/11 with them. The background is the pane's own color, the `terminal` token, so what an app learns from OSC 11, the
@@ -78,9 +78,10 @@ const fn tint(rgb: u32, alpha: f32) -> Tint {
 ///
 /// Surfaces are drawn bottom to top, and each one only adds to what is below it: the window tint over the blurred wallpaper, then a
 /// `panel` (the task list, the tab bar, the center pane), then a `panel_strong` (the selected row, the active tab), a `row_pending`, a
-/// [`Theme::hover`], or the launcher's `sheet`; the `terminal` fill replaces `panel` in the center pane. Nothing translucent goes on top
-/// of those (their stacks are at the 0.92 alpha cap), so a control that has a fill lights its edge on hover instead. No text sits on
-/// the bare window tint: the title row holds only the tab capsule. See [`composite`] for how GPUI blends such a stack.
+/// [`Theme::hover`], or the launcher's `sheet` (and on it [`Theme::sheet_row_fill`]); the `terminal` fill replaces `panel` in the
+/// center pane. A control that has a fill lights its edge on hover instead of adding more, because in `balanced` those stacks are at
+/// the 0.92 alpha cap already. No text sits on the bare window tint: the title row holds only the tab capsule. See [`composite`] for
+/// how GPUI blends such a stack.
 /// Text and status colors are solid: a translucent glyph would let the wallpaper through it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Theme {
@@ -100,8 +101,8 @@ pub struct Theme {
     pub highlight: Tint,
     /// The drop shadow of a floating surface.
     pub shadow: Tint,
-    /// The terminal pane. Dark in both modes, and solid: it covers the wallpaper so session output reads as it always has (Ruling
-    /// G-R2), and it is [`TERM_BG`].
+    /// The terminal pane. Dark in both modes, and solid at every glass level: it covers the wallpaper so session output reads as
+    /// it always has (Rulings G-R2, G-R14), and it is [`TERM_BG`].
     pub terminal: Tint,
     pub text: Tint,
     pub text_secondary: Tint,
@@ -121,6 +122,8 @@ pub struct Theme {
     /// The fill and the edge of a row that waits for approval.
     pub row_pending: Tint,
     pub row_pending_edge: Tint,
+    /// The weight of `text_secondary` and `text_tertiary`: one step heavier in `clear`, where more wallpaper shows behind them.
+    pub secondary_weight: FontWeight,
 }
 
 impl Theme {
@@ -151,6 +154,7 @@ impl Theme {
             idle: Tint::solid(0xa6aab3),
             row_pending: tint(0xe5c07b, 0.08),
             row_pending_edge: tint(0xe5c07b, 0.45),
+            secondary_weight: FontWeight::NORMAL,
         }
     }
 
@@ -180,6 +184,49 @@ impl Theme {
             idle: Tint::solid(0x5a5a5f),
             row_pending: tint(0xe5c07b, 0.10),
             row_pending_edge: tint(0x9a6a12, 0.55),
+            secondary_weight: FontWeight::NORMAL,
+        }
+    }
+
+    /// Dark clear, the default: the mockup's translucency. A panel stack sums to 0.59, so 41 % of the blurred wallpaper shows
+    /// through it, as in the mockup. Most of the coverage is the window tint, with a thin white glass for the panels. Over a white
+    /// wallpaper a panel is then a mid grey (`#828387`), so the text is white, the secondary and tertiary text are brighter and
+    /// heavier, and the status colors are lighter than [`Theme::dark_glass`]'s; they meet `clear`'s floors there (spec 7) and the
+    /// full ones over black.
+    pub fn dark_clear() -> Theme {
+        Theme {
+            window_tint: tint(0x15171f, 0.53),
+            panel: tint(0xffffff, 0.06),
+            panel_strong: tint(0xffffff, 0.14),
+            sheet: tint(0xffffff, 0.12),
+            text: Tint::solid(0xffffff),
+            text_secondary: Tint::solid(0xe6e8ec),
+            text_tertiary: Tint::solid(0xc0c3ca),
+            working: Tint::solid(0x8cd3dd),
+            done: Tint::solid(0xb5d99c),
+            idle: Tint::solid(0xc0c3ca),
+            row_pending: tint(0xe5c07b, 0.12),
+            secondary_weight: FontWeight::MEDIUM,
+            ..Theme::dark_glass()
+        }
+    }
+
+    /// Light clear, the default: the mockup's translucency. A panel stack sums to 0.71, so 29 % of the wallpaper shows through it.
+    /// Over a black wallpaper a panel is then a mid grey (`#979797`), so the secondary, tertiary and status colors are darker than
+    /// [`Theme::light_glass`]'s, and the secondary and tertiary text heavier.
+    pub fn light_clear() -> Theme {
+        Theme {
+            window_tint: tint(0xffffff, 0.26),
+            panel: tint(0xffffff, 0.45),
+            text_secondary: Tint::solid(0x2e2e31),
+            text_tertiary: Tint::solid(0x444448),
+            accent_text: Tint::solid(0x4f3400),
+            approval: Tint::solid(0x4f3400),
+            working: Tint::solid(0x084750),
+            done: Tint::solid(0x16440e),
+            idle: Tint::solid(0x444448),
+            secondary_weight: FontWeight::MEDIUM,
+            ..Theme::light_glass()
         }
     }
 
@@ -213,6 +260,15 @@ impl Theme {
         }
     }
 
+    /// The fill of the launcher's lit or hovered row, as in the mockup: `panel_strong`, where the sheet's stack leaves room for it
+    /// under the 0.92 alpha cap (`clear`). Otherwise `None` (`balanced`'s sheet is at the cap, and solid surfaces have no room), and the
+    /// row shows by its edge and highlight.
+    pub fn sheet_row_fill(&self) -> Option<Tint> {
+        let stack = [self.window_tint, self.panel, self.sheet, self.panel_strong];
+        let sum: f32 = stack.iter().map(|t| t.alpha).sum();
+        (sum <= 0.92 + 1e-6).then_some(self.panel_strong)
+    }
+
     /// The window's own background: blurred wallpaper for glass, plain for the opaque variants.
     pub fn window_background(&self) -> WindowBackgroundAppearance {
         if self.glass {
@@ -223,23 +279,26 @@ impl Theme {
     }
 }
 
-/// The theme for a mode. `system_dark` is the window's appearance; `reduce_transparency` is the macOS accessibility setting. The
-/// caller reads those (see `appearance::reduce_transparency`), so this stays pure.
-pub fn resolve(mode: Mode, system_dark: bool, glass: bool, reduce_transparency: bool) -> Theme {
+/// The theme for a mode and glass level. `system_dark` is the window's appearance; `reduce_transparency` is the macOS accessibility
+/// setting, which makes any level `solid`. `solid` is the balanced palette made opaque. The caller reads those (see
+/// `appearance::reduce_transparency`), so this stays pure.
+pub fn resolve(mode: Mode, system_dark: bool, glass: Glass, reduce_transparency: bool) -> Theme {
     let dark = match mode {
         Mode::System => system_dark,
         Mode::Dark => true,
         Mode::Light => false,
     };
-    let theme = if dark {
+    let balanced = if dark {
         Theme::dark_glass()
     } else {
         Theme::light_glass()
     };
-    if glass && !reduce_transparency {
-        theme
-    } else {
-        theme.opaque()
+    match glass {
+        _ if reduce_transparency => balanced.opaque(),
+        Glass::Clear if dark => Theme::dark_clear(),
+        Glass::Clear => Theme::light_clear(),
+        Glass::Balanced => balanced,
+        Glass::Solid => balanced.opaque(),
     }
 }
 
@@ -398,8 +457,11 @@ mod tests {
 
     const BACKDROPS: [u32; 2] = [0xffffff, 0x000000];
 
-    fn palettes() -> [(&'static str, Theme); 4] {
+    /// Every palette `resolve` gives: the levels' (`clear`, `balanced`) and `solid`'s (the balanced palettes made opaque).
+    fn palettes() -> [(&'static str, Theme); 6] {
         [
+            ("dark clear", Theme::dark_clear()),
+            ("light clear", Theme::light_clear()),
             ("dark glass", Theme::dark_glass()),
             ("light glass", Theme::light_glass()),
             ("dark opaque", Theme::dark_glass().opaque()),
@@ -408,12 +470,13 @@ mod tests {
     }
 
     /// The surfaces text is drawn on, bottom to top. The terminal pane has its own rule. The bare window tint is not one: the title
-    /// row holds only the tab capsule, the message bar and the offline banner are capsules, and the launcher's sheet sits in the
-    /// center pane (Ruling G-R3). Everything on the sheet is on `[window_tint, panel, sheet]`, which is at the alpha cap: the rows,
-    /// the lit row, the clear key capsules and the hints add no fill. The lit row's key is `on_accent` on the solid `accent`.
-    fn surface_stacks(th: &Theme) -> [(&'static str, Vec<Tint>); 5] {
+    /// row holds only the tab capsule, the message bar is a capsule, the offline banner is a box in the task list, and the sheet
+    /// sits in the center pane (Ruling G-R3). Everything on the sheet is on `[window_tint, panel, sheet]`, and the lit or hovered launcher row
+    /// adds [`Theme::sheet_row_fill`] where the alpha cap leaves room for it; the clear key capsules and the hints add no fill. The
+    /// lit row's key is `on_accent` on the solid `accent`.
+    fn surface_stacks(th: &Theme) -> Vec<(&'static str, Vec<Tint>)> {
         let w = th.window_tint;
-        [
+        let mut stacks = vec![
             ("[window_tint, panel]", vec![w, th.panel]),
             // A row, tab or button without a fill of its own, under the pointer.
             ("[window_tint, panel, hover]", vec![w, th.panel, th.hover()]),
@@ -426,26 +489,41 @@ mod tests {
                 vec![w, th.panel, th.row_pending],
             ),
             ("[window_tint, panel, sheet]", vec![w, th.panel, th.sheet]),
-        ]
+        ];
+        if let Some(fill) = th.sheet_row_fill() {
+            stacks.push((
+                "[window_tint, panel, sheet, sheet_row_fill]",
+                vec![w, th.panel, th.sheet, fill],
+            ));
+        }
+        stacks
     }
 
+    /// Spec 7. Each token has its full floor; `clear` has lower ones over `#ffffff` (the user traded some readability over a bright
+    /// wallpaper for translucency), and keeps the full floors over `#000000`.
     #[test]
     fn contrast_floors_hold_for_every_palette() {
         for (name, th) in palettes() {
+            let clear = name.ends_with("clear");
             let tokens = [
-                ("text", th.text, 4.5),
-                ("text_secondary", th.text_secondary, 4.5),
-                ("text_tertiary", th.text_tertiary, 3.0),
-                ("accent_text", th.accent_text, 3.0),
-                ("approval", th.approval, 3.0),
-                ("working", th.working, 3.0),
-                ("done", th.done, 3.0),
-                ("idle", th.idle, 3.0),
+                ("text", th.text, 4.5, 3.5),
+                ("text_secondary", th.text_secondary, 4.5, 3.0),
+                ("text_tertiary", th.text_tertiary, 3.0, 2.0),
+                ("accent_text", th.accent_text, 3.0, 2.0),
+                ("approval", th.approval, 3.0, 2.0),
+                ("working", th.working, 3.0, 2.0),
+                ("done", th.done, 3.0, 2.0),
+                ("idle", th.idle, 3.0, 2.0),
             ];
             for (stack_name, stack) in surface_stacks(&th) {
                 for backdrop in BACKDROPS {
                     let surface = composite(&stack, backdrop);
-                    for (token, tint, floor) in tokens {
+                    for (token, tint, full, over_white) in tokens {
+                        let floor = if clear && backdrop == 0xffffff {
+                            over_white
+                        } else {
+                            full
+                        };
                         let mut with_text = stack.clone();
                         with_text.push(tint);
                         let ratio = contrast(composite(&with_text, backdrop), surface);
@@ -507,6 +585,8 @@ mod tests {
     #[test]
     fn stack_alpha_sum_within_limit() {
         for (name, th) in [
+            ("dark clear", Theme::dark_clear()),
+            ("light clear", Theme::light_clear()),
             ("dark glass", Theme::dark_glass()),
             ("light glass", Theme::light_glass()),
         ] {
@@ -517,6 +597,33 @@ mod tests {
             // The terminal pane is the exception: it covers the backdrop, so the dim ANSI colors keep their contrast over a white wallpaper.
             let sum = alpha_sum(&[th.window_tint, th.terminal]);
             assert!(sum >= 1.0, "{name}: the terminal stack sums to {sum:.3}");
+        }
+    }
+
+    /// `clear` lets through what the mockup does in a browser (spec 5): there `(1 − 0.55)(1 − 0.08) ≈ 0.41` of the backdrop
+    /// reaches a dark panel and `(1 − 0.35)(1 − 0.55) ≈ 0.29` a light one. Under GPUI's blend that share is `1 − Σα`. The terminal
+    /// stays solid, unlike the mockup's 9 %: over white no show-through above about 3.5 % keeps ANSI 8 at 3:1, and the pane must
+    /// stay `TERM_BG` (Rulings G-R2, G-R4, G-R14). The launcher's lit row has room for the mockup's fill, which `balanced` (at the
+    /// alpha cap) doesn't.
+    #[test]
+    fn clear_matches_mockup_show_through() {
+        let show_through = |stack: &[Tint]| (1.0 - alpha_sum(stack)).max(0.0);
+        for (name, th, panel) in [
+            ("dark clear", Theme::dark_clear(), 0.41),
+            ("light clear", Theme::light_clear(), 0.29),
+        ] {
+            let s = show_through(&[th.window_tint, th.panel]);
+            assert!((s - panel).abs() <= 0.03, "{name}: a panel shows {s:.3}");
+            let s = show_through(&[th.window_tint, th.terminal]);
+            assert_eq!(s, 0.0, "{name}: the terminal shows {s:.3}");
+            assert_eq!(th.sheet_row_fill(), Some(th.panel_strong), "{name}");
+        }
+        for th in [
+            Theme::dark_glass(),
+            Theme::light_glass(),
+            Theme::dark_glass().opaque(),
+        ] {
+            assert_eq!(th.sheet_row_fill(), None);
         }
     }
 
@@ -578,32 +685,67 @@ mod tests {
         assert_eq!(better(0x000080), 0xffffff);
     }
 
+    /// Every mode × window appearance × level × Reduce transparency. Reduce transparency makes any level `solid`, and `solid` is the
+    /// balanced palette made opaque. Only `clear` draws the secondary and tertiary text one weight heavier.
     #[test]
     fn resolve_table() {
-        let th = resolve(Mode::System, true, true, false);
-        assert!(th.dark && th.glass);
-        assert_eq!(th.window_background(), WindowBackgroundAppearance::Blurred);
-        let th = resolve(Mode::System, false, true, false);
-        assert!(!th.dark && th.glass);
-        for system_dark in [true, false] {
-            let th = resolve(Mode::Dark, system_dark, true, false);
-            assert!(th.dark && th.glass, "Dark with system_dark={system_dark}");
-            let th = resolve(Mode::Light, system_dark, true, false);
-            assert!(!th.dark && th.glass, "Light with system_dark={system_dark}");
+        for mode in [Mode::System, Mode::Dark, Mode::Light] {
+            for system_dark in [true, false] {
+                let dark = mode == Mode::Dark || (mode == Mode::System && system_dark);
+                let (clear, balanced) = if dark {
+                    (Theme::dark_clear(), Theme::dark_glass())
+                } else {
+                    (Theme::light_clear(), Theme::light_glass())
+                };
+                for (glass, reduce, want, blurred, weight) in [
+                    (Glass::Clear, false, &clear, true, FontWeight::MEDIUM),
+                    (Glass::Balanced, false, &balanced, true, FontWeight::NORMAL),
+                    (
+                        Glass::Solid,
+                        false,
+                        &balanced.opaque(),
+                        false,
+                        FontWeight::NORMAL,
+                    ),
+                    (
+                        Glass::Clear,
+                        true,
+                        &balanced.opaque(),
+                        false,
+                        FontWeight::NORMAL,
+                    ),
+                    (
+                        Glass::Balanced,
+                        true,
+                        &balanced.opaque(),
+                        false,
+                        FontWeight::NORMAL,
+                    ),
+                    (
+                        Glass::Solid,
+                        true,
+                        &balanced.opaque(),
+                        false,
+                        FontWeight::NORMAL,
+                    ),
+                ] {
+                    let case =
+                        format!("{mode:?} system_dark={system_dark} {glass:?} reduce={reduce}");
+                    let th = resolve(mode, system_dark, glass, reduce);
+                    assert_eq!(&th, want, "{case}");
+                    assert_eq!(th.dark, dark, "{case}");
+                    assert_eq!(th.glass, blurred, "{case}");
+                    assert_eq!(th.secondary_weight, weight, "{case}");
+                    let background = if blurred {
+                        WindowBackgroundAppearance::Blurred
+                    } else {
+                        WindowBackgroundAppearance::Opaque
+                    };
+                    assert_eq!(th.window_background(), background, "{case}");
+                }
+            }
         }
-        // No glass, or Reduce transparency: opaque, and the window is not blurred.
-        for (mode, system_dark, glass, reduce) in [
-            (Mode::System, true, false, false),
-            (Mode::System, false, true, true),
-            (Mode::Dark, false, false, true),
-            (Mode::Light, true, true, true),
-        ] {
-            let th = resolve(mode, system_dark, glass, reduce);
-            assert!(!th.glass, "{mode:?} {system_dark} {glass} {reduce}");
-            assert_eq!(th.window_background(), WindowBackgroundAppearance::Opaque);
-            assert_eq!(th, resolve(mode, system_dark, true, false).opaque());
-        }
-        assert!(resolve(Mode::Dark, false, false, false).dark);
-        assert!(!resolve(Mode::Light, true, false, false).dark);
+        assert_ne!(Theme::dark_clear(), Theme::dark_glass());
+        assert_ne!(Theme::light_clear(), Theme::light_glass());
     }
 }
